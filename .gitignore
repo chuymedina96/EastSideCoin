@@ -4,7 +4,6 @@
 node_modules/
 
 # Expo
-.expo/
 dist/
 web-build/
 expo-env.d.ts
@@ -39,6 +38,7 @@ yarn-error.*
 *.pyc
 __pycache__/
 local_settings.py
+setting.py
 db.sqlite3
 db.sqlite3-*
 *.log
