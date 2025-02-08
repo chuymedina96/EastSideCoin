@@ -10,7 +10,7 @@ venv
 
 # React Native specific ignores
 node_modules/
-mobile/node_modules
+mobile/node_modules/
 /ios/build
 /android/app/build
 *.apk
