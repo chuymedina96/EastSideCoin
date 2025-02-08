@@ -6,6 +6,7 @@ db.sqlite3
 db.sqlite3-*
 *.log
 *.pot
+venv
 
 # React Native specific ignores
 node_modules/
