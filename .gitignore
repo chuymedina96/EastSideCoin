@@ -1,0 +1,24 @@
+# Django specific ignores
+*.pyc
+__pycache__/
+local_settings.py
+db.sqlite3
+db.sqlite3-*
+*.log
+*.pot
+
+# React Native specific ignores
+node_modules/
+/ios/build
+/android/app/build
+*.apk
+*.ipa
+*.d.ts
+
+# General ignores
+.env
+.DS_Store
+*.swp
+*.swo
+.vscode/
+.idea/
