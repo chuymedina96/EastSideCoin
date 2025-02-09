@@ -1,10 +1,6 @@
 import React, { useState, useContext } from "react";
 import { View, Text, TextInput, TouchableOpacity, StyleSheet, ActivityIndicator, Alert } from "react-native";
 import { AuthContext } from "../context/AuthProvider";
-import axios from "axios";
-import Web3 from "web3";
-import AsyncStorage from "@react-native-async-storage/async-storage";
-import { useNavigation } from "@react-navigation/native";
 
 const API_URL = "http://192.168.1.125:8000/api";
 

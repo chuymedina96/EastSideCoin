@@ -9,9 +9,6 @@ from django.db import transaction
 from rest_framework_simplejwt.tokens import OutstandingToken, BlacklistedToken
 from rest_framework_simplejwt.token_blacklist.models import BlacklistedToken
 import json
-import logging
-
-logger = logging.getLogger(__name__)
 
 User = get_user_model()
 

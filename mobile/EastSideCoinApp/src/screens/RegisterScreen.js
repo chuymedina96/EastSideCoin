@@ -1,9 +1,12 @@
 import React, { useState, useContext } from "react";
 import { View, Text, TextInput, TouchableOpacity, StyleSheet, Image, ActivityIndicator, Alert } from "react-native";
-import { AuthContext } from "../context/AuthProvider"; // ✅ Import register from AuthContext
+import { AuthContext } from "../context/AuthProvider";
+import { useNavigation } from "@react-navigation/native";
 
 const RegisterScreen = () => {
-  const { register } = useContext(AuthContext); // ✅ Use register function from AuthContext
+  const { register } = useContext(AuthContext);
+  const navigation = useNavigation();
+  
   const [firstName, setFirstName] = useState("");
   const [lastName, setLastName] = useState("");
   const [email, setEmail] = useState("");
@@ -63,12 +66,19 @@ const RegisterScreen = () => {
 
       {loading && <ActivityIndicator size="large" color="#E63946" />}
 
+      {/* Register Button */}
       <TouchableOpacity style={styles.button} onPress={handleRegister} disabled={loading}>
         <Text style={styles.buttonText}>{loading ? "Registering..." : "Sign Up"}</Text>
       </TouchableOpacity>
 
-      <TouchableOpacity>
+      {/* Navigate to Login Screen */}
+      <TouchableOpacity onPress={() => navigation.navigate("Login")}>
         <Text style={styles.linkText}>Already have an account? Log in</Text>
+      </TouchableOpacity>
+
+      {/* Navigate to Landing Page */}
+      <TouchableOpacity onPress={() => navigation.navigate("Landing")}>
+        <Text style={styles.backText}>← Back to Landing</Text>
       </TouchableOpacity>
     </View>
   );
@@ -92,6 +102,7 @@ const styles = StyleSheet.create({
   button: { backgroundColor: "#FF4500", padding: 15, borderRadius: 8, width: "90%", alignItems: "center", marginVertical: 10 },
   buttonText: { color: "#FFF", fontSize: 18, fontWeight: "bold" },
   linkText: { color: "#FFD700", fontSize: 16, marginTop: 10 },
+  backText: { color: "#888", fontSize: 14, marginTop: 20 },
 });
 
 export default RegisterScreen;
