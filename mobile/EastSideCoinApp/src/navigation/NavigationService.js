@@ -1,29 +1,28 @@
-import { CommonActions } from "@react-navigation/native";
+import { createNavigationContainerRef, CommonActions } from "@react-navigation/native";
 
-let navigator;
+export const navigationRef = createNavigationContainerRef();
 
-export function setNavigator(nav) {
-  navigator = nav;
-}
-
+// ✅ Function to navigate
 export function navigate(name, params) {
-  if (navigator) {
-    navigator.dispatch(
-      CommonActions.navigate({
-        name,
-        params,
-      })
-    );
+  if (navigationRef.isReady()) {
+    console.log(`🚀 Navigating to ${name}`);
+    navigationRef.navigate(name, params);
+  } else {
+    console.warn("⚠️ NavigationRef is not ready");
   }
 }
 
+// ✅ Function to reset navigation stack
 export function resetNavigation(name) {
-  if (navigator) {
-    navigator.dispatch(
+  if (navigationRef.isReady()) {
+    console.log(`🚀 Resetting Navigation to ${name}`);
+    navigationRef.dispatch(
       CommonActions.reset({
         index: 0,
         routes: [{ name }],
       })
     );
+  } else {
+    console.warn("⚠️ NavigationRef is not ready");
   }
 }

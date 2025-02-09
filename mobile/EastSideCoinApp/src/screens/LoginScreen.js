@@ -1,6 +1,12 @@
 import React, { useState, useContext } from "react";
 import { View, Text, TextInput, TouchableOpacity, StyleSheet, ActivityIndicator, Alert } from "react-native";
 import { AuthContext } from "../context/AuthProvider";
+import axios from "axios";
+import Web3 from "web3";
+import AsyncStorage from "@react-native-async-storage/async-storage";
+import { useNavigation } from "@react-navigation/native";
+
+const API_URL = "http://192.168.1.125:8000/api";
 
 const LoginScreen = ({ navigation }) => {
   const [email, setEmail] = useState("");
@@ -12,16 +18,21 @@ const LoginScreen = ({ navigation }) => {
     setLoading(true);
     try {
       console.log("🚀 Attempting Login:", { email, password });
-      await login(email, password); // ✅ Call login from AuthProvider
-      console.log("✅ Login Successful!");
-      navigation.reset({ index: 0, routes: [{ name: "Home" }] });
+  
+      // ✅ Call `login` from `AuthContext`
+      await login(email, password);
+  
+      // 🚀 Do NOT navigate here! `AuthContext` handles it
+      console.log("✅ Login Successful! Handing off navigation to AuthProvider...");
+  
     } catch (error) {
-      console.error("❌ Login Failed:", error.response?.data || error.message);
-      Alert.alert("Login Error", "Invalid email or password.");
+      console.error("❌ Login Failed:", error.message);
+      Alert.alert("Login Error", error.message);
     } finally {
       setLoading(false);
     }
   };
+  
 
   return (
     <View style={styles.container}>

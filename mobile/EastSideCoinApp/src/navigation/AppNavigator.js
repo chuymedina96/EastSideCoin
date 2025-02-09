@@ -17,7 +17,7 @@ import Ionicons from "react-native-vector-icons/Ionicons";
 const Stack = createStackNavigator();
 const Tab = createBottomTabNavigator();
 
-// ✅ Bottom Tabs for Authenticated Users
+// ✅ Define HomeTabs (Ensure it's correctly structured)
 const HomeTabs = () => (
   <Tab.Navigator
     screenOptions={({ route }) => ({
@@ -51,7 +51,7 @@ const AppNavigator = () => {
   return (
     <Stack.Navigator screenOptions={{ headerShown: false }}>
       {user ? (
-        <Stack.Screen name="HomeTabs" component={HomeTabs} />
+        <Stack.Screen name="HomeTabs" component={HomeTabs} />  // ✅ Must match the name used in navigation reset
       ) : (
         <>
           <Stack.Screen name="Landing" component={LandingScreen} />
@@ -62,5 +62,6 @@ const AppNavigator = () => {
     </Stack.Navigator>
   );
 };
+
 
 export default AppNavigator;

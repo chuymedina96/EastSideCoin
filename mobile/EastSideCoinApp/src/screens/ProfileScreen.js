@@ -1,34 +1,9 @@
-import React from "react";
-import { View, Text, StyleSheet, TouchableOpacity, Alert } from "react-native";
-import AsyncStorage from "@react-native-async-storage/async-storage";
-import axios from "axios";
+import React, { useContext } from "react";
+import { View, Text, StyleSheet, TouchableOpacity } from "react-native";
+import { AuthContext } from "../context/AuthProvider";
 
-const API_URL = "http://192.168.1.125:8000/api/logout/";
-
-const ProfileScreen = ({ navigation }) => {
-  const logoutUser = async () => {
-    try {
-      const refreshToken = await AsyncStorage.getItem("refreshToken"); // Ensure this is stored during login
-      if (!refreshToken) {
-        Alert.alert("Error", "No refresh token found. Try logging in again.");
-        return;
-      }
-
-      console.log("📡 Sending Logout Request...");
-
-      await axios.post(API_URL, { token: refreshToken }, { headers: { "Content-Type": "application/json" } });
-
-      await AsyncStorage.removeItem("authToken"); // Remove access token
-      await AsyncStorage.removeItem("refreshToken"); // Remove refresh token
-      await AsyncStorage.removeItem("user");
-
-      Alert.alert("Logged Out", "You have been successfully logged out.");
-      navigation.replace("Landing"); // ✅ Redirect to Landing Page
-    } catch (error) {
-      console.log("❌ Logout Error:", error.response?.data || error.message);
-      Alert.alert("Logout Failed", error.response?.data?.error || "Something went wrong.");
-    }
-  };
+const ProfileScreen = () => {
+  const { logoutUser } = useContext(AuthContext); // ✅ Get logoutUser from AuthContext
 
   return (
     <View style={styles.container}>

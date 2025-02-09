@@ -25,13 +25,11 @@ SECRET_KEY = 'django-insecure-1jb=o$!k9_^uu*qg%=q$(mt@!qm-7yki8j&lz+^%5f16%tk(td
 # SECURITY WARNING: don't run with debug turned on in production!
 DEBUG = True
 
-ALLOWED_HOSTS = ['*']
+ALLOWED_HOSTS = ["192.168.1.125", "0.0.0.0", "localhost"]
 
 CORS_ALLOW_ALL_ORIGINS = True  # Temporarily allow all requests
 
 CORS_ALLOWED_ORIGINS = [
-    "http://localhost:19006",  # ✅ React Native Expo
-    "http://localhost:8000", # ✅ Django API
     "http://192.168.1.125:8000",# ✅ Django API
     "http://192.168.1.125:8081" # ✅ React Native Expo
 ]
