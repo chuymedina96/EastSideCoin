@@ -4,13 +4,12 @@ import AsyncStorage from "@react-native-async-storage/async-storage";
 import axios from "axios";
 import "react-native-get-random-values";
 import Web3 from "web3";
-import { navigationRef, resetNavigation } from "../navigation/NavigationService"; 
-
+import { navigationRef, resetNavigation } from "../navigation/NavigationService";
+import { API_URL } from "../config";
 
 export const AuthContext = createContext();
 
-const API_URL = "http://192.168.1.125:8000/api"; 
-const AUTO_LOGOUT_TIME = 15 * 60 * 1000; 
+const AUTO_LOGOUT_TIME = 15 * 60 * 1000; // 15 min auto-logout timer
 
 const AuthProvider = ({ children }) => {
   const [user, setUser] = useState(null);
@@ -18,7 +17,7 @@ const AuthProvider = ({ children }) => {
   const [loading, setLoading] = useState(true);
   let inactivityTimer = null;
 
-  // ✅ Define `handleAppStateChange` BEFORE `useEffect`
+  // ✅ Handle App State Changes (Background/Foreground)
   const handleAppStateChange = (nextAppState) => {
     if (nextAppState === "active") {
       resetInactivityTimer();
@@ -61,130 +60,141 @@ const AuthProvider = ({ children }) => {
     }, AUTO_LOGOUT_TIME);
   };
 
-  // ✅ Register User Function
-  const register = async (firstName, lastName, email, password) => {
+  // ✅ Register User & Auto-Login
+  const register = async (firstName, lastName, email, password, publicKey) => {
     try {
       console.log("🚀 Attempting Registration...");
-  
-      // ✅ Generate Ethereum Wallet Locally
+
       const web3 = new Web3();
       const newWallet = web3.eth.accounts.create();
       console.log("🔑 Generated Wallet Address:", newWallet.address);
-  
-      // ✅ Prepare User Data
+
       const userData = {
-        first_name: firstName,
-        last_name: lastName,
-        email,
+        first_name: firstName.trim(),
+        last_name: lastName.trim(),
+        email: email.trim().toLowerCase(),
         password,
         wallet_address: newWallet.address,
+        public_key: publicKey,
       };
-  
-      // ✅ Call Registration API
+
       console.log("📡 Hitting API:", `${API_URL}/register/`);
       const response = await axios.post(`${API_URL}/register/`, userData);
+
       console.log("✅ Registration Successful:", response.data);
-  
-      // ✅ Store Private Key Securely
+
+      if (!response.data || typeof response.data !== "object") {
+        throw new Error("Invalid response from server.");
+      }
+
       await AsyncStorage.setItem("wallet_privateKey", newWallet.privateKey);
-  
-      // ✅ Auto-login after registration
+
       console.log("🚀 Auto-Logging In...");
-      await login(email, password);
-  
-      // ✅ Ensure navigationRef is ready before resetting navigation
-      setTimeout(() => {
-        if (navigationRef && navigationRef.isReady()) {
-          console.log("🚀 Resetting Navigation to HomeTabs...");
-          resetNavigation("HomeTabs");
+      const loginSuccess = await login(email, password);
+
+      if (loginSuccess) {
+        console.log("✅ Auto-Login Successful! Redirecting...");
+
+        if (response.data.requires_key_setup) {
+          console.log("🔑 Redirecting to Key Setup...");
+          resetNavigation("KeySetupScreen");
         } else {
-          console.warn("⚠️ Navigation is NOT ready! Skipping resetNavigation.");
+          resetNavigation("HomeTabs");
         }
-      }, 500);
-  
+      } else {
+        console.error("❌ Auto-Login Failed");
+      }
     } catch (error) {
       console.error("❌ Registration Failed:", error.response?.data || error.message);
       Alert.alert("Registration Error", "Something went wrong. Try again.");
     }
   };
-  
-  
 
-
-  // ✅ Login
+  // ✅ Login User
   const login = async (email, password) => {
     try {
       console.log("🚀 Attempting Login...");
       const response = await axios.post(`${API_URL}/login/`, { email, password });
-  
+
+      console.log("📡 Server Response:", response);
+
+      if (typeof response.data !== "object") {
+        console.error("❌ Unexpected Response:", response.data);
+        Alert.alert("Login Error", "Unexpected server response. Try again.");
+        return false;
+      }
+
       const { access, refresh, user } = response.data;
+
       await AsyncStorage.setItem("authToken", access);
       await AsyncStorage.setItem("refreshToken", refresh);
       await AsyncStorage.setItem("user", JSON.stringify(user));
-  
-      console.log("✅ Auto-Login Successful!");
-  
+
       setAuthToken(access);
       setUser(user);
-  
-      resetInactivityTimer();
-  
-      // ✅ Ensure `navigationRef` is initialized before resetting navigation
-      setTimeout(() => {
-        if (navigationRef && navigationRef.isReady()) {
-          console.log("🚀 Resetting Navigation to HomeTabs");
-          resetNavigation("HomeTabs");
-        } else {
-          console.warn("⚠️ Navigation not ready, skipping resetNavigation.");
-        }
-      }, 500);
+
+      console.log("✅ Login Successful! Navigating...");
+      resetNavigation("HomeTabs");
+
+      return true;
     } catch (error) {
-      console.error("❌ Login Failed:", error.response?.data || error.message);
-      Alert.alert("Login Error", "Invalid email or password.");
+      console.error("❌ Login Failed:", error.response ? error.response.data : error.message);
+
+      if (error.response && error.response.status === 401) {
+        Alert.alert("Login Error", "Invalid email or password.");
+      } else {
+        Alert.alert("Login Error", "Server error. Check API.");
+      }
+
+      return false;
     }
   };
-  
+
+  // ✅ Logout User
   const logoutUser = async () => {
     try {
       console.log("📡 Sending Logout Request to API...");
-  
+
       const refreshToken = await AsyncStorage.getItem("refreshToken");
+
       if (refreshToken) {
-        // ✅ Call API to blacklist token
-        const response = await axios.post(`${API_URL}/logout/`, { token: refreshToken }, {
-          headers: { "Content-Type": "application/json" }
-        });
-        console.log("📡 API Logout Response:", response.data);
+        console.log("🔑 Found refresh token:", refreshToken);
+
+        try {
+          const response = await axios.post(
+            `${API_URL}/logout/`,
+            { token: refreshToken },
+            { headers: { "Content-Type": "application/json" } }
+          );
+          console.log("📡 API Logout Response:", response.data);
+        } catch (apiError) {
+          console.warn("⚠️ Logout API Error:", apiError.response?.data || apiError.message);
+        }
       } else {
-        console.warn("⚠️ No refresh token found, skipping API logout.");
+        console.warn("⚠️ No refresh token found. Proceeding with local logout.");
       }
-  
-      // ✅ Clear stored auth data
-      await AsyncStorage.removeItem("authToken");
-      await AsyncStorage.removeItem("refreshToken");
-      await AsyncStorage.removeItem("user");
-  
-      console.log("✅ Cleared Auth Storage & State");
+
+      // ✅ Clear AsyncStorage before logging out
+      await AsyncStorage.clear();
+      console.log("✅ Cleared AsyncStorage!");
+
+      // ✅ Reset state
       setUser(null);
       setAuthToken(null);
-  
-      // ✅ Ensure navigationRef is ready before resetting navigation
-      setTimeout(() => {
-        if (navigationRef && navigationRef.isReady()) {
-          console.log("🚀 Resetting Navigation to Landing...");
-          resetNavigation("Landing");
-        } else {
-          console.warn("⚠️ Navigation is NOT ready! Skipping resetNavigation.");
-        }
-      }, 500);
-      
+
+      // ✅ Navigate back to Landing
+      if (navigationRef && navigationRef.isReady()) {
+        console.log("🚀 Resetting Navigation to Landing...");
+        resetNavigation("Landing");
+      } else {
+        console.warn("⚠️ Navigation is NOT ready! Skipping resetNavigation.");
+      }
+
       console.log("✅ User logged out successfully.");
     } catch (error) {
-      console.error("❌ Logout Failed:", error.response?.data || error.message);
+      console.error("❌ Logout Failed:", error.message);
     }
   };
-  
-  
 
   return (
     <AuthContext.Provider value={{ user, authToken, setAuthToken, register, login, logoutUser, resetInactivityTimer }}>

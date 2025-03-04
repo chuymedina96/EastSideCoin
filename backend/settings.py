@@ -38,6 +38,8 @@ CORS_ALLOWED_ORIGINS = [
 # Application definition
 
 INSTALLED_APPS = [
+    'daphne',
+    'channels',
     'corsheaders',
     'django.contrib.admin',
     'django.contrib.auth',
@@ -48,7 +50,6 @@ INSTALLED_APPS = [
     'rest_framework',
     'rest_framework_simplejwt',
     'rest_framework_simplejwt.token_blacklist',
-    'channels',
     'app',  # Single app for users, services, transactions, and chat
 ]
 
@@ -82,15 +83,18 @@ TEMPLATES = [
     },
 ]
 
-WSGI_APPLICATION = 'backend.wsgi.application'
 ASGI_APPLICATION = "backend.asgi.application"
-
 CHANNEL_LAYERS = {
     "default": {
-        "BACKEND": "channels_redis.core.RedisChannelLayer",
-        "CONFIG": {"hosts": [("127.0.0.1", 6379)]},
+        "BACKEND": "channels.layers.InMemoryChannelLayer",  # Use Redis in production
     },
 }
+# CHANNEL_LAYERS = {
+#     "default": {
+#         "BACKEND": "channels_redis.core.RedisChannelLayer",
+#         "CONFIG": {"hosts": [("127.0.0.1", 6379)]},
+#     },
+# }
 
 
 # Database
@@ -178,3 +182,4 @@ ETHEREUM_NODE_URL = "https://mainnet.infura.io/v3/YOUR_INFURA_PROJECT_ID"
 ESC_CONTRACT_ADDRESS = "0xYourESCContractAddress"
 ESC_PRICE_API = "https://api.coingecko.com/api/v3/simple/price?ids=eastside-coin&vs_currencies=usd"
 AUTH_USER_MODEL = "app.User"
+

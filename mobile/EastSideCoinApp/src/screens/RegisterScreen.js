@@ -1,12 +1,21 @@
 import React, { useState, useContext } from "react";
-import { View, Text, TextInput, TouchableOpacity, StyleSheet, Image, ActivityIndicator, Alert } from "react-native";
+import {
+  View,
+  Text,
+  TextInput,
+  TouchableOpacity,
+  StyleSheet,
+  Image,
+  ActivityIndicator,
+  Alert,
+} from "react-native";
 import { AuthContext } from "../context/AuthProvider";
 import { useNavigation } from "@react-navigation/native";
 
 const RegisterScreen = () => {
   const { register } = useContext(AuthContext);
   const navigation = useNavigation();
-  
+
   const [firstName, setFirstName] = useState("");
   const [lastName, setLastName] = useState("");
   const [email, setEmail] = useState("");
@@ -16,7 +25,22 @@ const RegisterScreen = () => {
   const handleRegister = async () => {
     setLoading(true);
     try {
-      await register(firstName.trim(), lastName.trim(), email.trim().toLowerCase(), password);
+      console.log("📡 Sending Registration Request...");
+
+      const response = await register(
+        firstName.trim(),
+        lastName.trim(),
+        email.trim().toLowerCase(),
+        password
+      );
+
+      if (response?.requires_key_setup) {
+        console.log("🔑 Redirecting to Key Setup...");
+        navigation.navigate("KeySetupScreen");
+      } else {
+        console.log("✅ Registration Complete! Redirecting to Home...");
+        navigation.navigate("HomeTabs");
+      }
     } catch (error) {
       console.error("❌ Registration Error:", error);
       Alert.alert("Registration Error", "Something went wrong. Try again.");
@@ -27,8 +51,10 @@ const RegisterScreen = () => {
 
   return (
     <View style={styles.container}>
-      {/* Logo */}
-      <Image source={require("../../assets/Eastside Coin.webp")} style={styles.logo} />
+      <Image
+        source={require("../../assets/Eastside Coin.webp")}
+        style={styles.logo}
+      />
       <Text style={styles.title}>Create Your Account</Text>
       <Text style={styles.subtitle}>Join the EastSide Coin community</Text>
 
@@ -67,16 +93,20 @@ const RegisterScreen = () => {
       {loading && <ActivityIndicator size="large" color="#E63946" />}
 
       {/* Register Button */}
-      <TouchableOpacity style={styles.button} onPress={handleRegister} disabled={loading}>
-        <Text style={styles.buttonText}>{loading ? "Registering..." : "Sign Up"}</Text>
+      <TouchableOpacity
+        style={styles.button}
+        onPress={handleRegister}
+        disabled={loading}
+      >
+        <Text style={styles.buttonText}>
+          {loading ? "Registering..." : "Sign Up"}
+        </Text>
       </TouchableOpacity>
 
-      {/* Navigate to Login Screen */}
       <TouchableOpacity onPress={() => navigation.navigate("Login")}>
         <Text style={styles.linkText}>Already have an account? Log in</Text>
       </TouchableOpacity>
 
-      {/* Navigate to Landing Page */}
       <TouchableOpacity onPress={() => navigation.navigate("Landing")}>
         <Text style={styles.backText}>← Back to Landing</Text>
       </TouchableOpacity>
@@ -86,9 +116,20 @@ const RegisterScreen = () => {
 
 // ✅ Styles
 const styles = StyleSheet.create({
-  container: { flex: 1, justifyContent: "center", alignItems: "center", backgroundColor: "#1E1E1E", padding: 20 },
+  container: {
+    flex: 1,
+    justifyContent: "center",
+    alignItems: "center",
+    backgroundColor: "#1E1E1E",
+    padding: 20,
+  },
   logo: { width: 120, height: 120, resizeMode: "contain", marginBottom: 20 },
-  title: { fontSize: 26, fontWeight: "bold", color: "#FFD700", marginBottom: 5 },
+  title: {
+    fontSize: 26,
+    fontWeight: "bold",
+    color: "#FFD700",
+    marginBottom: 5,
+  },
   subtitle: { fontSize: 14, color: "#CCC", textAlign: "center", marginBottom: 25 },
   input: {
     width: "90%",
@@ -97,9 +138,15 @@ const styles = StyleSheet.create({
     padding: 12,
     marginBottom: 12,
     borderRadius: 8,
-    placeholderTextColor: "#AAA",
   },
-  button: { backgroundColor: "#FF4500", padding: 15, borderRadius: 8, width: "90%", alignItems: "center", marginVertical: 10 },
+  button: {
+    backgroundColor: "#FF4500",
+    padding: 15,
+    borderRadius: 8,
+    width: "90%",
+    alignItems: "center",
+    marginVertical: 10,
+  },
   buttonText: { color: "#FFF", fontSize: 18, fontWeight: "bold" },
   linkText: { color: "#FFD700", fontSize: 16, marginTop: 10 },
   backText: { color: "#888", fontSize: 14, marginTop: 20 },

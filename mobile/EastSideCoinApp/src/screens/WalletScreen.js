@@ -2,8 +2,10 @@ import React, { useState, useEffect } from "react";
 import { View, Text, StyleSheet, ActivityIndicator } from "react-native";
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import axios from "axios";
+ import { API_URL } from "../config";
 
-const API_URL = "http://192.168.1.125/api/balance/";
+
+
 
 const WalletScreen = () => {
   const [walletAddress, setWalletAddress] = useState(null);
@@ -18,7 +20,8 @@ const WalletScreen = () => {
         setWalletAddress(parsedUser.wallet_address);
 
         try {
-          const response = await axios.get(`${API_URL}${parsedUser.wallet_address}`);
+          console.log("📡 Fetching Wallet Balance from:", `${API_URL}/balance/${user.wallet_address}/`);
+          const response = await axios.get(`${API_URL}/balance/${user.wallet_address}/`);
           setBalance(response.data.balance);
         } catch (error) {
           console.error("❌ Wallet Fetch Error:", error);
@@ -32,13 +35,11 @@ const WalletScreen = () => {
 
   return (
     <View style={styles.container}>
-      <Text style={styles.title}>My Wallet</Text>
-      {loading ? <ActivityIndicator size="large" color="#FFD700" /> : (
-        <>
-          <Text style={styles.text}>Wallet Address:</Text>
-          <Text style={styles.wallet}>{walletAddress}</Text>
-          <Text style={styles.text}>ESC Balance: {balance}</Text>
-        </>
+      <Text style={styles.title}>Wallet Balance</Text>
+      {loading ? (
+        <ActivityIndicator size="large" color="#FFD700" />
+      ) : (
+        <Text style={styles.balance}>Balance: {balance} ESC</Text>
       )}
     </View>
   );
@@ -51,30 +52,9 @@ WalletScreen.navigationOptions = ({ navigation }) => ({
 
 
 const styles = StyleSheet.create({
-  container: {
-    flex: 1,
-    justifyContent: "center",
-    alignItems: "center",
-    backgroundColor: "#1E1E1E",
-    padding: 20,
-  },
-  title: {
-    fontSize: 24,
-    fontWeight: "bold",
-    color: "#FFD700",
-    marginBottom: 10,
-  },
-  text: {
-    fontSize: 18,
-    color: "#FFF",
-    marginBottom: 5,
-  },
-  wallet: {
-    fontSize: 14,
-    color: "#CCC",
-    textAlign: "center",
-    marginBottom: 10,
-  },
+  container: { flex: 1, justifyContent: "center", alignItems: "center", backgroundColor: "#1E1E1E", padding: 20 },
+  title: { fontSize: 26, fontWeight: "bold", color: "#FFD700", marginBottom: 10 },
+  balance: { fontSize: 20, color: "#FFF" },
 });
 
 export default WalletScreen;

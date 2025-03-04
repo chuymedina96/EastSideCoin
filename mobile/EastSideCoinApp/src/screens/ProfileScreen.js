@@ -2,6 +2,8 @@ import React, { useContext } from "react";
 import { View, Text, StyleSheet, TouchableOpacity } from "react-native";
 import { AuthContext } from "../context/AuthProvider";
 
+
+
 const ProfileScreen = () => {
   const { logoutUser } = useContext(AuthContext); // ✅ Get logoutUser from AuthContext
 
