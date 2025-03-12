@@ -22,12 +22,16 @@ const LoginScreen = () => {
   const handleLogin = async () => {
     setLoading(true);
     console.log("🚀 Attempting Login:", { email, password });
-
+  
     try {
       const success = await login(email.trim().toLowerCase(), password);
       if (success) {
         console.log("✅ Login Successful! Redirecting...");
-        navigation.reset({ index: 0, routes: [{ name: "HomeTabs" }] }); // 🔥 Ensures proper redirection
+  
+        // ✅ Reset navigation properly
+        // navigation.reset({ index: 0, routes: [{ name: "Main" }] });
+
+
       } else {
         console.log("❌ Login Failed! No navigation triggered.");
         Alert.alert("Login Error", "Invalid email or password.");
@@ -39,6 +43,8 @@ const LoginScreen = () => {
       setLoading(false);
     }
   };
+  
+  
 
   return (
     <View style={styles.container}>

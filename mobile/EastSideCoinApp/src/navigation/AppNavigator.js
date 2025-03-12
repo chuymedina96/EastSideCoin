@@ -11,6 +11,7 @@ import WalletScreen from "../screens/WalletScreen";
 import ChatScreen from "../screens/ChatScreen";
 import ServicesScreen from "../screens/ServicesScreen";
 import ProfileScreen from "../screens/ProfileScreen";
+import KeyScreenSetup from "../screens/KeyScreenSetup"; // ✅ Import Key Setup Screen
 
 import Ionicons from "react-native-vector-icons/Ionicons";
 
@@ -44,14 +45,18 @@ const HomeTabs = () => (
   </Tab.Navigator>
 );
 
-// ✅ Main App Navigator (No NavigationContainer here)
+// ✅ Main App Navigator (Ensuring HomeTabs and KeyScreenSetup are Recognized)
 const AppNavigator = () => {
   const { user } = useContext(AuthContext);
 
   return (
     <Stack.Navigator screenOptions={{ headerShown: false }}>
       {user ? (
-        <Stack.Screen name="HomeTabs" component={HomeTabs} />
+        <>
+          {/* 🔥 Explicitly Define HomeTabs and KeyScreenSetup */}
+          <Stack.Screen name="HomeTabs" component={HomeTabs} />
+          <Stack.Screen name="KeyScreenSetup" component={KeyScreenSetup} />
+        </>
       ) : (
         <>
           <Stack.Screen name="Landing" component={LandingScreen} />

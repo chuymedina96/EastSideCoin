@@ -27,6 +27,7 @@ const RegisterScreen = () => {
     try {
       console.log("📡 Sending Registration Request...");
 
+      // ✅ Send registration request (WITHOUT generating keys)
       const response = await register(
         firstName.trim(),
         lastName.trim(),
@@ -36,10 +37,16 @@ const RegisterScreen = () => {
 
       if (response?.requires_key_setup) {
         console.log("🔑 Redirecting to Key Setup...");
-        navigation.navigate("KeySetupScreen");
+        navigation.reset({
+          index: 0,
+          routes: [{ name: "KeyScreenSetup" }], // ✅ Ensures no back navigation
+        });
       } else {
         console.log("✅ Registration Complete! Redirecting to Home...");
-        navigation.navigate("HomeTabs");
+        navigation.reset({
+          index: 0,
+          routes: [{ name: "HomeTabs" }],
+        });
       }
     } catch (error) {
       console.error("❌ Registration Error:", error);

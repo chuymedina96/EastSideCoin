@@ -30,7 +30,7 @@ class User(AbstractUser):
     last_name = models.CharField(max_length=30)
     email = models.EmailField(unique=True)
     password = models.CharField(max_length=128)  # ✅ Ensure password is stored hashed
-    public_key = models.TextField(blank=True, null=True)  # ✅ Store Public Key
+    public_key = models.TextField(null=True, blank=True)  # ✅ Fix for missing public_key field
     wallet_address = models.CharField(
         max_length=42, 
         unique=True, 
@@ -126,3 +126,4 @@ class WalletActivity(models.Model):
 
     def __str__(self):
         return f"WalletActivity({self.activity_type} of {self.amount} ESC by {self.user.email})"
+
