@@ -26,7 +26,7 @@ const RegisterScreen = () => {
     setLoading(true);
     try {
       console.log("📡 Sending Registration Request...");
-
+  
       // ✅ Send registration request (WITHOUT generating keys)
       const response = await register(
         firstName.trim(),
@@ -34,19 +34,13 @@ const RegisterScreen = () => {
         email.trim().toLowerCase(),
         password
       );
-
+  
       if (response?.requires_key_setup) {
         console.log("🔑 Redirecting to Key Setup...");
-        navigation.reset({
-          index: 0,
-          routes: [{ name: "KeyScreenSetup" }], // ✅ Ensures no back navigation
-        });
+        setTimeout(() => resetNavigation("KeyScreenSetup"), 500); // ✅ Ensures it works
       } else {
         console.log("✅ Registration Complete! Redirecting to Home...");
-        navigation.reset({
-          index: 0,
-          routes: [{ name: "HomeTabs" }],
-        });
+        setTimeout(() => resetNavigation("HomeTabs"), 500);
       }
     } catch (error) {
       console.error("❌ Registration Error:", error);
@@ -55,6 +49,7 @@ const RegisterScreen = () => {
       setLoading(false);
     }
   };
+  
 
   return (
     <View style={styles.container}>

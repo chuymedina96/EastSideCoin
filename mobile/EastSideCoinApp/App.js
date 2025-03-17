@@ -1,15 +1,15 @@
 import React from "react";
 import { NavigationContainer } from "@react-navigation/native";
-import { setNavigator } from "./src/navigation/NavigationService";
+import { navigationRef } from "./src/navigation/NavigationService"; // ✅ Correct import path
 import AuthProvider from "./src/context/AuthProvider";
 import AppNavigator from "./src/navigation/AppNavigator";
 
 export default function App() {
   return (
-    <NavigationContainer ref={(ref) => setNavigator(ref)}>
-      <AuthProvider>
+    <AuthProvider>
+      <NavigationContainer ref={navigationRef}>
         <AppNavigator />
-      </AuthProvider>
-    </NavigationContainer>
+      </NavigationContainer>
+    </AuthProvider>
   );
 }

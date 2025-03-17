@@ -1,27 +1,41 @@
-import { CommonActions } from "@react-navigation/native";
+import { createNavigationContainerRef, CommonActions } from "@react-navigation/native";
 
-let navigator;
+export const navigationRef = createNavigationContainerRef();
 
-export function setNavigator(nav) {
-  navigator = nav;
-}
-
+/**
+ * Reset navigation stack to a specific route.
+ */
 export function resetNavigation(routeName) {
-  if (!navigator) {
-    console.warn(`⚠️ Navigation is NOT initialized! Cannot navigate to ${routeName}.`);
+  if (!navigationRef.isReady()) {
+    console.warn(`⚠️ Navigation is NOT ready! Skipping reset to ${routeName}.`);
     return;
   }
 
-  if (navigator.isReady()) {
-    console.log(`🚀 Resetting Navigation to ${routeName}`);
+  console.log(`🚀 Resetting Navigation to ${routeName}`);
 
-    navigator.dispatch(
-      CommonActions.reset({
-        index: 0,
-        routes: [{ name: "HomeTabs", params: { screen: routeName } }],
-      })
-    );
-  } else {
-    console.warn(`⚠️ Navigation is NOT ready yet! Cannot navigate to ${routeName}.`);
+  navigationRef.dispatch(
+    CommonActions.reset({
+      index: 0,
+      routes: [{ name: routeName }],
+    })
+  );
+}
+
+/**
+ * Navigate to a specific route.
+ */
+export function navigate(routeName, params = {}) {
+  if (!navigationRef.isReady()) {
+    console.warn(`⚠️ Navigation is NOT ready! Skipping navigation to ${routeName}.`);
+    return;
   }
+
+  console.log(`📡 Navigating to ${routeName}`);
+
+  navigationRef.dispatch(
+    CommonActions.navigate({
+      name: routeName,
+      params,
+    })
+  );
 }

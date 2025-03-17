@@ -53,7 +53,7 @@ const AppNavigator = () => {
     <Stack.Navigator screenOptions={{ headerShown: false }}>
       {user ? (
         <>
-          {/* 🔥 Explicitly Define HomeTabs and KeyScreenSetup */}
+          {/* 🔥 Ensure HomeTabs and KeyScreenSetup are explicitly defined */}
           <Stack.Screen name="HomeTabs" component={HomeTabs} />
           <Stack.Screen name="KeyScreenSetup" component={KeyScreenSetup} />
         </>

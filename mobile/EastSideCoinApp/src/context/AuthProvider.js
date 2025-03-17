@@ -7,6 +7,7 @@ import Web3 from "web3";
 import { navigationRef, resetNavigation } from "../navigation/NavigationService";
 import { API_URL } from "../config";
 
+
 export const AuthContext = createContext();
 
 const AUTO_LOGOUT_TIME = 15 * 60 * 1000; // 15-minute auto-logout
@@ -96,26 +97,10 @@ const AuthProvider = ({ children }) => {
   
         if (response.data.requires_key_setup) {
           console.log("🔑 Redirecting to Key Setup...");
-  
-          if (navigationRef.isReady()) {
-            navigationRef.reset({
-              index: 0,
-              routes: [{ name: "KeyScreenSetup" }],
-            });
-          } else {
-            console.warn("⚠️ Navigation is not ready. Skipping reset.");
-          }
+          setTimeout(() => resetNavigation("KeyScreenSetup"), 500); // ✅ Small delay ensures navigation is ready
         } else {
           console.log("✅ Registration Complete! Redirecting to Home...");
-  
-          if (navigationRef.isReady()) {
-            navigationRef.reset({
-              index: 0,
-              routes: [{ name: "HomeTabs" }],
-            });
-          } else {
-            console.warn("⚠️ Navigation is not ready. Skipping reset.");
-          }
+          setTimeout(() => resetNavigation("HomeTabs"), 500); // ✅ Delay for safety
         }
       } else {
         console.error("❌ Auto-Login Failed");
@@ -125,6 +110,7 @@ const AuthProvider = ({ children }) => {
       Alert.alert("Registration Error", "Something went wrong. Try again.");
     }
   };
+  
   
 
 
