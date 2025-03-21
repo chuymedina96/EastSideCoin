@@ -10,11 +10,9 @@ import {
   Alert,
 } from "react-native";
 import { AuthContext } from "../context/AuthProvider";
-import { useNavigation } from "@react-navigation/native";
 
 const RegisterScreen = () => {
   const { register } = useContext(AuthContext);
-  const navigation = useNavigation();
 
   const [firstName, setFirstName] = useState("");
   const [lastName, setLastName] = useState("");
@@ -26,22 +24,13 @@ const RegisterScreen = () => {
     setLoading(true);
     try {
       console.log("📡 Sending Registration Request...");
-  
-      // ✅ Send registration request (WITHOUT generating keys)
-      const response = await register(
+      // Send registration request; navigation is automatically handled in AuthProvider
+      await register(
         firstName.trim(),
         lastName.trim(),
         email.trim().toLowerCase(),
         password
       );
-  
-      if (response?.requires_key_setup) {
-        console.log("🔑 Redirecting to Key Setup...");
-        setTimeout(() => resetNavigation("KeyScreenSetup"), 500); // ✅ Ensures it works
-      } else {
-        console.log("✅ Registration Complete! Redirecting to Home...");
-        setTimeout(() => resetNavigation("HomeTabs"), 500);
-      }
     } catch (error) {
       console.error("❌ Registration Error:", error);
       Alert.alert("Registration Error", "Something went wrong. Try again.");
@@ -49,7 +38,6 @@ const RegisterScreen = () => {
       setLoading(false);
     }
   };
-  
 
   return (
     <View style={styles.container}>
@@ -92,11 +80,16 @@ const RegisterScreen = () => {
         onChangeText={setPassword}
       />
 
-      {loading && <ActivityIndicator size="large" color="#E63946" />}
+      {loading && (
+        <View style={styles.loadingContainer}>
+          <ActivityIndicator size="large" color="#E63946" />
+          <Text style={styles.loadingText}>Registering your account...</Text>
+        </View>
+      )}
 
       {/* Register Button */}
       <TouchableOpacity
-        style={styles.button}
+        style={[styles.button, loading && styles.disabledButton]}
         onPress={handleRegister}
         disabled={loading}
       >
@@ -104,19 +97,10 @@ const RegisterScreen = () => {
           {loading ? "Registering..." : "Sign Up"}
         </Text>
       </TouchableOpacity>
-
-      <TouchableOpacity onPress={() => navigation.navigate("Login")}>
-        <Text style={styles.linkText}>Already have an account? Log in</Text>
-      </TouchableOpacity>
-
-      <TouchableOpacity onPress={() => navigation.navigate("Landing")}>
-        <Text style={styles.backText}>← Back to Landing</Text>
-      </TouchableOpacity>
     </View>
   );
 };
 
-// ✅ Styles
 const styles = StyleSheet.create({
   container: {
     flex: 1,
@@ -125,14 +109,24 @@ const styles = StyleSheet.create({
     backgroundColor: "#1E1E1E",
     padding: 20,
   },
-  logo: { width: 120, height: 120, resizeMode: "contain", marginBottom: 20 },
+  logo: {
+    width: 120,
+    height: 120,
+    resizeMode: "contain",
+    marginBottom: 20,
+  },
   title: {
     fontSize: 26,
     fontWeight: "bold",
     color: "#FFD700",
     marginBottom: 5,
   },
-  subtitle: { fontSize: 14, color: "#CCC", textAlign: "center", marginBottom: 25 },
+  subtitle: {
+    fontSize: 14,
+    color: "#CCC",
+    textAlign: "center",
+    marginBottom: 25,
+  },
   input: {
     width: "90%",
     backgroundColor: "#333",
@@ -140,6 +134,8 @@ const styles = StyleSheet.create({
     padding: 12,
     marginBottom: 12,
     borderRadius: 8,
+    borderColor: "#FFD700",
+    borderWidth: 1,
   },
   button: {
     backgroundColor: "#FF4500",
@@ -149,9 +145,23 @@ const styles = StyleSheet.create({
     alignItems: "center",
     marginVertical: 10,
   },
-  buttonText: { color: "#FFF", fontSize: 18, fontWeight: "bold" },
-  linkText: { color: "#FFD700", fontSize: 16, marginTop: 10 },
-  backText: { color: "#888", fontSize: 14, marginTop: 20 },
+  disabledButton: {
+    backgroundColor: "#555",
+  },
+  buttonText: {
+    color: "#FFF",
+    fontSize: 18,
+    fontWeight: "bold",
+  },
+  loadingContainer: {
+    alignItems: "center",
+    marginVertical: 10,
+  },
+  loadingText: {
+    color: "#FFD700",
+    fontSize: 16,
+    marginTop: 5,
+  },
 });
 
 export default RegisterScreen;
