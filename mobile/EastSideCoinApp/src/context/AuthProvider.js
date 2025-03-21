@@ -88,7 +88,8 @@ const AuthProvider = ({ children }) => {
 
       await AsyncStorage.setItem("wallet_privateKey", newWallet.privateKey);
       console.log("🚀 Auto-Logging In...");
-      const loginSuccess = await login(email, password);
+      const loginSuccess = await login(email, password, true); // 👈 skipRedirect = true
+
 
       if (loginSuccess) {
         console.log("✅ Auto-Login Successful! Redirecting...");
@@ -112,28 +113,33 @@ const AuthProvider = ({ children }) => {
   };
 
   // Login User
-  const login = async (email, password) => {
+  const login = async (email, password, skipRedirect = false) => {
     try {
       console.log("🚀 Attempting Login...");
       const response = await axios.post(`${API_URL}/login/`, { email, password });
       console.log("📡 Server Response:", response);
-
+  
       if (typeof response.data !== "object") {
         console.error("❌ Unexpected Response:", response.data);
         Alert.alert("Login Error", "Unexpected server response. Try again.");
         return false;
       }
-
+  
       const { access, refresh, user } = response.data;
       await AsyncStorage.setItem("authToken", access);
       await AsyncStorage.setItem("refreshToken", refresh);
       await AsyncStorage.setItem("user", JSON.stringify(user));
-
+  
       setAuthToken(access);
       setUser(user);
-      console.log("✅ Login Successful! Navigating...");
-
-      resetNavigation("Home");
+      console.log("✅ Login Successful!");
+  
+      // ✅ Only redirect if not suppressed
+      if (!skipRedirect) {
+        console.log("🚀 Resetting Navigation to HomeTabs");
+        resetNavigation("HomeTabs");
+      }
+  
       return true;
     } catch (error) {
       console.error("❌ Login Failed:", error.response ? error.response.data : error.message);
@@ -145,6 +151,7 @@ const AuthProvider = ({ children }) => {
       return false;
     }
   };
+  
 
   // Logout User
   const logoutUser = async () => {
