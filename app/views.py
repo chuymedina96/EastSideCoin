@@ -314,4 +314,15 @@ def check_balance(request, wallet_address):
     except Exception as e:
         print(f"❌ ERROR Fetching Balance: {e}")
         return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+    
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def get_user_public_key(request, user_id):
+    try:
+        user = User.objects.get(id=user_id)
+        if not user.public_key:
+            return Response({"error": "Public key not available."}, status=404)
+        return Response({"public_key": user.public_key})
+    except User.DoesNotExist:
+        return Response({"error": "User not found."}, status=404)
 

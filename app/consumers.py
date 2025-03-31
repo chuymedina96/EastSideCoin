@@ -5,6 +5,8 @@ from rest_framework_simplejwt.tokens import AccessToken
 from django.contrib.auth import get_user_model
 import json
 
+from app.models import ChatMessage
+
 User = get_user_model()
 
 class ChatConsumer(AsyncWebsocketConsumer):
@@ -29,8 +31,16 @@ class ChatConsumer(AsyncWebsocketConsumer):
 
     async def receive(self, text_data):
         data = json.loads(text_data)
+
+        
         receiver_id = data["receiver_id"]
         encrypted_message = data["encrypted_message"]
+        
+        print("📥 Message received via WebSocket")
+        print("📥 Message Received:", data)
+        print("From:", self.user.email)
+        print("To:", receiver_id)
+        print("Encrypted message:", encrypted_message)
 
         receiver = await database_sync_to_async(User.objects.get)(id=receiver_id)
         message = await database_sync_to_async(ChatMessage.objects.create)(

@@ -9,6 +9,7 @@ from .views import (
     get_messages,
     mark_message_read,
     check_balance,
+    get_user_public_key
 )
 
 urlpatterns = [
@@ -17,6 +18,7 @@ urlpatterns = [
     path("logout/", logout_user, name="logout"),  # ✅ User logout
     path("generate_keys/", generate_keys, name="generate_keys"),  # ✅ NEW: Key Generation Endpoint
     path("users/search/", search_users, name="search_users"),  # ✅ Search users by name/email
+    path("users/<int:user_id>/public_key/", get_user_public_key), # ✅ Get public key of a user
     
     # ✅ Messages (Grouped URLs)
     path("messages/send/", send_message, name="send_message"),  # ✅ Send encrypted messages

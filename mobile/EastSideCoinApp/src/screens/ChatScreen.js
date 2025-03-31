@@ -1,12 +1,21 @@
 import React, { useState, useEffect, useContext } from "react";
-import { View, Text, TextInput, TouchableOpacity, FlatList, StyleSheet, Alert, KeyboardAvoidingView, Platform } from "react-native";
+import {
+  View,
+  Text,
+  TextInput,
+  TouchableOpacity,
+  FlatList,
+  StyleSheet,
+  Alert,
+  KeyboardAvoidingView,
+  Platform,
+} from "react-native";
+import { SafeAreaView } from "react-native-safe-area-context";
 import { AuthContext } from "../context/AuthProvider";
 import { API_URL, WS_URL } from "../config";
 import { debounce } from "lodash";
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import { encryptAES, encryptRSA, decryptAES } from "../utils/encryption";
-
-// ✅ Alternative Simple Chat Component
 import SimpleChat from "react-native-simple-chat";
 
 const ChatScreen = ({ navigation }) => {
@@ -17,7 +26,7 @@ const ChatScreen = ({ navigation }) => {
   const [selectedUser, setSelectedUser] = useState(null);
   const [ws, setWs] = useState(null);
 
-  // ✅ Ensure User Has Encryption Keys Before Using Chat
+  // ✅ Ensure user has encryption keys
   useEffect(() => {
     const checkEncryptionSetup = async () => {
       const privateKey = await AsyncStorage.getItem("privateKey");
@@ -29,7 +38,7 @@ const ChatScreen = ({ navigation }) => {
     checkEncryptionSetup();
   }, []);
 
-  // ✅ Fetch Users (Debounced)
+  // ✅ Debounced user search
   const fetchUsers = debounce(async (query) => {
     if (query.length < 2) return;
     try {
@@ -47,11 +56,12 @@ const ChatScreen = ({ navigation }) => {
     fetchUsers(search);
   }, [search]);
 
-  // ✅ Open WebSocket when a user is selected
+  // ✅ Connect WebSocket when user is selected
   useEffect(() => {
     if (!selectedUser) return;
+
     console.log(`🔗 Connecting WebSocket for ${selectedUser.id}`);
-    const wsConnection = new WebSocket(`${WS_URL}/chat/${selectedUser.id}/`);
+    const wsConnection = new WebSocket(`${WS_URL}/chat/?token=${authToken}`);
 
     wsConnection.onopen = () => console.log("✅ WebSocket Connected");
     wsConnection.onmessage = (event) => {
@@ -76,9 +86,9 @@ const ChatScreen = ({ navigation }) => {
     return () => wsConnection.close();
   }, [selectedUser]);
 
-  // ✅ Send Encrypted Message
+  // ✅ Send encrypted message
   const sendMessage = async (messageText) => {
-    if (!selectedUser) return;
+    if (!selectedUser || !ws) return;
 
     const privateKey = await AsyncStorage.getItem("privateKey");
     if (!privateKey) {
@@ -87,15 +97,34 @@ const ChatScreen = ({ navigation }) => {
       return;
     }
 
+    if (ws.readyState !== WebSocket.OPEN) {
+      Alert.alert("WebSocket not connected. Try again.");
+      return;
+    }
+
     try {
-      const publicKey = await AsyncStorage.getItem(`publicKey_${selectedUser.id}`);
+      let publicKey = await AsyncStorage.getItem(`publicKey_${selectedUser.id}`);
       if (!publicKey) {
-        Alert.alert("Encryption Error", "Public key not found for this user.");
-        return;
+        const response = await fetch(`${API_URL}/users/${selectedUser.id}/public_key/`, {
+          headers: { Authorization: `Bearer ${authToken}` },
+        });
+        const data = await response.json();
+
+        if (!data.public_key) {
+          Alert.alert("Encryption Error", "Public key not found for this user.");
+          return;
+        }
+
+        publicKey = data.public_key;
+        await AsyncStorage.setItem(`publicKey_${selectedUser.id}`, publicKey);
       }
 
       const encryptedMessage = encryptAES(messageText);
       const encryptedKey = encryptRSA(encryptedMessage.key, publicKey);
+
+      console.log("🛫 Sending message to:", selectedUser.id);
+      console.log("📦 Encrypted Message:", encryptedMessage.encryptedText);
+      console.log("🔐 Encrypted AES Key:", encryptedKey);
 
       ws.send(
         JSON.stringify({
@@ -116,51 +145,103 @@ const ChatScreen = ({ navigation }) => {
       ]);
     } catch (error) {
       console.error("❌ Error sending message:", error);
+      Alert.alert("Send Error", "Failed to send message.");
     }
   };
 
   return (
-    <KeyboardAvoidingView behavior={Platform.OS === "ios" ? "padding" : "height"} style={styles.container}>
-      {/* Back Button */}
-      <TouchableOpacity style={styles.backButton} onPress={() => navigation.goBack()}>
-        <Text style={styles.backText}>← Back</Text>
-      </TouchableOpacity>
+    <SafeAreaView style={styles.safeContainer}>
+      <KeyboardAvoidingView behavior={Platform.OS === "ios" ? "padding" : "height"} style={styles.container}>
+        {/* Back Button */}
+        <TouchableOpacity style={styles.backButton} onPress={() => navigation.goBack()}>
+          <Text style={styles.backText}>← Back</Text>
+        </TouchableOpacity>
 
-      {/* Search Users */}
-      <TextInput style={styles.searchInput} placeholder="🔍 Search users..." placeholderTextColor="#AAA" value={search} onChangeText={setSearch} />
+        {/* Search Users */}
+        <TextInput
+          style={styles.searchInput}
+          placeholder="🔍 Search users..."
+          placeholderTextColor="#AAA"
+          value={search}
+          onChangeText={setSearch}
+        />
 
-      {/* Chat Section */}
-      {selectedUser ? (
-        <SimpleChat
-          messages={messages}
-          onSend={(text) => sendMessage(text)}
-          user={{ _id: user.id, name: "You" }}
-          placeholder="Type a message..."
-          inputStyle={styles.input}
-        />
-      ) : (
-        <FlatList
-          data={users}
-          keyExtractor={(item) => item.id.toString()}
-          renderItem={({ item }) => (
-            <TouchableOpacity style={styles.userItem} onPress={() => setSelectedUser(item)}>
-              <Text style={styles.userText}>{item.first_name} {item.last_name}</Text>
-            </TouchableOpacity>
-          )}
-        />
-      )}
-    </KeyboardAvoidingView>
+        {/* Chat Section */}
+        {selectedUser ? (
+          <SimpleChat
+            messages={messages}
+            onPressSendButton={(text) => sendMessage(text)}
+            user={{ _id: user.id, name: "You" }}
+            placeholder="Type a message..."
+            inputStyle={styles.input}
+          />
+        ) : (
+          <FlatList
+            data={users}
+            keyExtractor={(item) => item.id.toString()}
+            renderItem={({ item }) => (
+              <TouchableOpacity
+                style={[
+                  styles.userItem,
+                  selectedUser?.id === item.id && { backgroundColor: "#666" },
+                ]}
+                onPress={() => setSelectedUser(item)}
+              >
+                <Text style={styles.userText}>
+                  {item.first_name} {item.last_name}
+                </Text>
+              </TouchableOpacity>
+            )}
+          />
+        )}
+      </KeyboardAvoidingView>
+    </SafeAreaView>
   );
 };
 
 const styles = StyleSheet.create({
-  container: { flex: 1, backgroundColor: "#1E1E1E", padding: 15 },
-  backButton: { padding: 10, backgroundColor: "#333", borderRadius: 5, alignSelf: "flex-start", marginBottom: 10 },
-  backText: { color: "#FFD700", fontSize: 16 },
-  searchInput: { backgroundColor: "#222", padding: 12, color: "#FFF", borderRadius: 10, marginBottom: 10 },
-  userItem: { padding: 15, backgroundColor: "#444", borderRadius: 8, marginBottom: 10 },
-  userText: { color: "#FFF", fontSize: 16 },
-  input: { backgroundColor: "#333", padding: 10, color: "#FFF", borderRadius: 8 },
+  safeContainer: {
+    flex: 1,
+    backgroundColor: "#1E1E1E",
+  },
+  container: {
+    flex: 1,
+    padding: 15,
+  },
+  backButton: {
+    padding: 10,
+    backgroundColor: "#333",
+    borderRadius: 5,
+    alignSelf: "flex-start",
+    marginBottom: 10,
+  },
+  backText: {
+    color: "#FFD700",
+    fontSize: 16,
+  },
+  searchInput: {
+    backgroundColor: "#222",
+    padding: 12,
+    color: "#FFF",
+    borderRadius: 10,
+    marginBottom: 10,
+  },
+  userItem: {
+    padding: 15,
+    backgroundColor: "#444",
+    borderRadius: 8,
+    marginBottom: 10,
+  },
+  userText: {
+    color: "#FFF",
+    fontSize: 16,
+  },
+  input: {
+    backgroundColor: "#333",
+    padding: 10,
+    color: "#FFF",
+    borderRadius: 8,
+  },
 });
 
 export default ChatScreen;

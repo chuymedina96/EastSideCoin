@@ -126,15 +126,24 @@ const AuthProvider = ({ children }) => {
       }
   
       const { access, refresh, user } = response.data;
+  
+      // ✅ Save tokens and user info
       await AsyncStorage.setItem("authToken", access);
       await AsyncStorage.setItem("refreshToken", refresh);
       await AsyncStorage.setItem("user", JSON.stringify(user));
+  
+      // ✅ Sync public key if it exists
+      if (user.public_key) {
+        await AsyncStorage.setItem("publicKey", user.public_key);
+        console.log("🔑 Public key synced from server");
+      } else {
+        console.warn("⚠️ No public key found on server for this user.");
+      }
   
       setAuthToken(access);
       setUser(user);
       console.log("✅ Login Successful!");
   
-      // ✅ Only redirect if not suppressed
       if (!skipRedirect) {
         console.log("🚀 Resetting Navigation to HomeTabs");
         resetNavigation("HomeTabs");
@@ -152,6 +161,7 @@ const AuthProvider = ({ children }) => {
     }
   };
   
+  
 
   // Logout User
   const logoutUser = async () => {
@@ -159,6 +169,8 @@ const AuthProvider = ({ children }) => {
       console.log("📡 Sending Logout Request to API...");
       const refreshToken = await AsyncStorage.getItem("refreshToken");
       const accessToken = await AsyncStorage.getItem("authToken");
+      const privateKey = await AsyncStorage.getItem("privateKey"); // 🛑 Backup before clearing
+  
       if (refreshToken && accessToken) {
         console.log("🔑 Found refresh token:", refreshToken);
         console.log("🔐 Using access token:", accessToken);
@@ -180,24 +192,32 @@ const AuthProvider = ({ children }) => {
       } else {
         console.warn("⚠️ No refresh token or access token found. Proceeding with local logout.");
       }
-
+  
+      // 🧼 Clear all storage
       await AsyncStorage.clear();
-      console.log("✅ Cleared AsyncStorage!");
+  
+      // 🔁 Restore private key
+      if (privateKey) {
+        await AsyncStorage.setItem("privateKey", privateKey);
+        console.log("🔐 Private key restored after logout.");
+      }
+  
       setUser(null);
       setAuthToken(null);
-
+  
       if (navigationRef && navigationRef.isReady()) {
         console.log("🚀 Resetting Navigation to Landing...");
         resetNavigation("Landing");
       } else {
         console.warn("⚠️ Navigation is NOT ready! Skipping resetNavigation.");
       }
-
+  
       console.log("✅ User logged out successfully.");
     } catch (error) {
       console.error("❌ Logout Failed:", error.message);
     }
   };
+  
 
   return (
     <AuthContext.Provider

@@ -9,6 +9,7 @@ import {
   Animated,
   StyleSheet,
   Platform,
+  InteractionManager,
 } from "react-native";
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import forge from "node-forge";
@@ -17,14 +18,12 @@ import { API_URL } from "../config";
 import { resetNavigation } from "../navigation/NavigationService";
 import { useNavigation } from "@react-navigation/native";
 
-// Utility delay function
-const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-
 const KeyScreenSetup = () => {
   const navigation = useNavigation();
   const [loading, setLoading] = useState(false);
   const [keysGenerated, setKeysGenerated] = useState(false);
-  const [progress] = useState(new Animated.Value(0)); // progress from 0 to 100
+  const [progress] = useState(new Animated.Value(0));
+  const [percentage, setPercentage] = useState(0);
   const [step, setStep] = useState("Ready to generate keys");
 
   useEffect(() => {
@@ -43,74 +42,76 @@ const KeyScreenSetup = () => {
       duration: 500,
       useNativeDriver: false,
     }).start();
+    setPercentage(toValue);
+  };
+
+  const wait = (ms) => new Promise((res) => setTimeout(res, ms));
+
+  const showNotification = (msg) => {
+    if (Platform.OS === "android") {
+      ToastAndroid.show(msg, ToastAndroid.SHORT);
+    } else {
+      Alert.alert("Notification", msg);
+    }
   };
 
   const generateKeys = async (inBackground = false) => {
-    setLoading(true);
-    animateProgress(10);
-    setStep("Generating RSA key pair...");
-    await delay(150); // slight delay for UI update
-
-    let keyPair;
     try {
-      keyPair = forge.pki.rsa.generateKeyPair({ bits: 2048 });
-    } catch (err) {
-      console.error("RSA generation error:", err);
-      Alert.alert("Error", "Failed to generate RSA keys.");
-      setLoading(false);
-      return;
-    }
-    animateProgress(50);
-    setStep("Encrypting and preparing keys...");
-    await delay(150);
+      setLoading(true);
+      setStep("🔐 Generating RSA key pair...");
+      animateProgress(10);
+      await wait(150);
 
-    const publicKey = forge.pki.publicKeyToPem(keyPair.publicKey);
-    const privateKey = forge.pki.privateKeyToPem(keyPair.privateKey);
+      const keyPair = forge.pki.rsa.generateKeyPair({ bits: 2048 });
+ 
+      setStep("🔒 Encrypting keys...");
+      animateProgress(30);
+      await wait(150);
 
-    console.log("✅ RSA Key Pair Generated!");
-    await AsyncStorage.setItem("privateKey", privateKey);
+      const publicKey = forge.pki.publicKeyToPem(keyPair.publicKey);
+      const privateKey = forge.pki.privateKeyToPem(keyPair.privateKey);
 
-    const authToken = await AsyncStorage.getItem("authToken");
-    if (!authToken) {
-      Alert.alert("Session Expired", "Please log in again.");
-      resetNavigation("Login");
-      setLoading(false);
-      return;
-    }
+      await AsyncStorage.setItem("privateKey", privateKey);
 
-    animateProgress(75);
-    setStep("Storing public key on server...");
-    await delay(150);
+      setStep("🔑 Validating user session...");
+      animateProgress(50);
+      await wait(150);
 
-    try {
-      const response = await axios.post(
+      const authToken = await AsyncStorage.getItem("authToken");
+      if (!authToken) {
+        Alert.alert("Session Expired", "Please log in again.");
+        resetNavigation("Login");
+        return;
+      }
+
+      setStep("📡 Sending public key to server...");
+      animateProgress(80);
+      await wait(150);
+
+      const res = await axios.post(
         `${API_URL}/generate_keys/`,
         { public_key: publicKey.trim() },
-        { headers: { Authorization: `Bearer ${authToken}` } }
+        {
+          headers: { Authorization: `Bearer ${authToken}` },
+        }
       );
-      console.log("✅ Keys Successfully Stored! Response:", response.data);
+
+      console.log("✅ Keys stored:", res.data);
       await AsyncStorage.setItem("keysGenerated", "true");
+
       setKeysGenerated(true);
+      setStep("✅ Key setup complete!");
       animateProgress(100);
-      setStep("Key setup complete!");
-      showNotification("🔑 Encryption Keys Ready!");
-    } catch (error) {
-      console.error("❌ Key Setup Error:", error);
-      Alert.alert("Error", "Failed to store keys on server. Try again.");
-    } finally {
-      setLoading(false);
-      // For foreground mode, navigate after a short delay
+      showNotification("🔐 Keys generated!");
+
       if (!inBackground) {
         setTimeout(() => resetNavigation("HomeTabs"), 1000);
       }
-    }
-  };
-
-  const showNotification = (message) => {
-    if (Platform.OS === "android") {
-      ToastAndroid.show(message, ToastAndroid.SHORT);
-    } else {
-      Alert.alert("Notification", message);
+    } catch (err) {
+      console.error("❌ Key setup failed:", err);
+      Alert.alert("Key Setup Error", "Something went wrong.");
+    } finally {
+      setLoading(false);
     }
   };
 
@@ -135,6 +136,7 @@ const KeyScreenSetup = () => {
               ]}
             />
           </View>
+          <Text style={styles.percentageText}>{percentage}%</Text>
         </>
       ) : keysGenerated ? (
         <>
@@ -157,9 +159,10 @@ const KeyScreenSetup = () => {
           <TouchableOpacity
             style={styles.secondaryButton}
             onPress={() => {
-              // Start generation in background and immediately navigate away
-              generateKeys(true);
               resetNavigation("HomeTabs");
+              InteractionManager.runAfterInteractions(() => {
+                generateKeys(true);
+              });
             }}
           >
             <Text style={styles.secondaryButtonText}>
@@ -177,12 +180,12 @@ const styles = StyleSheet.create({
     flex: 1,
     justifyContent: "center",
     alignItems: "center",
-    backgroundColor: "#000", // Matrix Black
+    backgroundColor: "#000",
     padding: 20,
   },
   matrixText: {
     fontSize: 24,
-    color: "#0F0", // Matrix Green
+    color: "#0F0",
     fontWeight: "bold",
     textAlign: "center",
     textShadowColor: "#00FF00",
@@ -203,11 +206,16 @@ const styles = StyleSheet.create({
     backgroundColor: "#333",
     borderRadius: 5,
     overflow: "hidden",
-    marginVertical: 20,
+    marginVertical: 10,
   },
   progressFill: {
     height: "100%",
     backgroundColor: "#E63946",
+  },
+  percentageText: {
+    color: "#FFF",
+    fontSize: 14,
+    marginTop: 5,
   },
   successText: {
     fontSize: 16,
