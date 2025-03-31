@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useContext } from "react";
+import React, { useState, useEffect, useContext, useCallback } from "react";
 import {
   View,
   Text,
@@ -9,6 +9,7 @@ import {
   Alert,
   KeyboardAvoidingView,
   Platform,
+  RefreshControl,
 } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 import { AuthContext } from "../context/AuthProvider";
@@ -25,20 +26,18 @@ const ChatScreen = ({ navigation }) => {
   const [messages, setMessages] = useState([]);
   const [selectedUser, setSelectedUser] = useState(null);
   const [ws, setWs] = useState(null);
+  const [refreshing, setRefreshing] = useState(false);
 
-  // ✅ Ensure user has encryption keys
   useEffect(() => {
-    const checkEncryptionSetup = async () => {
+    (async () => {
       const privateKey = await AsyncStorage.getItem("privateKey");
       if (!privateKey) {
         Alert.alert("Encryption Setup Needed", "Please generate encryption keys before using chat.");
         navigation.navigate("KeySetupScreen");
       }
-    };
-    checkEncryptionSetup();
+    })();
   }, []);
 
-  // ✅ Debounced user search
   const fetchUsers = debounce(async (query) => {
     if (query.length < 2) return;
     try {
@@ -56,28 +55,25 @@ const ChatScreen = ({ navigation }) => {
     fetchUsers(search);
   }, [search]);
 
-  // ✅ Connect WebSocket when user is selected
   useEffect(() => {
     if (!selectedUser) return;
 
-    console.log(`🔗 Connecting WebSocket for ${selectedUser.id}`);
     const wsConnection = new WebSocket(`${WS_URL}/chat/?token=${authToken}`);
+    console.log(`🔗 Connecting WebSocket for ${selectedUser.id}`);
 
     wsConnection.onopen = () => console.log("✅ WebSocket Connected");
     wsConnection.onmessage = (event) => {
       const newMessage = JSON.parse(event.data);
-      setMessages((prev) => [
-        {
-          _id: newMessage.id,
-          text: decryptAES(newMessage.encrypted_message) || "🔒 Encrypted Message",
-          createdAt: new Date(),
-          user: {
-            _id: newMessage.sender,
-            name: selectedUser.first_name,
-          },
+      const incoming = {
+        _id: newMessage.id,
+        text: decryptAES(newMessage.encrypted_message) || "🔒 Encrypted Message",
+        createdAt: new Date(),
+        user: {
+          _id: newMessage.sender,
+          name: newMessage.sender === user.id ? "You" : selectedUser.first_name,
         },
-        ...prev,
-      ]);
+      };
+      setMessages((prev) => [...prev, incoming]);
     };
     wsConnection.onerror = (error) => console.error("❌ WebSocket Error:", error.message);
     wsConnection.onclose = () => console.log("🔴 WebSocket Disconnected");
@@ -86,7 +82,6 @@ const ChatScreen = ({ navigation }) => {
     return () => wsConnection.close();
   }, [selectedUser]);
 
-  // ✅ Send encrypted message
   const sendMessage = async (messageText) => {
     if (!selectedUser || !ws) return;
 
@@ -122,10 +117,6 @@ const ChatScreen = ({ navigation }) => {
       const encryptedMessage = encryptAES(messageText);
       const encryptedKey = encryptRSA(encryptedMessage.key, publicKey);
 
-      console.log("🛫 Sending message to:", selectedUser.id);
-      console.log("📦 Encrypted Message:", encryptedMessage.encryptedText);
-      console.log("🔐 Encrypted AES Key:", encryptedKey);
-
       ws.send(
         JSON.stringify({
           receiver_id: selectedUser.id,
@@ -134,30 +125,36 @@ const ChatScreen = ({ navigation }) => {
         })
       );
 
-      setMessages((prev) => [
-        {
-          _id: Math.random().toString(),
-          text: messageText,
-          createdAt: new Date(),
-          user: { _id: user.id, name: "You" },
-        },
-        ...prev,
-      ]);
+      const senderMessage = {
+        _id: Math.random().toString(),
+        text: messageText,
+        createdAt: new Date(),
+        user: { _id: user.id, name: "You" },
+      };
+
+      setMessages((prev) => [...prev, senderMessage]);
     } catch (error) {
       console.error("❌ Error sending message:", error);
       Alert.alert("Send Error", "Failed to send message.");
     }
   };
 
+  const onRefresh = useCallback(() => {
+    setRefreshing(true);
+    setTimeout(() => setRefreshing(false), 1000);
+  }, []);
+
+  useEffect(() => {
+    console.log("📥 Current Messages:", messages);
+  }, [messages]);
+
   return (
     <SafeAreaView style={styles.safeContainer}>
       <KeyboardAvoidingView behavior={Platform.OS === "ios" ? "padding" : "height"} style={styles.container}>
-        {/* Back Button */}
         <TouchableOpacity style={styles.backButton} onPress={() => navigation.goBack()}>
           <Text style={styles.backText}>← Back</Text>
         </TouchableOpacity>
 
-        {/* Search Users */}
         <TextInput
           style={styles.searchInput}
           placeholder="🔍 Search users..."
@@ -166,14 +163,14 @@ const ChatScreen = ({ navigation }) => {
           onChangeText={setSearch}
         />
 
-        {/* Chat Section */}
         {selectedUser ? (
           <SimpleChat
             messages={messages}
-            onPressSendButton={(text) => sendMessage(text)}
+            onPressSendButton={sendMessage}
             user={{ _id: user.id, name: "You" }}
             placeholder="Type a message..."
             inputStyle={styles.input}
+            refreshControl={<RefreshControl refreshing={refreshing} onRefresh={onRefresh} />}
           />
         ) : (
           <FlatList
@@ -181,15 +178,10 @@ const ChatScreen = ({ navigation }) => {
             keyExtractor={(item) => item.id.toString()}
             renderItem={({ item }) => (
               <TouchableOpacity
-                style={[
-                  styles.userItem,
-                  selectedUser?.id === item.id && { backgroundColor: "#666" },
-                ]}
+                style={[styles.userItem, selectedUser?.id === item.id && { backgroundColor: "#666" }]}
                 onPress={() => setSelectedUser(item)}
               >
-                <Text style={styles.userText}>
-                  {item.first_name} {item.last_name}
-                </Text>
+                <Text style={styles.userText}>{item.first_name} {item.last_name}</Text>
               </TouchableOpacity>
             )}
           />
