@@ -62,19 +62,26 @@ const ChatScreen = ({ navigation }) => {
     console.log(`🔗 Connecting WebSocket for ${selectedUser.id}`);
 
     wsConnection.onopen = () => console.log("✅ WebSocket Connected");
+
     wsConnection.onmessage = (event) => {
       const newMessage = JSON.parse(event.data);
-      const incoming = {
-        _id: newMessage.id,
-        text: decryptAES(newMessage.encrypted_message) || "🔒 Encrypted Message",
-        createdAt: new Date(),
-        user: {
-          _id: newMessage.sender,
-          name: newMessage.sender === user.id ? "You" : selectedUser.first_name,
+      console.log("📥 Received Message:", newMessage);
+
+      const decryptedText = decryptAES(newMessage.encrypted_message);
+      setMessages((prev) => [
+        ...prev,
+        {
+          _id: newMessage.id,
+          text: decryptedText || "🔒 Encrypted Message",
+          createdAt: new Date(),
+          user: {
+            _id: newMessage.sender,
+            name: newMessage.sender === user.id ? "You" : selectedUser.first_name,
+          },
         },
-      };
-      setMessages((prev) => [...prev, incoming]);
+      ]);
     };
+
     wsConnection.onerror = (error) => console.error("❌ WebSocket Error:", error.message);
     wsConnection.onclose = () => console.log("🔴 WebSocket Disconnected");
 
@@ -117,6 +124,10 @@ const ChatScreen = ({ navigation }) => {
       const encryptedMessage = encryptAES(messageText);
       const encryptedKey = encryptRSA(encryptedMessage.key, publicKey);
 
+      console.log("🛫 Sending message to:", selectedUser.id);
+      console.log("📦 Encrypted Message:", encryptedMessage.encryptedText);
+      console.log("🔐 Encrypted AES Key:", encryptedKey);
+
       ws.send(
         JSON.stringify({
           receiver_id: selectedUser.id,
@@ -125,14 +136,16 @@ const ChatScreen = ({ navigation }) => {
         })
       );
 
-      const senderMessage = {
-        _id: Math.random().toString(),
-        text: messageText,
-        createdAt: new Date(),
-        user: { _id: user.id, name: "You" },
-      };
-
-      setMessages((prev) => [...prev, senderMessage]);
+      // ✅ Add sender message to chat view
+      setMessages((prev) => [
+        ...prev,
+        {
+          _id: Math.random().toString(),
+          text: messageText,
+          createdAt: new Date(),
+          user: { _id: user.id, name: "You" },
+        },
+      ]);
     } catch (error) {
       console.error("❌ Error sending message:", error);
       Alert.alert("Send Error", "Failed to send message.");
@@ -143,10 +156,6 @@ const ChatScreen = ({ navigation }) => {
     setRefreshing(true);
     setTimeout(() => setRefreshing(false), 1000);
   }, []);
-
-  useEffect(() => {
-    console.log("📥 Current Messages:", messages);
-  }, [messages]);
 
   return (
     <SafeAreaView style={styles.safeContainer}>
@@ -165,12 +174,14 @@ const ChatScreen = ({ navigation }) => {
 
         {selectedUser ? (
           <SimpleChat
-            messages={messages}
-            onPressSendButton={sendMessage}
+            messages={[...messages]} // latest at bottom
+            onPressSendButton={(text) => sendMessage(text)}
             user={{ _id: user.id, name: "You" }}
             placeholder="Type a message..."
             inputStyle={styles.input}
-            refreshControl={<RefreshControl refreshing={refreshing} onRefresh={onRefresh} />}
+            refreshControl={
+              <RefreshControl refreshing={refreshing} onRefresh={onRefresh} />
+            }
           />
         ) : (
           <FlatList
@@ -178,7 +189,10 @@ const ChatScreen = ({ navigation }) => {
             keyExtractor={(item) => item.id.toString()}
             renderItem={({ item }) => (
               <TouchableOpacity
-                style={[styles.userItem, selectedUser?.id === item.id && { backgroundColor: "#666" }]}
+                style={[
+                  styles.userItem,
+                  selectedUser?.id === item.id && { backgroundColor: "#666" },
+                ]}
                 onPress={() => setSelectedUser(item)}
               >
                 <Text style={styles.userText}>{item.first_name} {item.last_name}</Text>
