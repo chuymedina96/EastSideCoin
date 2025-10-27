@@ -1,4 +1,5 @@
-import React, { useState, useEffect } from "react";
+// screens/KeyScreenSetup.js
+import React, { useState, useEffect, useRef } from "react";
 import {
   View,
   Text,
@@ -9,248 +10,250 @@ import {
   Animated,
   StyleSheet,
   Platform,
-  InteractionManager,
 } from "react-native";
 import AsyncStorage from "@react-native-async-storage/async-storage";
-import forge from "node-forge";
-import axios from "axios";
-import { API_URL } from "../config";
 import { resetNavigation } from "../navigation/NavigationService";
-import { useNavigation } from "@react-navigation/native";
+import {
+  isKeysReady,
+  generateAndUploadKeys,
+  loadPrivateKeyForUser,
+} from "../utils/keyManager";
 
 const KeyScreenSetup = () => {
-  const navigation = useNavigation();
   const [loading, setLoading] = useState(false);
   const [keysGenerated, setKeysGenerated] = useState(false);
-  const [progress] = useState(new Animated.Value(0));
-  const [percentage, setPercentage] = useState(0);
-  const [step, setStep] = useState("Ready to generate keys");
 
-  useEffect(() => {
-    (async () => {
-      const privateKeyExists = await AsyncStorage.getItem("privateKey");
-      if (privateKeyExists) {
-        console.log("✅ Keys already exist. Skipping generation.");
-        setKeysGenerated(true);
-      }
-    })();
-  }, []);
+  // UX copy that updates per stage
+  const [headline, setHeadline] = useState("Setting up secure messaging…");
+  const [detail, setDetail] = useState(
+    "We’re creating encryption keys on your device so only you and your neighbors can read your messages."
+  );
 
-  const animateProgress = (toValue) => {
-    Animated.timing(progress, {
-      toValue,
-      duration: 500,
-      useNativeDriver: false,
-    }).start();
-    setPercentage(toValue);
+  // progress
+  const progress = useRef(new Animated.Value(0)).current;
+  const [pct, setPct] = useState(0);
+
+  const animateTo = (toValue, duration = 400) => {
+    Animated.timing(progress, { toValue, duration, useNativeDriver: false }).start();
+    setPct(toValue);
   };
 
-  const wait = (ms) => new Promise((res) => setTimeout(res, ms));
+  const toast = (msg) => {
+    if (Platform.OS === "android") ToastAndroid.show(msg, ToastAndroid.SHORT);
+    else Alert.alert("Info", msg);
+  };
 
-  const showNotification = (msg) => {
-    if (Platform.OS === "android") {
-      ToastAndroid.show(msg, ToastAndroid.SHORT);
-    } else {
-      Alert.alert("Notification", msg);
+  const routeHome = () => resetNavigation("HomeTabs");
+
+  // Smooth staged progress so it doesn’t “jump”
+  const stage = async (nextPct, title, sub, minMs = 300) => {
+    setHeadline(title);
+    setDetail(sub);
+    const start = Date.now();
+    animateTo(nextPct);
+    const elapsed = Date.now() - start;
+    if (elapsed < minMs) {
+      await new Promise((r) => setTimeout(r, minMs - elapsed));
     }
   };
 
-  const generateKeys = async (inBackground = false) => {
+  const runGenerate = async () => {
+    setLoading(true);
     try {
-      setLoading(true);
-      setStep("🔐 Generating RSA key pair...");
-      animateProgress(10);
-      await wait(150);
-
-      const keyPair = forge.pki.rsa.generateKeyPair({ bits: 2048 });
- 
-      setStep("🔒 Encrypting keys...");
-      animateProgress(30);
-      await wait(150);
-
-      const publicKey = forge.pki.publicKeyToPem(keyPair.publicKey);
-      const privateKey = forge.pki.privateKeyToPem(keyPair.privateKey);
-
-      await AsyncStorage.setItem("privateKey", privateKey);
-
-      setStep("🔑 Validating user session...");
-      animateProgress(50);
-      await wait(150);
-
+      const rawUser = await AsyncStorage.getItem("user");
       const authToken = await AsyncStorage.getItem("authToken");
-      if (!authToken) {
-        Alert.alert("Session Expired", "Please log in again.");
+      const user = rawUser ? JSON.parse(rawUser) : null;
+
+      if (!user?.id || !authToken) {
+        Alert.alert("Session expired", "Please log in again.");
         resetNavigation("Login");
         return;
       }
 
-      setStep("📡 Sending public key to server...");
-      animateProgress(80);
-      await wait(150);
-
-      const res = await axios.post(
-        `${API_URL}/generate_keys/`,
-        { public_key: publicKey.trim() },
-        {
-          headers: { Authorization: `Bearer ${authToken}` },
-        }
+      await stage(
+        10,
+        "Creating your private key…",
+        "This key never leaves your device. It’s used to decrypt messages sent to you."
       );
 
-      console.log("✅ Keys stored:", res.data);
-      await AsyncStorage.setItem("keysGenerated", "true");
+      await stage(
+        30,
+        "Creating your public key…",
+        "We’ll share this with the server so neighbors can send you encrypted messages."
+      );
+
+      await stage(
+        45,
+        "Saving keys to secure storage…",
+        "Keeping your private key on-device under your account."
+      );
+
+      // generate & upload (progress callback will update text/pct too)
+      await generateAndUploadKeys({
+        userId: user.id,
+        authToken,
+        onProgress: (v, msg) => {
+          if (typeof v === "number") animateTo(Math.max(pct, v)); // never go backwards
+          if (msg) {
+            setHeadline(msg);
+            // keep our explanatory detail unless msg is a full sentence
+          }
+        },
+      });
+
+      await stage(
+        85,
+        "Verifying setup…",
+        "Double-checking your keys and syncing with your account."
+      );
+
+      // Hydrate legacy slot to keep the rest of the app happy
+      await loadPrivateKeyForUser(user.id);
+
+      await stage(
+        100,
+        "All set! 🔐",
+        "End-to-end encryption is enabled for your device."
+      );
 
       setKeysGenerated(true);
-      setStep("✅ Key setup complete!");
-      animateProgress(100);
-      showNotification("🔐 Keys generated!");
-
-      if (!inBackground) {
-        setTimeout(() => resetNavigation("HomeTabs"), 1000);
-      }
+      toast("Keys generated on this device.");
+      setTimeout(routeHome, 650);
     } catch (err) {
-      console.error("❌ Key setup failed:", err);
-      Alert.alert("Key Setup Error", "Something went wrong.");
+      console.error("❌ Key setup failed:", err?.response?.data || err?.message || err);
+      Alert.alert(
+        "Key Setup",
+        "Something went wrong while generating keys. You can try again."
+      );
     } finally {
       setLoading(false);
     }
   };
 
+  // Auto-start on mount if missing; if already ready, go home
+  useEffect(() => {
+    (async () => {
+      try {
+        const rawUser = await AsyncStorage.getItem("user");
+        const user = rawUser ? JSON.parse(rawUser) : null;
+        if (!user?.id) {
+          resetNavigation("Login");
+          return;
+        }
+        const ready = await isKeysReady(user.id);
+        if (ready) {
+          await loadPrivateKeyForUser(user.id);
+          setKeysGenerated(true);
+          routeHome();
+        } else {
+          setTimeout(runGenerate, 300);
+        }
+      } catch (e) {
+        console.warn("KeyScreenSetup init error:", e?.message || e);
+      }
+    })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   return (
     <View style={styles.container}>
-      <Text style={styles.matrixText}>🔑 Secure Your Account</Text>
-      <Text style={styles.description}>{step}</Text>
 
-      {loading ? (
-        <>
-          <ActivityIndicator size="large" color="#E63946" />
-          <View style={styles.progressBar}>
-            <Animated.View
-              style={[
-                styles.progressFill,
-                {
-                  width: progress.interpolate({
-                    inputRange: [0, 100],
-                    outputRange: ["0%", "100%"],
-                  }),
-                },
-              ]}
-            />
+      <View style={styles.card}>
+        <Text style={styles.title}>{headline}</Text>
+        <Text style={styles.subtitle}>{detail}</Text>
+
+        <View style={styles.infoBox}>
+          <Text style={styles.infoLine}>• Your private key stays on this device.</Text>
+          <Text style={styles.infoLine}>• Only the public key is shared to let others send you messages.</Text>
+          <Text style={styles.infoLine}>• You can keep using the app while we finish.</Text>
+        </View>
+
+        <View style={styles.progressBar}>
+          <Animated.View
+            style={[
+              styles.progressFill,
+              {
+                width: progress.interpolate({
+                  inputRange: [0, 100],
+                  outputRange: ["0%", "100%"],
+                }),
+              },
+            ]}
+          />
+        </View>
+        <Text style={styles.percent}>{Math.round(pct)}%</Text>
+
+        {loading ? (
+          <ActivityIndicator size="small" color="#FFD700" style={{ marginTop: 10 }} />
+        ) : keysGenerated ? (
+          <TouchableOpacity style={styles.primary} onPress={routeHome}>
+            <Text style={styles.primaryText}>Continue</Text>
+          </TouchableOpacity>
+        ) : (
+          <View style={{ width: "100%" }}>
+            <TouchableOpacity style={styles.primary} onPress={runGenerate}>
+              <Text style={styles.primaryText}>Try Again</Text>
+            </TouchableOpacity>
+            <TouchableOpacity style={styles.secondary} onPress={routeHome}>
+              <Text style={styles.secondaryText}>Skip for now (not recommended)</Text>
+            </TouchableOpacity>
           </View>
-          <Text style={styles.percentageText}>{percentage}%</Text>
-        </>
-      ) : keysGenerated ? (
-        <>
-          <Text style={styles.successText}>✅ Keys Successfully Generated!</Text>
-          <TouchableOpacity
-            style={styles.button}
-            onPress={() => resetNavigation("HomeTabs")}
-          >
-            <Text style={styles.buttonText}>Continue</Text>
-          </TouchableOpacity>
-        </>
-      ) : (
-        <>
-          <TouchableOpacity
-            style={styles.button}
-            onPress={() => generateKeys(false)}
-          >
-            <Text style={styles.buttonText}>Generate Now</Text>
-          </TouchableOpacity>
-          <TouchableOpacity
-            style={styles.secondaryButton}
-            onPress={() => {
-              resetNavigation("HomeTabs");
-              InteractionManager.runAfterInteractions(() => {
-                generateKeys(true);
-              });
-            }}
-          >
-            <Text style={styles.secondaryButtonText}>
-              Generate in Background
-            </Text>
-          </TouchableOpacity>
-        </>
-      )}
+        )}
+      </View>
+
     </View>
   );
 };
 
 const styles = StyleSheet.create({
-  container: {
-    flex: 1,
-    justifyContent: "center",
-    alignItems: "center",
-    backgroundColor: "#000",
-    padding: 20,
-  },
-  matrixText: {
-    fontSize: 24,
-    color: "#0F0",
-    fontWeight: "bold",
-    textAlign: "center",
-    textShadowColor: "#00FF00",
-    textShadowOffset: { width: 1, height: 1 },
-    textShadowRadius: 5,
-    letterSpacing: 2,
-    marginBottom: 10,
-  },
-  description: {
-    fontSize: 16,
-    color: "#AAA",
-    marginBottom: 20,
-    textAlign: "center",
-  },
-  progressBar: {
-    width: "80%",
-    height: 10,
-    backgroundColor: "#333",
-    borderRadius: 5,
-    overflow: "hidden",
-    marginVertical: 10,
-  },
-  progressFill: {
-    height: "100%",
-    backgroundColor: "#E63946",
-  },
-  percentageText: {
-    color: "#FFF",
-    fontSize: 14,
-    marginTop: 5,
-  },
-  successText: {
-    fontSize: 16,
-    color: "#0F0",
-    marginBottom: 20,
-    fontWeight: "bold",
-  },
-  button: {
-    backgroundColor: "#FF4500",
-    padding: 15,
-    borderRadius: 8,
-    width: "90%",
-    alignItems: "center",
-    marginVertical: 10,
-  },
-  buttonText: {
-    color: "#FFF",
-    fontSize: 18,
-    fontWeight: "bold",
-  },
-  secondaryButton: {
-    backgroundColor: "#333",
-    padding: 15,
-    borderRadius: 8,
-    width: "90%",
-    alignItems: "center",
-    marginVertical: 10,
-    borderColor: "#FFD700",
+  container: { flex: 1, backgroundColor: "#000", justifyContent: "center", alignItems: "center", padding: 20 },
+  card: {
+    backgroundColor: "#111",
+    borderRadius: 14,
+    padding: 18,
+    width: "100%",
+    maxWidth: 520,
     borderWidth: 1,
+    borderColor: "#222",
   },
-  secondaryButtonText: {
-    color: "#FFD700",
-    fontSize: 18,
-    fontWeight: "bold",
+  title: { color: "#fff", fontSize: 20, fontWeight: "700", marginBottom: 6 },
+  subtitle: { color: "#BEBEBE", fontSize: 14, marginBottom: 14, lineHeight: 20 },
+  infoBox: {
+    backgroundColor: "#0d1a0d",
+    borderColor: "#163116",
+    borderWidth: 1,
+    borderRadius: 10,
+    padding: 10,
+    marginBottom: 16,
   },
+  infoLine: { color: "#8ee28e", fontSize: 12, marginBottom: 2 },
+  progressBar: {
+    width: "100%",
+    height: 10,
+    backgroundColor: "#2a2a2a",
+    borderRadius: 6,
+    overflow: "hidden",
+  },
+  progressFill: { height: "100%", backgroundColor: "#FFD700" },
+  percent: { color: "#ddd", fontSize: 12, marginTop: 6, textAlign: "right" },
+  primary: {
+    marginTop: 16,
+    backgroundColor: "#FF4500",
+    paddingVertical: 12,
+    borderRadius: 8,
+    alignItems: "center",
+  },
+  primaryText: { color: "#fff", fontSize: 16, fontWeight: "700" },
+  secondary: {
+    marginTop: 10,
+    backgroundColor: "#222",
+    paddingVertical: 12,
+    borderRadius: 8,
+    alignItems: "center",
+    borderWidth: 1,
+    borderColor: "#FFD700",
+  },
+  secondaryText: { color: "#FFD700", fontSize: 14, fontWeight: "700" },
 });
 
 export default KeyScreenSetup;

@@ -1,64 +1,54 @@
-# Learn more https://docs.github.com/en/get-started/getting-started-with-git/ignoring-files
-
-# dependencies
-node_modules/
-migrations
-
-# Expo
-dist/
-web-build/
-expo-env.d.ts
-
-# Native
-*.orig.*
-*.jks
-*.p8
-*.p12
-*.key
-*.mobileprovision
-
-# Metro
-.metro-health-check*
-
-# debug
-npm-debug.*
-yarn-debug.*
-yarn-error.*
-
-# macOS
-.DS_Store
-*.pem
-
-# local env files
-.env*.local
-
-# typescript
-*.tsbuildinfo
-
-# Django specific ignores
-*.pyc
+# ===========================
+# 🐍 Python / Django
+# ===========================
 __pycache__/
-local_settings.py
-setting.py
-db.sqlite3
-db.sqlite3-*
+*.py[cod]
+*.pyo
+*.pyd
 *.log
 *.pot
-venv
-
-# React Native specific ignores
-node_modules/
-mobile/node_modules/
-/ios/build
-/android/app/build
-*.apk
-*.ipa
-*.d.ts
-
-# General ignores
+*.pyc
+*.db
+*.sqlite3
+*.DS_Store
 .env
-.DS_Store
+.env.*
+*.mo
+*.egg-info/
+*.bak
 *.swp
-*.swo
-.vscode/
-.idea/
+*.tmp
+
+# Virtual environments
+venv/
+env/
+
+# Migrations (but keep __init__.py)
+app/migrations/
+!app/migrations/__init__.py
+
+# ===========================
+# 🔑 Security / Keys
+# ===========================
+*.pem
+*.key
+*.crt
+*.csr
+*.p12
+*.der
+*.jks
+*.keystore
+*.pub
+
+# ===========================
+# 🧱 Build / Cache
+# ===========================
+build/
+dist/
+*.egg/
+*.manifest
+*.spec
+*.coverage
+.coverage
+.cache/
+static

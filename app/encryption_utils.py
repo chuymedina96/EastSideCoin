@@ -1,142 +1,149 @@
+# encryption_util.py
 import base64
+import hmac
 import os
+from typing import Dict, Optional
+
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.primitives.asymmetric import rsa, padding
-from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
-from cryptography.hazmat.primitives import hashes
-from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives import hashes, serialization
 from django.conf import settings
 
-# ✅ Load RSA private key from environment (or secure storage)
+# --- Key storage (same as yours) ---
 PRIVATE_KEY_PATH = settings.BASE_DIR / "private_key.pem"
 PUBLIC_KEY_PATH = settings.BASE_DIR / "public_key.pem"
 
-# ✅ RSA Key Size
 RSA_KEY_SIZE = 2048
+AES_KEY_SIZE = 32   # 256-bit
+AES_IV_SIZE = 16    # 128-bit block size for AES-CBC
 
-# ✅ AES Configuration
-AES_KEY_SIZE = 32  # 256-bit key
-AES_IV_SIZE = 16  # 128-bit IV
-AES_ITERATIONS = 100000  # Strengthens PBKDF2 key derivation
+# ---------- helpers ----------
+def b64e(b: bytes) -> str:
+    return base64.b64encode(b).decode("ascii")
 
+def b64d(s: str) -> bytes:
+    # normalize potential whitespace/newlines
+    return base64.b64decode("".join(s.split()))
 
-# ✅ Generate New RSA Key Pair (for initial setup)
+def pkcs7_pad(data: bytes, block_size: int = 16) -> bytes:
+    pad_len = block_size - (len(data) % block_size)
+    return data + bytes([pad_len]) * pad_len
+
+def pkcs7_unpad(padded: bytes, block_size: int = 16) -> bytes:
+    if not padded:
+        raise ValueError("Invalid padding: empty input")
+    pad_len = padded[-1]
+    if pad_len < 1 or pad_len > block_size or len(padded) < pad_len:
+        raise ValueError("Invalid padding length")
+    if padded[-pad_len:] != bytes([pad_len]) * pad_len:
+        raise ValueError("Invalid PKCS#7 padding")
+    return padded[:-pad_len]
+
+# ---------- RSA keypair management ----------
 def generate_rsa_keys():
-    private_key = rsa.generate_private_key(
-        public_exponent=65537,
-        key_size=RSA_KEY_SIZE
-    )
+    private_key = rsa.generate_private_key(public_exponent=65537, key_size=RSA_KEY_SIZE)
     public_key = private_key.public_key()
 
-    # ✅ Store Private Key Securely
     with open(PRIVATE_KEY_PATH, "wb") as f:
         f.write(private_key.private_bytes(
             encoding=serialization.Encoding.PEM,
             format=serialization.PrivateFormat.PKCS8,
-            encryption_algorithm=serialization.NoEncryption()
+            encryption_algorithm=serialization.NoEncryption(),
         ))
 
-    # ✅ Store Public Key
     with open(PUBLIC_KEY_PATH, "wb") as f:
         f.write(public_key.public_bytes(
             encoding=serialization.Encoding.PEM,
-            format=serialization.PublicFormat.SubjectPublicKeyInfo
+            format=serialization.PublicFormat.SubjectPublicKeyInfo,
         ))
 
     return private_key, public_key
 
-
-# ✅ Load RSA Private Key
 def load_private_key():
     with open(PRIVATE_KEY_PATH, "rb") as f:
         return serialization.load_pem_private_key(f.read(), password=None)
 
-
-# ✅ Load RSA Public Key
 def load_public_key():
     with open(PUBLIC_KEY_PATH, "rb") as f:
         return serialization.load_pem_public_key(f.read())
 
+# ---------- AES-CBC + HMAC-SHA256 (Encrypt-then-MAC) ----------
+# Mirrors your RN implementation: MAC over (iv || ciphertext) with the same key.
+def encrypt_aes_etm(plaintext: str) -> Dict[str, str]:
+    key = os.urandom(AES_KEY_SIZE)           # 32 bytes
+    iv  = os.urandom(AES_IV_SIZE)            # 16 bytes
 
-# ✅ AES Encryption
-def encryptAES(plaintext):
-    salt = os.urandom(16)
-    key = os.urandom(AES_KEY_SIZE)
-
-    # ✅ Generate IV
-    iv = os.urandom(AES_IV_SIZE)
-
-    # ✅ Encrypt message
     cipher = Cipher(algorithms.AES(key), modes.CBC(iv))
     encryptor = cipher.encryptor()
-    padded_plaintext = plaintext + (AES_IV_SIZE - len(plaintext) % AES_IV_SIZE) * chr(AES_IV_SIZE - len(plaintext) % AES_IV_SIZE)
-    ciphertext = encryptor.update(padded_plaintext.encode()) + encryptor.finalize()
+    ct = encryptor.update(pkcs7_pad(plaintext.encode("utf-8"))) + encryptor.finalize()
+
+    mac = hmac.new(key, iv + ct, digestmod="sha256").digest()
 
     return {
-        "encrypted_text": base64.b64encode(ciphertext).decode(),
-        "iv": base64.b64encode(iv).decode(),
-        "key": base64.b64encode(key).decode()
+        "ciphertext_b64": b64e(ct),
+        "iv_b64": b64e(iv),
+        "key_b64": b64e(key),
+        "mac_b64": b64e(mac),
     }
 
-
-# ✅ AES Decryption
-def decryptAES(encrypted_text, iv, key):
+def decrypt_aes_etm(ciphertext_b64: str, iv_b64: str, mac_b64: str, key_b64: str) -> Optional[str]:
     try:
-        iv = base64.b64decode(iv)
-        key = base64.b64decode(key)
-        encrypted_text = base64.b64decode(encrypted_text)
+        key = b64d(key_b64)
+        iv  = b64d(iv_b64)
+        ct  = b64d(ciphertext_b64)
+        mac_expected = b64d(mac_b64)
+
+        mac_computed = hmac.new(key, iv + ct, digestmod="sha256").digest()
+        # constant-time compare
+        if not hmac.compare_digest(mac_computed, mac_expected):
+            print("⚠️ AES MAC validation failed")
+            return None
 
         cipher = Cipher(algorithms.AES(key), modes.CBC(iv))
         decryptor = cipher.decryptor()
-        decrypted_padded = decryptor.update(encrypted_text) + decryptor.finalize()
-
-        # ✅ Remove padding
-        padding_length = decrypted_padded[-1]
-        decrypted_text = decrypted_padded[:-padding_length].decode()
-
-        return decrypted_text
-
+        padded = decryptor.update(ct) + decryptor.finalize()
+        pt = pkcs7_unpad(padded).decode("utf-8")
+        return pt
     except Exception as e:
         print("❌ AES Decryption Failed:", e)
         return None
 
+# ---------- RSA-OAEP (SHA-256 + MGF1-SHA256) ----------
+# IMPORTANT: matches the RN forge params (md=SHA256, mgf1=SHA256)
+_OAEP = padding.OAEP(
+    mgf=padding.MGF1(algorithm=hashes.SHA256()),
+    algorithm=hashes.SHA256(),
+    label=None,
+)
 
-# ✅ RSA Encryption (Used in React Native)
-def encryptRSA(plaintext, public_key_pem):
-    public_key = serialization.load_pem_public_key(public_key_pem.encode())
+def rsa_encrypt_b64(data_b64: str, public_key_pem: str) -> str:
+    """
+    Encrypt a base64 payload (e.g., AES key) with a PEM public key.
+    Returns base64 ciphertext. Mirrors RN encryptRSA(bundle.keyB64, pubkey).
+    """
+    pub = serialization.load_pem_public_key(public_key_pem.encode("utf-8"))
+    raw = b64d(data_b64)
+    enc = pub.encrypt(raw, _OAEP)
+    return b64e(enc)
 
-    encrypted = public_key.encrypt(
-        plaintext.encode(),
-        padding.OAEP(
-            mgf=padding.MGF1(algorithm=hashes.SHA256()),
-            algorithm=hashes.SHA256(),
-            label=None
-        )
-    )
-
-    return base64.b64encode(encrypted).decode()
-
-
-# ✅ RSA Decryption (Used in Django WebSocket)
-def decryptRSA(encrypted_text, private_key=None):
+def rsa_decrypt_to_b64(encrypted_b64: str, private_key=None) -> str:
+    """
+    Decrypt base64 ciphertext with server private key and return base64 of raw bytes.
+    NOTE: Do NOT .decode('utf-8') here; the result is random bytes (AES key).
+    """
     if private_key is None:
         private_key = load_private_key()
+    enc = b64d(encrypted_b64)
+    raw = private_key.decrypt(enc, _OAEP)
+    return b64e(raw)
 
-    encrypted_text = base64.b64decode(encrypted_text)
+# --- Optional compatibility wrappers (if you reference old names elsewhere) ---
+encryptAES = encrypt_aes_etm
+decryptAES = decrypt_aes_etm
+encryptRSA = rsa_encrypt_b64
+decryptRSA = rsa_decrypt_to_b64
 
-    decrypted = private_key.decrypt(
-        encrypted_text,
-        padding.OAEP(
-            mgf=padding.MGF1(algorithm=hashes.SHA256()),
-            algorithm=hashes.SHA256(),
-            label=None
-        )
-    )
-
-    return decrypted.decode()
-
-
-# ✅ Initial Key Generation (Run Once)
+# ---------- Initial key generation on cold start ----------
 if not os.path.exists(PRIVATE_KEY_PATH) or not os.path.exists(PUBLIC_KEY_PATH):
     print("🔑 Generating New RSA Key Pair...")
     generate_rsa_keys()

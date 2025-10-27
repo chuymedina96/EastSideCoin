@@ -1,0 +1,32 @@
+# Django / Python
+__pycache__/
+*.py[cod]
+*.sqlite3
+*.log
+*.pot
+*.pyc
+*.pyo
+*.pyd
+*.db
+*.DS_Store
+
+# Virtualenv
+venv/
+env/
+
+# Django Migrations
+app/migrations/
+!app/migrations/__init__.py
+
+# Node / React Native
+node_modules/
+mobile/EastSideCoinApp/node_modules/
+mobile/EastSideCoinApp/.expo/
+mobile/EastSideCoinApp/dist/
+mobile/EastSideCoinApp/.expo-shared/
+mobile/EastSideCoinApp/android/
+mobile/EastSideCoinApp/ios/
+mobile/EastSideCoinApp/web-build/
+mobile/EastSideCoinApp/build/
+mobile/EastSideCoinApp/.nvmrc
+mobile/EastSideCoinApp/.gitignore
