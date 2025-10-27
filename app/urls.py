@@ -10,7 +10,8 @@ from .views import (
     mark_message_read,
     check_balance,
     get_user_public_key,
-    get_conversation
+    get_conversation,
+    delete_account
 )
 
 urlpatterns = [
@@ -28,5 +29,6 @@ urlpatterns = [
 
     # ✅ Wallet (Consistent URL Pattern)
     path("wallet/<str:wallet_address>/balance/", check_balance, name="check_balance"),  # ✅ Check ESC balance
-    path("conversations/<int:other_id>/", get_conversation, name="get_conversation")
+    path("conversations/<int:other_id>/", get_conversation, name="get_conversation"),
+    path("delete_account/", delete_account, name="delete_account"),  # NEW
 ]

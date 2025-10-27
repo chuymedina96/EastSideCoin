@@ -1,15 +1,8 @@
 // screens/KeyScreenSetup.js
 import React, { useState, useEffect, useRef } from "react";
 import {
-  View,
-  Text,
-  TouchableOpacity,
-  ActivityIndicator,
-  Alert,
-  ToastAndroid,
-  Animated,
-  StyleSheet,
-  Platform,
+  View, Text, ActivityIndicator, Alert, ToastAndroid,
+  Animated, StyleSheet, Platform, InteractionManager
 } from "react-native";
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import { resetNavigation } from "../navigation/NavigationService";
@@ -17,25 +10,34 @@ import {
   isKeysReady,
   generateAndUploadKeys,
   loadPrivateKeyForUser,
+  loadPublicKeyForUser,
 } from "../utils/keyManager";
 
 const KeyScreenSetup = () => {
-  const [loading, setLoading] = useState(false);
-  const [keysGenerated, setKeysGenerated] = useState(false);
+  const [loading, setLoading] = useState(true);
+  const [errorMsg, setErrorMsg] = useState("");
 
-  // UX copy that updates per stage
-  const [headline, setHeadline] = useState("Setting up secure messaging…");
+  const [headline, setHeadline] = useState("Setting up your secure account…");
   const [detail, setDetail] = useState(
-    "We’re creating encryption keys on your device so only you and your neighbors can read your messages."
+    "Generating encryption keys on your device. This can take ~10–20 seconds the first time."
   );
 
-  // progress
   const progress = useRef(new Animated.Value(0)).current;
+  const pctRef = useRef(0);
   const [pct, setPct] = useState(0);
+  const mountedRef = useRef(true);
+  const startedRef = useRef(false); // prevent double runs
 
-  const animateTo = (toValue, duration = 400) => {
-    Animated.timing(progress, { toValue, duration, useNativeDriver: false }).start();
-    setPct(toValue);
+  const setPctSafe = (v) => {
+    if (!mountedRef.current) return;
+    pctRef.current = v;
+    setPct(v);
+  };
+
+  const animateTo = (toValue, duration = 220) => {
+    const next = Math.max(pctRef.current, toValue); // never regress
+    Animated.timing(progress, { toValue: next, duration, useNativeDriver: false }).start();
+    setPctSafe(next);
   };
 
   const toast = (msg) => {
@@ -45,93 +47,77 @@ const KeyScreenSetup = () => {
 
   const routeHome = () => resetNavigation("HomeTabs");
 
-  // Smooth staged progress so it doesn’t “jump”
-  const stage = async (nextPct, title, sub, minMs = 300) => {
-    setHeadline(title);
-    setDetail(sub);
-    const start = Date.now();
+  const stage = async (nextPct, title, sub, minMs = 240) => {
+    if (!mountedRef.current) return;
+    if (title) setHeadline(title);
+    if (sub) setDetail(sub);
+    const t0 = Date.now();
     animateTo(nextPct);
-    const elapsed = Date.now() - start;
-    if (elapsed < minMs) {
-      await new Promise((r) => setTimeout(r, minMs - elapsed));
-    }
+    const elapsed = Date.now() - t0;
+    if (elapsed < minMs) await new Promise((r) => setTimeout(r, Math.max(0, minMs - elapsed)));
   };
 
-  const runGenerate = async () => {
-    setLoading(true);
+  const runGenerate = async (attempt = 1) => {
+    if (!mountedRef.current) return;
+    if (attempt === 1) setLoading(true);
+    setErrorMsg("");
     try {
       const rawUser = await AsyncStorage.getItem("user");
       const authToken = await AsyncStorage.getItem("authToken");
       const user = rawUser ? JSON.parse(rawUser) : null;
 
       if (!user?.id || !authToken) {
-        Alert.alert("Session expired", "Please log in again.");
         resetNavigation("Login");
         return;
       }
 
       await stage(
         10,
-        "Creating your private key…",
-        "This key never leaves your device. It’s used to decrypt messages sent to you."
+        "Creating your key pair…",
+        "Your private key stays on this device. Your public key lets neighbors send you encrypted messages."
       );
 
-      await stage(
-        30,
-        "Creating your public key…",
-        "We’ll share this with the server so neighbors can send you encrypted messages."
-      );
-
-      await stage(
-        45,
-        "Saving keys to secure storage…",
-        "Keeping your private key on-device under your account."
-      );
-
-      // generate & upload (progress callback will update text/pct too)
       await generateAndUploadKeys({
         userId: user.id,
         authToken,
         onProgress: (v, msg) => {
-          if (typeof v === "number") animateTo(Math.max(pct, v)); // never go backwards
-          if (msg) {
-            setHeadline(msg);
-            // keep our explanatory detail unless msg is a full sentence
-          }
+          if (!mountedRef.current) return;
+          if (typeof v === "number") animateTo(v);
+          if (msg) setDetail(msg);
         },
       });
 
-      await stage(
-        85,
-        "Verifying setup…",
-        "Double-checking your keys and syncing with your account."
-      );
+      await stage(90, "Verifying setup…", "Finishing sync with your account…");
 
-      // Hydrate legacy slot to keep the rest of the app happy
       await loadPrivateKeyForUser(user.id);
+      await loadPublicKeyForUser(user.id);
 
-      await stage(
-        100,
-        "All set! 🔐",
-        "End-to-end encryption is enabled for your device."
-      );
+      const ready = await isKeysReady(user.id);
+      if (!ready) throw new Error("Keys not fully ready after generation.");
 
-      setKeysGenerated(true);
+      await stage(100, "All set! 🔐", "End-to-end encryption is now enabled.");
       toast("Keys generated on this device.");
-      setTimeout(routeHome, 650);
+      routeHome();
     } catch (err) {
+      if (!mountedRef.current) return;
       console.error("❌ Key setup failed:", err?.response?.data || err?.message || err);
-      Alert.alert(
-        "Key Setup",
-        "Something went wrong while generating keys. You can try again."
-      );
+
+      if (attempt < 2) {
+        setErrorMsg("Something went wrong setting up your secure account. Retrying…");
+        await new Promise((r) => setTimeout(r, 900));
+        setErrorMsg("");
+        return runGenerate(attempt + 1);
+      }
+
+      setErrorMsg("We couldn’t finish setup. Please reopen the app to try again.");
     } finally {
-      setLoading(false);
+      if (mountedRef.current && attempt === 1) setLoading(false);
     }
   };
 
-  // Auto-start on mount if missing; if already ready, go home
   useEffect(() => {
+    mountedRef.current = true;
+
     (async () => {
       try {
         const rawUser = await AsyncStorage.getItem("user");
@@ -140,33 +126,41 @@ const KeyScreenSetup = () => {
           resetNavigation("Login");
           return;
         }
+
         const ready = await isKeysReady(user.id);
         if (ready) {
+          // Keys already there—hydrate legacy slots then go home.
           await loadPrivateKeyForUser(user.id);
-          setKeysGenerated(true);
+          await loadPublicKeyForUser(user.id);
           routeHome();
-        } else {
-          setTimeout(runGenerate, 300);
+          return;
+        }
+
+        // ✅ Let the screen render FIRST, then kick off heavy work.
+        if (!startedRef.current) {
+          startedRef.current = true;
+          InteractionManager.runAfterInteractions(() => {
+            // small timeout to ensure first paint + 10% shows
+            setTimeout(() => runGenerate(1), 0);
+          });
         }
       } catch (e) {
         console.warn("KeyScreenSetup init error:", e?.message || e);
+        setErrorMsg("We hit a snag starting your secure setup. Please reopen the app.");
       }
     })();
+
+    return () => {
+      mountedRef.current = false;
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   return (
     <View style={styles.container}>
-
       <View style={styles.card}>
         <Text style={styles.title}>{headline}</Text>
         <Text style={styles.subtitle}>{detail}</Text>
-
-        <View style={styles.infoBox}>
-          <Text style={styles.infoLine}>• Your private key stays on this device.</Text>
-          <Text style={styles.infoLine}>• Only the public key is shared to let others send you messages.</Text>
-          <Text style={styles.infoLine}>• You can keep using the app while we finish.</Text>
-        </View>
 
         <View style={styles.progressBar}>
           <Animated.View
@@ -183,24 +177,10 @@ const KeyScreenSetup = () => {
         </View>
         <Text style={styles.percent}>{Math.round(pct)}%</Text>
 
-        {loading ? (
-          <ActivityIndicator size="small" color="#FFD700" style={{ marginTop: 10 }} />
-        ) : keysGenerated ? (
-          <TouchableOpacity style={styles.primary} onPress={routeHome}>
-            <Text style={styles.primaryText}>Continue</Text>
-          </TouchableOpacity>
-        ) : (
-          <View style={{ width: "100%" }}>
-            <TouchableOpacity style={styles.primary} onPress={runGenerate}>
-              <Text style={styles.primaryText}>Try Again</Text>
-            </TouchableOpacity>
-            <TouchableOpacity style={styles.secondary} onPress={routeHome}>
-              <Text style={styles.secondaryText}>Skip for now (not recommended)</Text>
-            </TouchableOpacity>
-          </View>
-        )}
-      </View>
+        {loading && <ActivityIndicator size="small" color="#FFD700" style={{ marginTop: 12 }} />}
 
+        {!!errorMsg && <Text style={styles.error}>{errorMsg}</Text>}
+      </View>
     </View>
   );
 };
@@ -217,43 +197,11 @@ const styles = StyleSheet.create({
     borderColor: "#222",
   },
   title: { color: "#fff", fontSize: 20, fontWeight: "700", marginBottom: 6 },
-  subtitle: { color: "#BEBEBE", fontSize: 14, marginBottom: 14, lineHeight: 20 },
-  infoBox: {
-    backgroundColor: "#0d1a0d",
-    borderColor: "#163116",
-    borderWidth: 1,
-    borderRadius: 10,
-    padding: 10,
-    marginBottom: 16,
-  },
-  infoLine: { color: "#8ee28e", fontSize: 12, marginBottom: 2 },
-  progressBar: {
-    width: "100%",
-    height: 10,
-    backgroundColor: "#2a2a2a",
-    borderRadius: 6,
-    overflow: "hidden",
-  },
+  subtitle: { color: "#BEBEBE", fontSize: 14, marginBottom: 16, lineHeight: 20 },
+  progressBar: { width: "100%", height: 10, backgroundColor: "#2a2a2a", borderRadius: 6, overflow: "hidden" },
   progressFill: { height: "100%", backgroundColor: "#FFD700" },
   percent: { color: "#ddd", fontSize: 12, marginTop: 6, textAlign: "right" },
-  primary: {
-    marginTop: 16,
-    backgroundColor: "#FF4500",
-    paddingVertical: 12,
-    borderRadius: 8,
-    alignItems: "center",
-  },
-  primaryText: { color: "#fff", fontSize: 16, fontWeight: "700" },
-  secondary: {
-    marginTop: 10,
-    backgroundColor: "#222",
-    paddingVertical: 12,
-    borderRadius: 8,
-    alignItems: "center",
-    borderWidth: 1,
-    borderColor: "#FFD700",
-  },
-  secondaryText: { color: "#FFD700", fontSize: 14, fontWeight: "700" },
+  error: { color: "#ff6b6b", marginTop: 10, fontSize: 12 },
 });
 
 export default KeyScreenSetup;

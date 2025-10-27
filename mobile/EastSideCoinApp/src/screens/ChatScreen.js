@@ -11,9 +11,10 @@ import debounce from "lodash.debounce";
 import SimpleChat from "react-native-simple-chat";
 
 import { AuthContext } from "../context/AuthProvider";
-import { API_URL, WS_URL } from "../config";
+import { API_URL } from "../config";
 import { encryptAES, encryptRSA, decryptAES, decryptRSA } from "../utils/encryption";
 import { isKeysReady, loadPrivateKeyForUser } from "../utils/keyManager";
+import { createChatSocket } from "../utils/wsClient";
 
 const THREADS_KEY = "chat_threads_index_v1";
 const MSGS_KEY_PREFIX = "chat_msgs_"; // per-thread cache
@@ -29,70 +30,43 @@ const formatTime = (d) => {
 };
 const nameOf = (u) => (`${u?.first_name || ""} ${u?.last_name || ""}`.trim() || u?.email || "Neighbor");
 
-/** threads shape:
- * { [otherUserId: string]: { id, name, lastText, updatedAt, unread } }
- */
-const upsertThread = (threads, otherUser, lastText, at, isIncoming) => {
-  const key = asId(otherUser.id);
-  const prev = threads[key] || {
-    id: key,
-    name: nameOf(otherUser),
-    lastText: "",
-    updatedAt: new Date().toISOString(),
-    unread: 0,
-  };
-  return {
-    ...threads,
-    [key]: {
-      ...prev,
-      name: nameOf(otherUser),
-      lastText: typeof lastText === "string" ? lastText : prev.lastText,
-      updatedAt: (at || new Date()).toISOString(),
-      unread: Math.max(0, (prev.unread || 0) + (isIncoming ? 1 : 0)),
-    },
-  };
+// base64 normalizer
+const b64FixPadding = (b64) => {
+  if (!b64) return b64;
+  const s = String(b64).replace(/\s+/g, "").replace(/-/g, "+").replace(/_/g, "/");
+  const pad = s.length % 4;
+  return pad === 0 ? s : s + "=".repeat(4 - pad);
 };
 
-const loadCachedMessages = async (otherId) => {
-  try {
-    const raw = await AsyncStorage.getItem(`${MSGS_KEY_PREFIX}${otherId}`);
-    return raw ? JSON.parse(raw) : [];
-  } catch { return []; }
-};
-const saveCachedMessages = async (otherId, msgs) => {
-  try { await AsyncStorage.setItem(`${MSGS_KEY_PREFIX}${otherId}`, JSON.stringify(msgs)); } catch {}
-};
-
-// ---------- tolerant server->UI decryption ----------
+// choose the correct key-wrap for me
 const pickWrapForMe = (m, meId) => {
-  // Preferred (new API): server gives the one we can open
-  if (m.encrypted_key_for_me) return m.encrypted_key_for_me;
-
-  // Legacy compatibility:
+  if (m.encrypted_key_for_me) return m.encrypted_key_for_me; // optional convenience field
   const me = String(meId);
   const sender = String(m.sender ?? m.sender_id);
   const receiver = String(m.receiver ?? m.receiver_id);
-
   if (receiver === me && (m.encrypted_key_for_receiver || m.encrypted_key)) {
-    return m.encrypted_key_for_receiver || m.encrypted_key;
+    return m.encrypted_key_for_receiver || m.encrypted_key; // API uses 'encrypted_key' for receiver
   }
-  if (sender === me && m.encrypted_key_for_sender) {
-    return m.encrypted_key_for_sender;
-  }
+  if (sender === me && m.encrypted_key_for_sender) return m.encrypted_key_for_sender;
   return null;
 };
 
 const decryptServerMessage = (m, privateKeyPem, meId, otherUser) => {
   const wrap = pickWrapForMe(m, meId);
   if (!wrap) return null;
+
   let keyB64;
-  try { keyB64 = decryptRSA(wrap, privateKeyPem); } catch { return null; }
+  try {
+    keyB64 = decryptRSA(b64FixPadding(wrap), privateKeyPem);
+  } catch {
+    return null;
+  }
 
   const text = decryptAES({
-    ciphertextB64: m.encrypted_message,
-    ivB64: m.iv,
-    macB64: m.mac,
-    keyB64,
+    ciphertextB64: b64FixPadding(m.encrypted_message),
+    ivB64: b64FixPadding(m.iv),
+    macB64: b64FixPadding(m.mac),
+    keyB64: b64FixPadding(keyB64),
   });
   if (!text || text === "[Auth Failed]" || text === "[Decryption Failed]") return null;
 
@@ -110,7 +84,7 @@ const decryptServerMessage = (m, privateKeyPem, meId, otherUser) => {
   };
 };
 
-// ---- Uncontrolled, focus-locked search input (no React state per keystroke) ----
+// ---- Uncontrolled, focus-locked search input ----
 const UncontrolledLockedSearch = React.memo(function UncontrolledLockedSearch({
   placeholder = "🔍 Search neighbors…",
   initialValue = "",
@@ -151,10 +125,19 @@ const UncontrolledLockedSearch = React.memo(function UncontrolledLockedSearch({
 const ChatScreen = ({ navigation }) => {
   const { authToken, user, keysReady } = useContext(AuthContext);
 
+  // ---- Namespaced storage helpers (per user) ----
+  const userPrefix = user?.id ? `u${user.id}:` : "u?:";
+  const threadsKey = `${userPrefix}${THREADS_KEY}`;
+  const msgsKey = (otherId) => `${userPrefix}${MSGS_KEY_PREFIX}${asId(otherId)}`;
+
+  // ---- State ----
   const [mode, setMode] = useState("threads"); // 'threads' | 'conversation'
   const [threads, setThreads] = useState({});
   const [messages, setMessages] = useState([]);
   const [selectedUser, setSelectedUser] = useState(null);
+
+  // Minimal directory to keep real names/emails available
+  const [directory, setDirectory] = useState({}); // { [id]: {id, first_name, last_name, email} }
 
   // Search (debounced)
   const [effectiveQuery, setEffectiveQuery] = useState("");
@@ -167,19 +150,61 @@ const ChatScreen = ({ navigation }) => {
   // Pagination for conversation history
   const pageRef = useRef({ next: null });
 
-  // WebSocket management
-  const wsRef = useRef(null);
-  const reconnectAttemptsRef = useRef(0);
-  const shouldReconnectRef = useRef(false);
-  const modeRef = useRef(mode);
-  const maxReconnects = 3;
-  useEffect(() => { modeRef.current = mode; }, [mode]);
+  // WebSocket (via util)
+  const socketRef = useRef(null);
 
-  // Load persisted threads on mount
-  useEffect(() => { (async () => {
-    try { const raw = await AsyncStorage.getItem(THREADS_KEY); if (raw) setThreads(JSON.parse(raw)); } catch {}
-  })(); }, []);
-  useEffect(() => { AsyncStorage.setItem(THREADS_KEY, JSON.stringify(threads)).catch(() => {}); }, [threads]);
+  // ---------- Cache IO (now namespaced) ----------
+  const loadCachedThreads = useCallback(async () => {
+    try {
+      const raw = await AsyncStorage.getItem(threadsKey);
+      return raw ? JSON.parse(raw) : {};
+    } catch {
+      return {};
+    }
+  }, [threadsKey]);
+
+  const saveCachedThreads = useCallback(async (val) => {
+    try { await AsyncStorage.setItem(threadsKey, JSON.stringify(val)); } catch {}
+  }, [threadsKey]);
+
+  const loadCachedMessages = useCallback(async (otherId) => {
+    try {
+      const raw = await AsyncStorage.getItem(msgsKey(otherId));
+      return raw ? JSON.parse(raw) : [];
+    } catch { return []; }
+  }, [msgsKey]);
+
+  const saveCachedMessages = useCallback(async (otherId, msgs) => {
+    try { await AsyncStorage.setItem(msgsKey(otherId), JSON.stringify(msgs)); } catch {}
+  }, [msgsKey]);
+
+  // ---- Bootstrap per-user threads on mount & when user changes ----
+  useEffect(() => {
+    let mounted = true;
+    (async () => {
+      // clear in-memory when account switches
+      setThreads({});
+      setMessages([]);
+      setSelectedUser(null);
+      const t = await loadCachedThreads();
+      if (mounted) setThreads(t);
+    })();
+    return () => { mounted = false; };
+    // re-run whenever authed user (and thus prefix/threadsKey) changes
+  }, [user?.id, loadCachedThreads]);
+
+  // Persist threads when they change
+  useEffect(() => { saveCachedThreads(threads); }, [threads, saveCachedThreads]);
+
+  // Index search results into directory (for stable names later)
+  useEffect(() => {
+    if (!Array.isArray(searchResults)) return;
+    setDirectory((d) => {
+      const next = { ...d };
+      for (const u of searchResults) if (u?.id) next[asId(u.id)] = u;
+      return next;
+    });
+  }, [searchResults]);
 
   // Hydrate default privateKey slot when user changes
   useEffect(() => { (async () => {
@@ -233,7 +258,7 @@ const ChatScreen = ({ navigation }) => {
 
   const hydrateConversation = useCallback(async (neighbor) => {
     try {
-      // 1) Show cached immediately
+      // show cached immediately (namespaced)
       const cached = await loadCachedMessages(neighbor.id);
       if (cached.length) {
         const normalized = cached.map(m => ({ ...m, createdAt: new Date(m.createdAt) }))
@@ -243,7 +268,7 @@ const ChatScreen = ({ navigation }) => {
         setMessages([]);
       }
 
-      // 2) Fetch from DB and replace
+      // fetch and decrypt
       const privateKeyPem = await AsyncStorage.getItem("privateKey");
       if (!privateKeyPem) return;
 
@@ -255,13 +280,13 @@ const ChatScreen = ({ navigation }) => {
         .sort((a,b) => new Date(a.createdAt) - new Date(b.createdAt));
 
       setMessages(decrypted);
-      saveCachedMessages(neighbor.id, decrypted);
+      await saveCachedMessages(neighbor.id, decrypted);
       pageRef.current = { next: first.next_page || null };
-      console.log("[hydrate] decrypted msgs (after filter):", decrypted.length);
+      console.log("[hydrate] rows:", first.results?.length ?? 0, "decrypted:", decrypted.length);
     } catch (e) {
       console.log("conversation hydrate error", e?.message);
     }
-  }, [fetchConversationPage, user?.id]);
+  }, [fetchConversationPage, user?.id, loadCachedMessages, saveCachedMessages]);
 
   const loadOlder = useCallback(async () => {
     const pg = pageRef.current?.next;
@@ -285,112 +310,164 @@ const ChatScreen = ({ navigation }) => {
     } catch (e) {
       console.log("loadOlder error", e?.message);
     }
-  }, [selectedUser, fetchConversationPage, user?.id]);
+  }, [selectedUser, fetchConversationPage, user?.id, saveCachedMessages]);
 
-  // ---------- WebSocket lifecycle (conversation only) ----------
+  // ---------- WebSocket lifecycle via util (conversation only) ----------
   useEffect(() => {
-    if (mode !== "conversation" || !selectedUser || !authToken || !effectiveReady) return;
-    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) return;
+    let cleanup = null;
 
-    shouldReconnectRef.current = true;
+    (async () => {
+      if (mode !== "conversation" || !selectedUser || !authToken || !effectiveReady) return;
 
-    const openSocket = () => {
-      if (wsRef.current && wsRef.current.readyState !== WebSocket.CLOSED) {
-        try { wsRef.current.close(); } catch {}
-      }
-      const ws = new WebSocket(`${WS_URL}/chat/?token=${authToken}`);
-      wsRef.current = ws;
+      const privForUser = await loadPrivateKeyForUser(user?.id);
+      if (!privForUser) return;
 
-      ws.onopen = () => { reconnectAttemptsRef.current = 0; };
+      const { socket, close } = createChatSocket({
+        token: authToken,
+        onOpen: () => {},
+        onClose: () => {},
+        onError: (e) => console.warn("[ws] error", e?.message || e),
+        onMessage: async (incoming) => {
+          try {
+            const senderId = incoming.sender ?? incoming.sender_id;
+            const receiverId = incoming.receiver ?? incoming.receiver_id;
+            const myIdStr = String(user.id);
+            const otherId = String(senderId) === myIdStr ? String(receiverId) : String(senderId);
 
-      ws.onmessage = async (event) => {
-        try {
-          const incoming = JSON.parse(event.data);
-          const privateKeyPem = await AsyncStorage.getItem("privateKey");
-          if (!privateKeyPem) return;
+            // bump thread preview/unread — clear later if active
+            setThreads((t) => {
+              const existingMeta = t[asId(otherId)]?.meta || {};
+              return upsertThread(
+                t,
+                { id: otherId, ...existingMeta },
+                "New message",
+                new Date(),
+                String(senderId) !== myIdStr
+              );
+            });
 
-          // Prefer per-caller wrap if provided by WS; else fall back
-          let wrap = incoming.encrypted_key_for_me
-            || incoming.encrypted_key_sender
-            || incoming.encrypted_key; // receiver wrap
+            // only add to UI if this is the active thread
+            if (!selectedUser || String(selectedUser.id) !== otherId) return;
 
-          if (!wrap) return;
+            const privateKeyPem = await AsyncStorage.getItem("privateKey");
+            if (!privateKeyPem) return;
 
-          let keyB64;
-          try { keyB64 = decryptRSA(wrap, privateKeyPem); } catch { return; }
+            const wrap = pickWrapForMe(incoming, user.id);
+            if (!wrap) return;
 
-          const decryptedText = decryptAES({
-            ciphertextB64: incoming.encrypted_message,
-            ivB64: incoming.iv,
-            macB64: incoming.mac,
-            keyB64,
-          });
+            let keyB64;
+            try { keyB64 = decryptRSA(b64FixPadding(wrap), privateKeyPem); } catch { return; }
 
-          const isMine = String(incoming.sender ?? incoming.sender_id) === String(user.id);
-          const otherId = isMine
-            ? (incoming.receiver ?? incoming.receiver_id)
-            : (incoming.sender ?? incoming.sender_id);
+            const decryptedText = decryptAES({
+              ciphertextB64: b64FixPadding(incoming.encrypted_message),
+              ivB64: b64FixPadding(incoming.iv),
+              macB64: b64FixPadding(incoming.mac),
+              keyB64: b64FixPadding(keyB64),
+            });
 
-          const newMsg = {
-            _id: incoming.id || Math.random().toString(),
-            text: decryptedText || "🔒 Encrypted Message",
-            createdAt: incoming.timestamp ? new Date(incoming.timestamp)
-              : (incoming.created_at ? new Date(incoming.created_at) : new Date()),
-            user: { _id: isMine ? user.id : otherId, name: isMine ? "You" : nameOf(selectedUser) },
-          };
+            const isMine = String(senderId) === myIdStr;
+            const newMsg = {
+              _id: incoming.id || Math.random().toString(),
+              text: decryptedText || "🔒 Encrypted Message",
+              createdAt: incoming.timestamp ? new Date(incoming.timestamp)
+                : (incoming.created_at ? new Date(incoming.created_at) : new Date()),
+              user: { _id: isMine ? user.id : selectedUser.id, name: isMine ? "You" : nameOf(selectedUser) },
+            };
 
-          setMessages((prev) => {
-            const next = [...prev, newMsg].sort((a,b) => new Date(a.createdAt) - new Date(b.createdAt));
-            if (selectedUser?.id) saveCachedMessages(selectedUser.id, next);
-            return next;
-          });
+            setMessages((prev) => {
+              const next = [...prev, newMsg].sort((a,b) => new Date(a.createdAt) - new Date(b.createdAt));
+              if (selectedUser?.id) saveCachedMessages(selectedUser.id, next);
+              return next;
+            });
 
-          setThreads((t) => upsertThread(t, { id: otherId }, decryptedText, newMsg.createdAt, !isMine));
-        } catch (e) {
-          console.error("❌ onmessage error:", e);
-        }
-      };
+            // active thread → reset unread & set preview text
+            setThreads((t) => upsertThread(
+              t,
+              { id: selectedUser.id, ...selectedUser },
+              decryptedText,
+              newMsg.createdAt,
+              !isMine,
+              { resetUnread: true }
+            ));
+          } catch (e) {
+            console.error("❌ onMessage handler error:", e);
+          }
+        },
+      });
 
-      ws.onerror = (e) => console.warn("[ws] error", e?.message || e);
-      ws.onclose = () => {
-        const should = shouldReconnectRef.current && modeRef.current === "conversation";
-        if (should && selectedUser && authToken && effectiveReady && reconnectAttemptsRef.current < maxReconnects) {
-          reconnectAttemptsRef.current += 1;
-          setTimeout(openSocket, 500 * reconnectAttemptsRef.current);
-        }
-      };
-    };
+      socketRef.current = socket;
+      cleanup = () => { try { close(); } catch {} };
+    })();
 
-    openSocket();
     return () => {
-      shouldReconnectRef.current = false;
-      if (wsRef.current) { try { wsRef.current.close(); } catch {} wsRef.current = null; }
+      if (cleanup) cleanup();
+      socketRef.current = null;
     };
-  }, [mode, selectedUser, authToken, effectiveReady, user?.id]);
+  }, [mode, selectedUser, authToken, effectiveReady, user?.id, saveCachedMessages]);
+
+  // ---------- Thread utils ----------
+  const upsertThread = (threads, otherUser, lastText, at, isIncoming, opts = {}) => {
+    const key = asId(otherUser.id);
+    const baseName = nameOf(otherUser);
+    const prev = threads[key] || {
+      id: key,
+      name: baseName,
+      meta: {
+        first_name: otherUser.first_name,
+        last_name: otherUser.last_name,
+        email: otherUser.email,
+      },
+      lastText: "",
+      updatedAt: new Date().toISOString(),
+      unread: 0,
+    };
+    return {
+      ...threads,
+      [key]: {
+        ...prev,
+        name: baseName || prev.name,
+        meta: {
+          first_name: otherUser.first_name ?? prev.meta?.first_name,
+          last_name: otherUser.last_name ?? prev.meta?.last_name,
+          email: otherUser.email ?? prev.meta?.email,
+        },
+        lastText: typeof lastText === "string" ? lastText : prev.lastText,
+        updatedAt: (at || new Date()).toISOString(),
+        unread: opts.resetUnread ? 0 : Math.max(0, (prev.unread || 0) + (isIncoming ? 1 : 0)),
+      },
+    };
+  };
 
   // ---- actions ----
   const openConversation = (neighbor) => {
     if (!neighbor?.id) return;
-    setThreads((t) => upsertThread(t, neighbor, "", new Date(), false));
-    setSelectedUser(neighbor);
+    const known = directory[asId(neighbor.id)] || neighbor;
+    setThreads((t) => upsertThread(t, known, "", new Date(), false, { resetUnread: true }));
+    setSelectedUser(known);
     setMessages([]);
     setMode("conversation");
     setEffectiveQuery("");
     setSearchResults([]);
-    hydrateConversation(neighbor);
+    hydrateConversation(known);
   };
 
   const backToThreads = () => {
     setMode("threads");
+    if (selectedUser?.id) {
+      setThreads((t) => upsertThread(t, selectedUser, "", new Date(), false, { resetUnread: true }));
+    }
     setSelectedUser(null);
     setMessages([]);
-    shouldReconnectRef.current = false;
-    if (wsRef.current) { try { wsRef.current.close(); } catch {} wsRef.current = null; }
+    if (socketRef.current) { try { socketRef.current.close(); } catch {} socketRef.current = null; }
   };
 
-  const sendMessage = async (messageText) => {
-    const ws = wsRef.current;
-    if (!selectedUser || !ws) return;
+  const sendMessage = async (messageVal) => {
+    const messageText = typeof messageVal === "string" ? messageVal : (messageVal?.text ?? "");
+    const text = messageText.trim();
+    if (!text) return;
+
+    const sock = socketRef.current;
+    if (!selectedUser || !sock) return;
 
     const privateKey = await AsyncStorage.getItem("privateKey");
     const myPublicKey = await AsyncStorage.getItem("publicKey");
@@ -398,13 +475,13 @@ const ChatScreen = ({ navigation }) => {
       Alert.alert("Encryption Setup", "Your device keys are still generating. Try again in a moment.");
       return;
     }
-    if (ws.readyState !== WebSocket.OPEN) {
+    if (sock.readyState !== WebSocket.OPEN) {
       Alert.alert("WebSocket not connected. Try again.");
       return;
     }
 
     try {
-      // get/cache recipient public key
+      // get or cache recipient public key
       let recipientPub = await AsyncStorage.getItem(`publicKey_${selectedUser.id}`);
       if (!recipientPub) {
         const response = await fetch(`${API_URL}/users/${selectedUser.id}/public_key/`, {
@@ -419,12 +496,12 @@ const ChatScreen = ({ navigation }) => {
         await AsyncStorage.setItem(`publicKey_${selectedUser.id}`, recipientPub);
       }
 
-      // Encrypt message with fresh AES; wrap for both parties
-      const bundle = encryptAES(messageText);
+      // encrypt message with fresh AES; wrap for both parties
+      const bundle = encryptAES(text);
       const encrypted_key_for_receiver = encryptRSA(bundle.keyB64, recipientPub);
       const encrypted_key_for_sender   = encryptRSA(bundle.keyB64, myPublicKey);
 
-      ws.send(JSON.stringify({
+      sock.send(JSON.stringify({
         receiver_id: selectedUser.id,
         encrypted_message: bundle.ciphertextB64,
         encrypted_key_for_receiver,
@@ -436,7 +513,7 @@ const ChatScreen = ({ navigation }) => {
       const now = new Date();
       const optimistic = {
         _id: Math.random().toString(),
-        text: messageText,
+        text,
         createdAt: now,
         user: { _id: user.id, name: "You" },
       };
@@ -447,7 +524,7 @@ const ChatScreen = ({ navigation }) => {
         return next;
       });
 
-      setThreads((t) => upsertThread(t, selectedUser, messageText, now, false));
+      setThreads((t) => upsertThread(t, selectedUser, text, now, false));
     } catch (error) {
       console.error("❌ Error sending message:", error);
       Alert.alert("Send Error", "Failed to send message.");
@@ -455,7 +532,7 @@ const ChatScreen = ({ navigation }) => {
   };
 
   const onRefresh = useCallback(() => { setRefreshing(true); setTimeout(() => setRefreshing(false), 600); }, []);
-  const messagesForUI = useMemo(() => messages.slice().reverse(), [messages]); // SimpleChat wants newest-first
+  const messagesForUI = useMemo(() => messages.slice().reverse(), [messages]); // SimpleChat expects newest first
 
   // ---- UI blocks ----
   const ThreadsList = () => {
@@ -496,8 +573,9 @@ const ChatScreen = ({ navigation }) => {
               style={styles.threadItem}
               onPress={() => openConversation({
                 id: item.id,
-                first_name: item.name.split(" ")[0],
-                last_name: item.name.split(" ").slice(1).join(" ")
+                first_name: item.meta?.first_name,
+                last_name: item.meta?.last_name,
+                email: item.meta?.email,
               })}
             >
               <View style={styles.avatar}><Text style={styles.avatarTxt}>{item.name?.[0]?.toUpperCase() || "N"}</Text></View>
@@ -548,7 +626,10 @@ const ChatScreen = ({ navigation }) => {
 
         <SimpleChat
           messages={messagesForUI}
-          onPressSendButton={(text) => sendMessage(text)}
+          onPressSendButton={(val) => {
+            const text = typeof val === "string" ? val : (val?.text ?? "");
+            if (text.trim().length) sendMessage(text.trim());
+          }}
           user={{ _id: user.id, name: "You" }}
           placeholder="Type a message…"
           inputStyle={styles.input}

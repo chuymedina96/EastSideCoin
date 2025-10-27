@@ -13,7 +13,7 @@ from rest_framework import status
 from django.contrib.auth.hashers import make_password, check_password
 from django.contrib.auth import get_user_model
 
-from .models import ChatMessage  # adjust import if needed
+from .models import ChatMessage  # adjust if needed
 
 User = get_user_model()
 
@@ -32,9 +32,9 @@ def _serialize_user(u: User):
 
 def _serialize_message_for_requester(m: ChatMessage, requester_id: int):
     """
-    Return fields expected by the mobile client.
-    - Always include both `encrypted_key` (receiver) and `encrypted_key_sender` (sender) for compatibility.
-    - The client will pick the right one based on who they are in each row.
+    Mobile client expects these fields. We expose wraps as:
+    - encrypted_key          -> receiver wrap (RSA-OAEP key for the recipient)
+    - encrypted_key_sender   -> sender wrap  (RSA-OAEP key for the sender)
     """
     return {
         "id": str(m.id),
@@ -43,15 +43,27 @@ def _serialize_message_for_requester(m: ChatMessage, requester_id: int):
         "encrypted_message": m.encrypted_message,
         "iv": m.iv,
         "mac": m.mac,
-        # map model fields to the names the app expects
         "encrypted_key": m.encrypted_key_for_receiver,
         "encrypted_key_sender": m.encrypted_key_for_sender,
-        "timestamp": m.timestamp.isoformat(),
+        "timestamp": (m.timestamp or timezone.now()).isoformat(),
         "is_read": m.is_read,
     }
 
 
-# ✅ Register User
+def _tzsafe_parse(dt_str):
+    if not dt_str:
+        return None
+    dt = parse_datetime(dt_str)
+    if not dt:
+        return None
+    if timezone.is_naive(dt):
+        dt = timezone.make_aware(dt, timezone.get_current_timezone())
+    return dt
+
+
+# ===========================
+# Auth / Keys
+# ===========================
 @api_view(["POST"])
 @permission_classes([AllowAny])
 def register_user(request):
@@ -70,16 +82,14 @@ def register_user(request):
         if User.objects.filter(email=email).exists():
             return Response({"error": "Email is already in use"}, status=status.HTTP_400_BAD_REQUEST)
 
-        hashed_password = make_password(password)
         user = User.objects.create(
             first_name=first_name,
             last_name=last_name,
             email=email,
-            password=hashed_password,
+            password=make_password(password),
             wallet_address=wallet_address,
-            public_key=None,  # set later by /generate_keys
+            public_key=None,
         )
-
         print(f"✅ User Registered: {user.id} {user.email}")
         return Response(
             {"message": "User registered successfully", "requires_key_setup": True},
@@ -90,22 +100,21 @@ def register_user(request):
         return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 
-# ✅ Store user's public key (client generates keys)
 @api_view(["POST"])
 @permission_classes([IsAuthenticated])
 def generate_keys(request):
     user = request.user
-    received_public_key = request.data.get("public_key")
+    received_public_key = (request.data.get("public_key") or "").strip()
 
     if user.public_key:
         return Response({"message": "Keys already generated"}, status=status.HTTP_400_BAD_REQUEST)
 
-    if not received_public_key or not received_public_key.strip().startswith("-----BEGIN PUBLIC KEY-----"):
+    if not received_public_key.startswith("-----BEGIN PUBLIC KEY-----"):
         print("❌ Invalid or missing public key format.")
         return Response({"error": "Invalid public key format."}, status=status.HTTP_400_BAD_REQUEST)
 
     try:
-        user.public_key = received_public_key.strip()
+        user.public_key = received_public_key
         user.save(update_fields=["public_key"])
         print(f"✅ Public key stored for {user.email}")
         return Response({"message": "Keys stored successfully"}, status=status.HTTP_200_OK)
@@ -114,7 +123,6 @@ def generate_keys(request):
         return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 
-# ✅ Login User
 @api_view(["POST"])
 @permission_classes([AllowAny])
 def login_user(request):
@@ -144,8 +152,11 @@ def login_user(request):
             {
                 "access": access,
                 "refresh": str(refresh),
-                "user": _serialize_user(user)
-                | {"wallet_address": user.wallet_address, "public_key": user.public_key},
+                "user": {
+                    **_serialize_user(user),
+                    "wallet_address": user.wallet_address,
+                    "public_key": user.public_key,
+                },
             },
             status=status.HTTP_200_OK,
         )
@@ -154,7 +165,6 @@ def login_user(request):
         return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 
-# ✅ Logout User
 @api_view(["POST"])
 @permission_classes([IsAuthenticated])
 def logout_user(request):
@@ -177,7 +187,35 @@ def logout_user(request):
         return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 
-# ✅ Search Users
+@api_view(["DELETE"])
+@permission_classes([IsAuthenticated])
+def delete_account(request):
+    """
+    DELETE /api/delete_account/
+    Optional body: { "refresh": "<refresh_token_string>" }
+    """
+    try:
+        user = request.user
+        refresh = request.data.get("refresh")
+
+        if refresh:
+            try:
+                RefreshToken(refresh).blacklist()
+            except Exception:
+                pass
+
+        # Delete all messages involving the user
+        ChatMessage.objects.filter(Q(sender=user) | Q(receiver=user)).delete()
+        user.delete()
+
+        return Response(status=status.HTTP_204_NO_CONTENT)
+    except Exception as e:
+        return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+
+# ===========================
+# Users / Search
+# ===========================
 @api_view(["GET"])
 @permission_classes([IsAuthenticated])
 def search_users(request):
@@ -188,22 +226,26 @@ def search_users(request):
 
     users = (
         User.objects.filter(
-            Q(first_name__icontains=query)
-            | Q(last_name__icontains=query)
-            | Q(email__icontains=query)
+            Q(first_name__icontains=query) |
+            Q(last_name__icontains=query) |
+            Q(email__icontains=query)
         )
         .exclude(id=request.user.id)
         .only("id", "first_name", "last_name", "email")
     )
-
-    results = [_serialize_user(u) for u in users]
-    return Response(results, status=status.HTTP_200_OK)
+    return Response([_serialize_user(u) for u in users], status=status.HTTP_200_OK)
 
 
-# ✅ Retrieve Messages (inbox-style for the authenticated receiver)
+# ===========================
+# Messages / Conversations
+# ===========================
 @api_view(["GET"])
 @permission_classes([IsAuthenticated])
 def get_messages(request):
+    """
+    Inbox-style for the authenticated user (as receiver).
+    If you want both directions, prefer get_conversation().
+    """
     print("🚀 Get Messages API Hit!")
     try:
         messages = ChatMessage.objects.filter(receiver=request.user).order_by("-timestamp")
@@ -214,14 +256,59 @@ def get_messages(request):
         return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 
-# ✅ Conversation fetch (both directions, paginated, optional before/after ISO-8601)
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def my_threads(request):
+    """
+    Returns a list of peers the authed user has chatted with,
+    with latest timestamp and a small preview snippet.
+    """
+    print("🚀 My Threads API Hit!")
+    try:
+        me = request.user
+
+        # Who are my peers?
+        peer_pairs = ChatMessage.objects.filter(
+            Q(sender=me) | Q(receiver=me)
+        ).values_list("sender_id", "receiver_id", "id", "timestamp", "encrypted_message")
+
+        latest_by_peer = {}
+        for s_id, r_id, msg_id, ts, enc in peer_pairs:
+            other_id = r_id if s_id == me.id else s_id
+            if other_id == me.id:
+                continue
+            prev = latest_by_peer.get(other_id)
+            if (not prev) or (ts and ts > prev["timestamp"]):
+                latest_by_peer[other_id] = {"timestamp": ts, "encrypted_message": enc or ""}
+
+        if not latest_by_peer:
+            return Response([], status=status.HTTP_200_OK)
+
+        peers = User.objects.filter(id__in=list(latest_by_peer.keys())).only("id", "first_name", "last_name", "email")
+
+        items = []
+        for u in peers:
+            meta = latest_by_peer.get(u.id)
+            items.append({
+                "peer": _serialize_user(u),
+                "latest_timestamp": meta["timestamp"].isoformat() if meta["timestamp"] else None,
+                "latest_encrypted_message": meta["encrypted_message"],
+            })
+
+        items.sort(key=lambda x: x["latest_timestamp"] or "", reverse=True)
+        return Response(items, status=status.HTTP_200_OK)
+    except Exception as e:
+        print("❌ my_threads error:", e)
+        return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+
 @api_view(["GET"])
 @permission_classes([IsAuthenticated])
 def get_conversation(request, other_id: int):
     """
     GET /api/conversations/<other_id>/?limit=50&page=1&before=...&after=...
     Returns encrypted messages BETWEEN the authed user and other_id.
-    Sorted ASC (oldest -> newest) for UI-friendly rendering.
+    Sorted ASC (oldest -> newest).
     """
     print(f"🚀 Get Conversation API Hit: other_id={other_id}")
     try:
@@ -232,22 +319,17 @@ def get_conversation(request, other_id: int):
 
         limit = max(1, min(int(request.GET.get("limit", 50)), 200))
         page = int(request.GET.get("page", 1))
-        before = request.GET.get("before")
-        after = request.GET.get("after")
+        before = _tzsafe_parse(request.GET.get("before"))
+        after = _tzsafe_parse(request.GET.get("after"))
 
         qs = ChatMessage.objects.filter(
             Q(sender=request.user, receiver=other) |
             Q(sender=other, receiver=request.user)
         )
-
         if after:
-            dt = parse_datetime(after)
-            if dt:
-                qs = qs.filter(timestamp__gt=dt)
+            qs = qs.filter(timestamp__gt=after)
         if before:
-            dt = parse_datetime(before)
-            if dt:
-                qs = qs.filter(timestamp__lt=dt)
+            qs = qs.filter(timestamp__lt=before)
 
         qs = qs.order_by("timestamp")  # ASC for UI
 
@@ -267,17 +349,16 @@ def get_conversation(request, other_id: int):
         prev_page = page - 1 if page_obj.has_previous() else None
 
         return Response({
-                "results": items,
-                "next_page": next_page,
-                "prev_page": prev_page,
-                "count": paginator.count,
-            }, status=status.HTTP_200_OK)
+            "results": items,
+            "next_page": next_page,
+            "prev_page": prev_page,
+            "count": paginator.count,
+        }, status=status.HTTP_200_OK)
     except Exception as e:
         print("❌ get_conversation error:", e)
         return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 
-# ✅ Mark Message as Read (single)
 @api_view(["POST"])
 @permission_classes([IsAuthenticated])
 def mark_message_read(request):
@@ -297,7 +378,6 @@ def mark_message_read(request):
         return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 
-# ✅ Mark Messages as Read (batch)
 @api_view(["POST"])
 @permission_classes([IsAuthenticated])
 def mark_messages_read_batch(request):
@@ -310,13 +390,16 @@ def mark_messages_read_batch(request):
     if not isinstance(ids, list) or not ids:
         return Response({"error": "ids must be a non-empty list"}, status=status.HTTP_400_BAD_REQUEST)
     try:
-        updated = ChatMessage.objects.filter(id__in=ids, receiver=request.user, is_read=False).update(is_read=True)
+        updated = ChatMessage.objects.filter(
+            id__in=ids,
+            receiver=request.user,
+            is_read=False
+        ).update(is_read=True)
         return Response({"updated": updated}, status=status.HTTP_200_OK)
     except Exception as e:
         return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 
-# ✅ Send Encrypted Chat Message (client-side E2EE bundle)
 @api_view(["POST"])
 @permission_classes([IsAuthenticated])
 def send_message(request):
@@ -334,12 +417,18 @@ def send_message(request):
     print("🚀 Send Message API Hit!")
     try:
         data = request.data
+        # NOISY LOG (keys only) to debug client payload shape
+        try:
+            print("📥 send_message keys:", list(data.keys()))
+        except Exception:
+            pass
+
         receiver_id = data.get("receiver_id")
         enc_msg = data.get("encrypted_message")
         iv = data.get("iv")
         mac = data.get("mac")
-        enc_key_recv = data.get("encrypted_key")  # receiver wrap
-        enc_key_sender = data.get("encrypted_key_sender")  # sender wrap (optional)
+        enc_key_recv = data.get("encrypted_key")
+        enc_key_sender = data.get("encrypted_key_sender")
 
         if not all([receiver_id, enc_msg, iv, mac, enc_key_recv]):
             return Response(
@@ -352,25 +441,30 @@ def send_message(request):
         except User.DoesNotExist:
             return Response({"error": "Receiver not found"}, status=status.HTTP_404_NOT_FOUND)
 
-        chat_message = ChatMessage.objects.create(
+        msg = ChatMessage.objects.create(
             sender=request.user,
             receiver=receiver,
             encrypted_message=enc_msg,
             iv=iv,
             mac=mac,
             encrypted_key_for_receiver=enc_key_recv,
-            encrypted_key_for_sender=enc_key_sender,  # may be None
-            timestamp=timezone.now(),  # explicit for safety
+            encrypted_key_for_sender=enc_key_sender,
+            timestamp=timezone.now(),
         )
 
-        print(f"✅ Message stored: {chat_message.id}")
-        return Response({"message": "Message stored", "message_id": str(chat_message.id)}, status=status.HTTP_201_CREATED)
+        print(f"✅ Message stored: {msg.id}")
+
+        # Echo back a canonical payload so the client can merge immediately if needed
+        payload = _serialize_message_for_requester(msg, request.user.id)
+        return Response(payload, status=status.HTTP_201_CREATED)
     except Exception as e:
         print(f"❌ ERROR Sending Message: {e}")
         return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 
-# ✅ Check Wallet Balance
+# ===========================
+# Wallet / Keys
+# ===========================
 @api_view(["GET"])
 @permission_classes([IsAuthenticated])
 def check_balance(request, wallet_address):
@@ -385,7 +479,6 @@ def check_balance(request, wallet_address):
         return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 
-# ✅ Public key getter (for encrypting to a recipient)
 @api_view(["GET"])
 @permission_classes([IsAuthenticated])
 def get_user_public_key(request, user_id):

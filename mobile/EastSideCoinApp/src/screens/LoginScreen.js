@@ -13,6 +13,7 @@ import AsyncStorage from "@react-native-async-storage/async-storage";
 import { AuthContext } from "../context/AuthProvider";
 import { useNavigation } from "@react-navigation/native";
 import { resetNavigation } from "../navigation/NavigationService";
+import { loadPrivateKeyForUser, loadPublicKeyForUser } from "../utils/keyManager";
 
 const MIN_PW = 6;
 
@@ -20,31 +21,47 @@ const LoginScreen = () => {
   const { login } = useContext(AuthContext);
   const navigation = useNavigation();
 
-  const [email, setEmail]         = useState("");
-  const [password, setPassword]   = useState("");
-  const [showPw, setShowPw]       = useState(false);
-  const [loading, setLoading]     = useState(false);
-  const [routing, setRouting]     = useState(false); // brief spinner during post-login route decision
+  const [email, setEmail]       = useState("");
+  const [password, setPassword] = useState("");
+  const [showPw, setShowPw]     = useState(false);
+  const [loading, setLoading]   = useState(false);
+  const [routing, setRouting]   = useState(false);
 
-  const canSubmit = useMemo(() => {
-    return /^\S+@\S+\.\S+$/.test(email.trim()) && password.length >= MIN_PW && !loading && !routing;
-  }, [email, password, loading, routing]);
+  const canSubmit = useMemo(
+    () => /^\S+@\S+\.\S+$/.test(email.trim()) && password.length >= MIN_PW && !loading && !routing,
+    [email, password, loading, routing]
+  );
 
   const routeAfterAuth = async () => {
     setRouting(true);
     try {
-      // Give AuthProvider a beat to persist things
+      // Let AuthProvider persist tokens/user
       await new Promise((r) => setTimeout(r, 150));
 
-      const priv = await AsyncStorage.getItem("privateKey");
-      // Either cached locally or provided by server (AuthProvider may have cached user.public_key to 'publicKey')
-      const pub  = await AsyncStorage.getItem("publicKey");
+      const rawUser = await AsyncStorage.getItem("user");
+      const u = rawUser ? JSON.parse(rawUser) : null;
 
-      if (priv && pub) {
-        resetNavigation("HomeTabs");
-      } else {
-        resetNavigation("KeyScreenSetup");
+      if (u?.id) {
+        // Hydrate legacy slot if a per-user key already exists on this device
+        const perUserKey = await AsyncStorage.getItem(`privateKey_${u.id}`);
+        if (perUserKey) await AsyncStorage.setItem("privateKey", perUserKey);
+
+        const priv = await loadPrivateKeyForUser(u.id); // copies if present
+        const pub =
+          (await loadPublicKeyForUser(u.id)) ||
+          (await AsyncStorage.getItem("publicKey")) ||
+          u.public_key ||
+          null;
+
+        const ready = Boolean(priv && pub);
+        resetNavigation(ready ? "HomeTabs" : "KeyScreenSetup");
+        return;
       }
+
+      // Fallback legacy check (very unlikely)
+      const priv = await AsyncStorage.getItem("privateKey");
+      const pub  = await AsyncStorage.getItem("publicKey");
+      resetNavigation(priv && pub ? "HomeTabs" : "KeyScreenSetup");
     } finally {
       setRouting(false);
     }
@@ -57,12 +74,12 @@ const LoginScreen = () => {
     }
     setLoading(true);
     try {
-      const success = await login(email.trim().toLowerCase(), password, /*skipRedirect*/ true);
+      const success = await login(email.trim().toLowerCase(), password, /* skipRedirect */ true);
       if (!success) {
         Alert.alert("Login Error", "Invalid email or password.");
         return;
       }
-      // Decide immediately on this screen (AuthProvider also guards, this just makes it snappier)
+      // Don’t generate keys here—route to KeyScreenSetup if needed
       await routeAfterAuth();
     } catch (error) {
       console.error("❌ Login Failed:", error?.message || error);
@@ -106,8 +123,7 @@ const LoginScreen = () => {
       </View>
 
       <Text style={styles.helper}>
-        After login, we’ll secure your messages with device keys. If keys are missing,
-        you’ll be guided to set them up right away.
+        After login, if your device doesn’t have keys yet, we’ll walk you through setup.
       </Text>
 
       {(loading || routing) && <ActivityIndicator size="large" color="#E63946" />}

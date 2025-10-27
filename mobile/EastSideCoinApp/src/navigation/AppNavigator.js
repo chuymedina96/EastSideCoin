@@ -1,6 +1,9 @@
+// navigation/AppNavigator.js
 import React, { useContext } from "react";
 import { createStackNavigator } from "@react-navigation/stack";
 import { createBottomTabNavigator } from "@react-navigation/bottom-tabs";
+import Ionicons from "react-native-vector-icons/Ionicons";
+
 import { AuthContext } from "../context/AuthProvider";
 
 import LandingScreen from "../screens/LandingScreen";
@@ -11,63 +14,75 @@ import WalletScreen from "../screens/WalletScreen";
 import ChatScreen from "../screens/ChatScreen";
 import ServicesScreen from "../screens/ServicesScreen";
 import ProfileScreen from "../screens/ProfileScreen";
-import KeyScreenSetup from "../screens/KeyScreenSetup"; // Key setup screen
+import KeyScreenSetup from "../screens/KeyScreenSetup";
 
-import Ionicons from "react-native-vector-icons/Ionicons";
-
-const Stack = createStackNavigator();
+const AuthStack = createStackNavigator();
+const AppStack = createStackNavigator();
 const Tab = createBottomTabNavigator();
 
-// Bottom Tabs for Authenticated Users
+const iconMap = {
+  Home: "home",
+  Wallet: "wallet",
+  Chat: "chatbubbles",
+  Services: "briefcase",
+  Profile: "person",
+};
+
 const HomeTabs = () => (
   <Tab.Navigator
     screenOptions={({ route }) => ({
       headerShown: false,
-      tabBarIcon: ({ color, size }) => {
-        let iconName;
-        if (route.name === "Home") iconName = "home";
-        else if (route.name === "Wallet") iconName = "wallet";
-        else if (route.name === "Chat") iconName = "chatbubbles";
-        else if (route.name === "Services") iconName = "briefcase";
-        else if (route.name === "Profile") iconName = "person";
-
-        return <Ionicons name={iconName} size={size} color={color} />;
-      },
+      tabBarIcon: ({ color, size }) => (
+        <Ionicons name={iconMap[route.name] ?? "home"} size={size} color={color} />
+      ),
       tabBarActiveTintColor: "#E63946",
       tabBarInactiveTintColor: "gray",
+      tabBarHideOnKeyboard: true,         // nicer input UX
     })}
+    // Helps performance a bit; RN handles this well now.
+    // detachInactiveScreens={true}
   >
     <Tab.Screen name="Home" component={HomeScreen} />
     <Tab.Screen name="Wallet" component={WalletScreen} />
-    <Tab.Screen name="Chat" component={ChatScreen} />
+    <Tab.Screen
+      name="Chat"
+      component={ChatScreen}
+      options={{ unmountOnBlur: true }}   // extra WS safety
+    />
     <Tab.Screen name="Services" component={ServicesScreen} />
     <Tab.Screen name="Profile" component={ProfileScreen} />
   </Tab.Navigator>
 );
 
-// Main App Navigator
-const AppNavigator = () => {
-  const { user } = useContext(AuthContext);
+// ---- Auth stack when not logged in ------------------------------------------
+const AuthNavigator = () => (
+  <AuthStack.Navigator screenOptions={{ headerShown: false }} initialRouteName="Landing">
+    <AuthStack.Screen name="Landing" component={LandingScreen} />
+    <AuthStack.Screen name="Login" component={LoginScreen} />
+    <AuthStack.Screen name="Register" component={RegisterScreen} />
+  </AuthStack.Navigator>
+);
 
-  return (
-    <Stack.Navigator
-      screenOptions={{ headerShown: false }}
-      initialRouteName={user ? "HomeTabs" : "Landing"}
-    >
-      {user ? (
-        <>
-          <Stack.Screen name="HomeTabs" component={HomeTabs} />
-          <Stack.Screen name="KeyScreenSetup" component={KeyScreenSetup} />
-        </>
-      ) : (
-        <>
-          <Stack.Screen name="Landing" component={LandingScreen} />
-          <Stack.Screen name="Login" component={LoginScreen} />
-          <Stack.Screen name="Register" component={RegisterScreen} />
-        </>
-      )}
-    </Stack.Navigator>
-  );
+// ---- App stack when logged in ------------------------------------------------
+// Note: the `key` forces a remount when keysReady flips, so initialRouteName is honored.
+const AppNavigatorInner = ({ keysReady }) => (
+  <AppStack.Navigator
+    screenOptions={{ headerShown: false }}
+    initialRouteName={keysReady ? "HomeTabs" : "KeyScreenSetup"}
+    key={keysReady ? "app-home" : "app-keys"}
+  >
+    <AppStack.Screen
+      name="KeyScreenSetup"
+      component={KeyScreenSetup}
+      options={{ gestureEnabled: false }} // don't allow swipe-back into auth flow
+    />
+    <AppStack.Screen name="HomeTabs" component={HomeTabs} />
+  </AppStack.Navigator>
+);
+
+const AppNavigator = () => {
+  const { user, keysReady } = useContext(AuthContext);
+  return user ? <AppNavigatorInner keysReady={!!keysReady} /> : <AuthNavigator />;
 };
 
 export default AppNavigator;
