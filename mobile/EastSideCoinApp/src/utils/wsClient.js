@@ -3,11 +3,11 @@ import { WS_URL } from "../config";
 
 /**
  * Sticky singleton WS client (one socket per session/token).
- * - Keeps the same socket across thread switches.
- * - Reconnects with exponential backoff when the connection drops.
- * - Supports multiple listeners (returns an unsubscribe to remove your callbacks).
- * - Exposes destroyChatSocket() to fully close on logout.
- * - Filters heartbeat frames (shape: { type, ts }) away from onMessage; routes to onHeartbeat instead.
+ * - One socket per token; auto-reconnect with backoff.
+ * - Multiple listeners; each createOrGetChatSocket() returns an unsubscribe.
+ * - Heartbeats filtered from onMessage (use onHeartbeat to observe them).
+ * - Small send queue survives reconnects.
+ * - Exposes a tiny debug state: {_state: {sendQueue, processedIds}, ready:boolean}
  */
 
 let socket = null;
@@ -15,24 +15,29 @@ let lastToken = null;
 let lastUrl = null;
 let manualClose = false;
 
-let listeners = new Set(); // each: { onOpen, onClose, onError, onMessage, onHeartbeat }
+let listeners = new Set(); // { onOpen, onClose, onError, onMessage, onHeartbeat }
 let reconnectTimer = null;
 let reconnectAttempts = 0;
 
-// Heartbeat (app-level ping over text frames)
+// Heartbeat
 let heartbeatTimer = null;
 const HEARTBEAT_MS = 25000;
 
+// Light debug / internals we surface for HUDs
+const _state = {
+  sendQueue: [],         // queued payloads while not OPEN
+  processedIds: new Set()// optional use by consumers
+};
+
 // ---- utils ------------------------------------------------------------------
 function buildUrl({ baseUrl, path, token }) {
-  const b = (baseUrl || WS_URL || "").replace(/\/+$/, ""); // no trailing slash
-  const p = (path || "/chat/").replace(/^\/?/, "/");       // ensure single leading slash
+  const b = (baseUrl || WS_URL || "").replace(/\/+$/, "");
+  const p = (path || "/chat/").replace(/^\/?/, "/");
   return `${b}${p}?token=${encodeURIComponent(token)}`;
 }
 
 function isHeartbeatPayload(obj) {
   if (!obj || typeof obj !== "object") return false;
-  // Django logs showed heartbeat-like payloads with keys ['ts', 'type'] and NO encrypted fields.
   const hasTsType = ("type" in obj) && ("ts" in obj);
   if (!hasTsType) return false;
   const hasEncrypted =
@@ -50,12 +55,9 @@ function startHeartbeat() {
   heartbeatTimer = setInterval(() => {
     try {
       if (socket && socket.readyState === WebSocket.OPEN) {
-        // Application-level ping; server may reply with { type: 'heartbeat', ts: ... }
         socket.send(JSON.stringify({ type: "ping", ts: Date.now() }));
       }
-    } catch {
-      // ignore
-    }
+    } catch { /* noop */ }
   }, HEARTBEAT_MS);
 }
 function stopHeartbeat() {
@@ -68,13 +70,12 @@ function stopHeartbeat() {
 function notify(kind, payload) {
   for (const h of Array.from(listeners)) {
     try {
-      if (kind === "open")       h.onOpen?.();
-      else if (kind === "close") h.onClose?.(payload);
-      else if (kind === "error") h.onError?.(payload);
+      if (kind === "open")         h.onOpen?.();
+      else if (kind === "close")   h.onClose?.(payload);
+      else if (kind === "error")   h.onError?.(payload);
       else if (kind === "message") h.onMessage?.(payload);
       else if (kind === "heartbeat") h.onHeartbeat?.(payload);
     } catch (e) {
-      // don’t let a bad listener break others
       console.warn("[wsClient] listener error:", e?.message || e);
     }
   }
@@ -83,15 +84,11 @@ function notify(kind, payload) {
 function scheduleReconnect() {
   if (manualClose) return;
   if (reconnectTimer) return;
-
-  // Exponential backoff up to ~10s
   const delay = Math.min(10000, 500 * Math.pow(2, reconnectAttempts));
   reconnectAttempts += 1;
   reconnectTimer = setTimeout(() => {
     reconnectTimer = null;
-    if (!manualClose && lastToken && lastUrl) {
-      tryOpen(lastUrl);
-    }
+    if (!manualClose && lastToken && lastUrl) tryOpen(lastUrl);
   }, delay);
 }
 
@@ -103,13 +100,26 @@ function clearReconnect() {
   reconnectAttempts = 0;
 }
 
-function tryOpen(url) {
-  // If an existing socket is already open to same URL, keep it
-  if (socket && socket.readyState === WebSocket.OPEN && lastUrl === url) {
-    return socket;
+function flushQueue() {
+  if (!socket || socket.readyState !== WebSocket.OPEN) return;
+  while (_state.sendQueue.length) {
+    const payload = _state.sendQueue.shift();
+    try {
+      const data = typeof payload === "string" ? payload : JSON.stringify(payload);
+      socket.send(data);
+    } catch (e) {
+      // push back and bail; we'll try again next open
+      _state.sendQueue.unshift(payload);
+      break;
+    }
   }
+}
 
-  // If there is a socket but URL/token changed, close and replace
+function tryOpen(url) {
+  // reuse if already open and same URL
+  if (socket && socket.readyState === WebSocket.OPEN && lastUrl === url) return socket;
+
+  // different URL/token → close the old one
   if (socket && lastUrl !== url) {
     try { socket.close(); } catch {}
     socket = null;
@@ -123,6 +133,7 @@ function tryOpen(url) {
   socket.onopen = () => {
     clearReconnect();
     startHeartbeat();
+    flushQueue();
     notify("open");
   };
 
@@ -139,14 +150,10 @@ function tryOpen(url) {
   socket.onmessage = (e) => {
     try {
       const data = JSON.parse(e.data);
-
-      // Filter heartbeats out of onMessage noise
       if (isHeartbeatPayload(data)) {
-        // If you want to see pulses, consumers can pass onHeartbeat to the subscription.
         notify("heartbeat", data);
         return;
       }
-
       notify("message", data);
     } catch (err) {
       notify("error", err);
@@ -157,13 +164,6 @@ function tryOpen(url) {
 }
 
 // ---- public API -------------------------------------------------------------
-/**
- * Create (or get) the singleton socket. Registers your callbacks and
- * returns an object with { socket, send, unsubscribe, close }.
- *
- * close(): only removes *your* listener; it does not destroy the singleton unless
- *          there are no listeners left. Use destroyChatSocket() to fully close.
- */
 export function createOrGetChatSocket({
   token,
   baseUrl = WS_URL,
@@ -172,7 +172,7 @@ export function createOrGetChatSocket({
   onClose,
   onError,
   onMessage,
-  onHeartbeat, // optional: receive heartbeat frames
+  onHeartbeat
 }) {
   if (!baseUrl) {
     const err = new Error("WS baseUrl is missing (WS_URL undefined).");
@@ -187,7 +187,7 @@ export function createOrGetChatSocket({
 
   const url = buildUrl({ baseUrl, path, token });
 
-  // If token changed since last time, nuke current socket so we don't leak auth
+  // token changed → hard destroy
   if (lastToken && lastToken !== token) {
     destroyChatSocket();
   }
@@ -196,28 +196,35 @@ export function createOrGetChatSocket({
   const handler = { onOpen, onClose, onError, onMessage, onHeartbeat };
   listeners.add(handler);
 
-  // Open (or reuse) the socket
   tryOpen(url);
 
   const api = {
-    get socket() { return socket; },
+    get socket() {
+      if (!socket) return null;
+      return {
+        ...socket,
+        get ready() { return socket.readyState === WebSocket.OPEN; },
+        _state
+      };
+    },
     send: (payload) => {
-      if (!socket || socket.readyState !== WebSocket.OPEN) {
-        throw new Error("WebSocket not connected");
-      }
       const data = typeof payload === "string" ? payload : JSON.stringify(payload);
-      socket.send(data);
+      if (socket && socket.readyState === WebSocket.OPEN) {
+        socket.send(data);
+      } else {
+        _state.sendQueue.push(payload);
+      }
     },
     unsubscribe: () => {
       listeners.delete(handler);
-      // Optionally auto-destroy when no listeners remain (kept off by default)
-      // if (listeners.size === 0) destroyChatSocket();
+      // if (listeners.size === 0) destroyChatSocket(); // optional
     },
     close: () => {
-      // backwards-compat: close only your subscription
-      api.unsubscribe();
-    },
+      // backwards compat: only remove this listener
+      listeners.delete(handler);
+    }
   };
+
   return api;
 }
 
@@ -225,7 +232,6 @@ export function getActiveChatSocket() {
   return socket || null;
 }
 
-/** Hard-destroy the singleton (use on logout). */
 export function destroyChatSocket() {
   manualClose = true;
   clearReconnect();
@@ -237,4 +243,5 @@ export function destroyChatSocket() {
   lastToken = null;
   lastUrl = null;
   listeners.clear();
+  _state.sendQueue.length = 0;
 }

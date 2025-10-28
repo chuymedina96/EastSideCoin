@@ -7,8 +7,6 @@ import "react-native-get-random-values";
 import Web3 from "web3";
 import { navigationRef, resetNavigation } from "../navigation/NavigationService";
 import { API_URL } from "../config";
-// If you later move secrets to SecureStore, you can use it here:
-// import * as SecureStore from "expo-secure-store";
 
 export const AuthContext = createContext();
 
@@ -23,25 +21,21 @@ const LOGOUT_REMOVE_KEYS = [
   "publicKey_upload_pending",
 ];
 
-// Global wipes (used in delete) — broad to guarantee a clean device.
 const STORAGE_PREFIXES_TO_WIPE = [
-  "privateKey_",            // per-user private keys (e.g., privateKey_3)
-  "publicKey_",             // cached server pubkeys per user
-  "esc_keys_v2:",           // any namespaced key bundles
-  "chat_msgs_",             // (legacy, non-namespaced) per-thread message caches
-  "chat_threads_index_v1",  // (legacy, non-namespaced) threads list cache
-  "wallet_privateKey",      // wallet key generated on register
-  "publicKey",              // global cached server public key
+  "privateKey_",
+  "publicKey_",
+  "esc_keys_v2:",
+  "chat_msgs_",
+  "chat_threads_index_v1",
+  "wallet_privateKey",
+  "publicKey",
 ];
 
 const AuthProvider = ({ children }) => {
   const [user, setUser] = useState(null);
   const [authToken, setAuthToken] = useState(null);
   const [loading, setLoading] = useState(true);
-
-  // UI hint (disable chat input until keys exist). Navigation does NOT depend on this.
   const [keysReady, setKeysReady] = useState(false);
-
   const inactivityTimerRef = useRef(null);
 
   useEffect(() => {
@@ -53,9 +47,7 @@ const AuthProvider = ({ children }) => {
     };
   }, []);
 
-  const handleAppStateChange = (next) => {
-    if (next === "active") resetInactivityTimer();
-  };
+  const handleAppStateChange = (next) => { if (next === "active") resetInactivityTimer(); };
 
   const resetInactivityTimer = () => {
     if (inactivityTimerRef.current) clearTimeout(inactivityTimerRef.current);
@@ -75,11 +67,16 @@ const AuthProvider = ({ children }) => {
       ]);
 
       if (storedToken && storedUser) {
+        const u = JSON.parse(storedUser);
         setAuthToken(storedToken);
-        setUser(JSON.parse(storedUser));
+        setUser(u);
         resetInactivityTimer();
-        // Do NOT navigate or generate keys here. KeyScreenSetup owns that.
-        setKeysReady(false);
+
+        // 🔑 Ensure volatile privateKey is restored from per-user storage
+        const perUserKey = await AsyncStorage.getItem(`privateKey_${u.id}`);
+        if (perUserKey) await AsyncStorage.setItem("privateKey", perUserKey);
+
+        setKeysReady(!!perUserKey); // hint for UI
       } else {
         setUser(null);
         setAuthToken(null);
@@ -112,10 +109,7 @@ const AuthProvider = ({ children }) => {
       console.log("✅ Registration Successful:", res.data);
 
       await AsyncStorage.setItem("wallet_privateKey", newWallet.privateKey);
-
-      // Immediately log in, but do not navigate; KeyScreenSetup will handle flow.
-      const ok = await login(email, password, /* skipRedirect */ true);
-      return !!ok;
+      return await login(email, password, /* skipRedirect */ true);
     } catch (error) {
       console.error("❌ Registration Failed:", error.response?.data || error.message);
       Alert.alert("Registration Error", "Something went wrong. Try again.");
@@ -127,7 +121,6 @@ const AuthProvider = ({ children }) => {
     try {
       const { data } = await axios.post(`${API_URL}/login/`, { email, password });
       const { access, refresh, user: u } = data || {};
-
       if (!access || !u) {
         Alert.alert("Login Error", "Unexpected server response.");
         return false;
@@ -139,19 +132,20 @@ const AuthProvider = ({ children }) => {
         AsyncStorage.setItem("user", JSON.stringify(u)),
       ]);
 
-      // Cache server-side public key if present (client keygen/upload happens later on KeyScreenSetup)
       if (u.public_key) await AsyncStorage.setItem("publicKey", u.public_key);
+
+      // 🔑 Immediately restore per-user private key (prevents spurious keygen)
+      const perUserKey = await AsyncStorage.getItem(`privateKey_${u.id}`);
+      if (perUserKey) await AsyncStorage.setItem("privateKey", perUserKey);
+      setKeysReady(!!perUserKey);
 
       setAuthToken(access);
       setUser(u);
       resetInactivityTimer();
 
-      // Do NOT generate keys or route to HomeTabs here.
       if (!skipRedirect && navigationRef?.isReady()) {
-        // Safe nudge to KeyScreenSetup (your App stack initialRouteName is already KeyScreenSetup).
         resetNavigation("KeyScreenSetup");
       }
-
       return true;
     } catch (error) {
       console.error("❌ Login Failed:", error.response ? error.response.data : error.message);
@@ -164,7 +158,6 @@ const AuthProvider = ({ children }) => {
     }
   };
 
-  // Remove any keys that start with a given set of prefixes, or equal an exact key
   const removeByPrefixes = async (prefixes) => {
     try {
       const keys = await AsyncStorage.getAllKeys();
@@ -179,7 +172,6 @@ const AuthProvider = ({ children }) => {
     }
   };
 
-  // Purge *namespaced* chat caches for the specific user (matches ChatScreen's `u<uid>:` scheme)
   const purgeUserChatCaches = async (uid) => {
     if (!uid) return;
     try {
@@ -220,16 +212,14 @@ const AuthProvider = ({ children }) => {
         }
       }
 
-      // Preserve per-user private key ONLY on logout (helps dev/login flow).
+      // ✅ Preserve per-user private key on logout
       let currentId = null;
       if (userData) {
         try { currentId = JSON.parse(userData)?.id; } catch {}
         if (privateKey && currentId) await AsyncStorage.setItem(`privateKey_${currentId}`, privateKey);
       }
 
-      // Also purge this user's namespaced chat caches so a different user never sees stale previews.
       if (currentId) await purgeUserChatCaches(currentId);
-
       await AsyncStorage.multiRemove(LOGOUT_REMOVE_KEYS);
 
       setUser(null);
@@ -243,7 +233,6 @@ const AuthProvider = ({ children }) => {
     }
   };
 
-  // Full account deletion (server + local wipe)
   const deleteAccountAndLogout = async () => {
     try {
       const [accessToken, rawUser] = await Promise.all([
@@ -272,7 +261,6 @@ const AuthProvider = ({ children }) => {
   };
 
   const wipeLocalAfterDelete = async (uid) => {
-    // Base removal list (auth/session + known fixed keys)
     const removal = [
       ...LOGOUT_REMOVE_KEYS,
       "wallet_privateKey",
@@ -285,30 +273,15 @@ const AuthProvider = ({ children }) => {
       removal.push(`esc_keys_v2:${String(uid)}`);
     }
 
-    try {
-      await AsyncStorage.multiRemove(removal);
-    } catch (e) {
-      console.warn("⚠️ multiRemove baseline error:", e?.message || e);
-    }
+    try { await AsyncStorage.multiRemove(removal); }
+    catch (e) { console.warn("⚠️ multiRemove baseline error:", e?.message || e); }
 
-    // Purge namespaced chat caches for this user (u<uid>:chat_…)
     if (uid) await purgeUserChatCaches(uid);
-
-    // Aggressive wipe: remove any remaining device keys & legacy chat caches (all users)
     await removeByPrefixes(STORAGE_PREFIXES_TO_WIPE);
-
-    // OPTIONAL: If you store secrets in SecureStore, also clear here:
-    // try {
-    //   await SecureStore.deleteItemAsync("privateKey");
-    //   if (uid) await SecureStore.deleteItemAsync(`privateKey_${uid}`);
-    // } catch (e) {
-    //   console.warn("⚠️ SecureStore wipe error:", e?.message || e);
-    // }
 
     setUser(null);
     setAuthToken(null);
     setKeysReady(false);
-
     if (navigationRef?.isReady()) resetNavigation("Landing");
   };
 
@@ -323,8 +296,8 @@ const AuthProvider = ({ children }) => {
         logoutUser,
         deleteAccountAndLogout,
         resetInactivityTimer,
-        keysReady,          // UI hint only; navigation is handled elsewhere
-        setKeysReady,       // let KeyScreenSetup toggle after keygen/migration
+        keysReady,
+        setKeysReady,
       }}
     >
       {loading ? <Text>Loading...</Text> : children}

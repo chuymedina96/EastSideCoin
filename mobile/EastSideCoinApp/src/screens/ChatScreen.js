@@ -18,7 +18,9 @@ import { createOrGetChatSocket } from "../utils/wsClient";
 const THREADS_KEY = "chat_threads_index_v1";
 const MSGS_KEY_PREFIX = "chat_msgs_";
 
+// ---------- utils ----------
 const asId = (v) => String(v ?? "");
+const nameOf = (u) => (`${u?.first_name || ""} ${u?.last_name || ""}`.trim() || u?.email || "Neighbor");
 const formatTime = (d) => {
   const date = typeof d === "string" ? new Date(d) : d;
   const now = new Date();
@@ -26,8 +28,6 @@ const formatTime = (d) => {
     ? date.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })
     : date.toLocaleDateString([], { month: "short", day: "numeric" });
 };
-const nameOf = (u) => (`${u?.first_name || ""} ${u?.last_name || ""}`.trim() || u?.email || "Neighbor");
-
 const b64FixPadding = (b64) => {
   if (!b64) return b64;
   const s = String(b64).replace(/\s+/g, "").replace(/-/g, "+").replace(/_/g, "/");
@@ -35,47 +35,69 @@ const b64FixPadding = (b64) => {
   return pad === 0 ? s : s + "=".repeat(4 - pad);
 };
 
-const pickWrapForMe = (m, meId) => {
-  if (m.encrypted_key_for_me) return m.encrypted_key_for_me;
+const normalizeWrapAliases = (m) => {
+  const x = { ...m };
+  if (!x.encrypted_key_for_receiver && x.encrypted_key) x.encrypted_key_for_receiver = x.encrypted_key;
+  if (!x.encrypted_key_for_sender && x.encrypted_key_sender) x.encrypted_key_for_sender = x.encrypted_key_sender;
+  return x;
+};
+
+const pickWrapForMe = (raw, meId) => {
+  const m = normalizeWrapAliases(raw);
+  if (m.encrypted_key_for_me) return { which: "for_me", value: m.encrypted_key_for_me };
+
   const me = String(meId);
   const sender = String(m.sender ?? m.sender_id);
   const receiver = String(m.receiver ?? m.receiver_id);
+
   if (receiver === me && (m.encrypted_key_for_receiver || m.encrypted_key)) {
-    return m.encrypted_key_for_receiver || m.encrypted_key;
+    return { which: "receiver", value: m.encrypted_key_for_receiver || m.encrypted_key };
   }
-  if (sender === me && m.encrypted_key_for_sender) return m.encrypted_key_for_sender;
-  return null;
+  if (sender === me && m.encrypted_key_for_sender) {
+    return { which: "sender", value: m.encrypted_key_for_sender };
+  }
+  return { which: "none", value: null };
 };
 
-const decryptServerMessage = (m, privateKeyPem, meId, otherUser) => {
-  const wrap = pickWrapForMe(m, meId);
-  if (!wrap) return null;
+const decryptServerMessage = (raw, privateKeyPem, meId, otherUser) => {
+  try {
+    const m = normalizeWrapAliases(raw);
+    const { value } = pickWrapForMe(m, meId);
+    if (!value) return null;
 
-  let keyB64;
-  try { keyB64 = decryptRSA(b64FixPadding(wrap), privateKeyPem); } catch { return null; }
+    let keyB64;
+    try {
+      keyB64 = decryptRSA(b64FixPadding(value), privateKeyPem);
+    } catch {
+      return null;
+    }
 
-  const text = decryptAES({
-    ciphertextB64: b64FixPadding(m.encrypted_message),
-    ivB64: b64FixPadding(m.iv),
-    macB64: b64FixPadding(m.mac),
-    keyB64: b64FixPadding(keyB64),
-  });
-  if (!text || text === "[Auth Failed]" || text === "[Decryption Failed]") return null;
+    const text = decryptAES({
+      ciphertextB64: b64FixPadding(m.encrypted_message),
+      ivB64: b64FixPadding(m.iv),
+      macB64: b64FixPadding(m.mac),
+      keyB64: b64FixPadding(keyB64),
+    });
+    if (!text || text === "[Auth Failed]" || text === "[Decryption Failed]") return null;
 
-  const isMine = String(m.sender ?? m.sender_id) === String(meId);
-  const createdAt =
-    (m.timestamp ? new Date(m.timestamp) :
-     m.created_at ? new Date(m.created_at) : new Date());
+    const isMine = String(m.sender ?? m.sender_id) === String(meId);
+    const createdAt =
+      (m.timestamp ? new Date(m.timestamp) :
+       m.created_at ? new Date(m.created_at) : new Date());
 
-  return {
-    _id: String(m.id || Math.random()),
-    text,
-    createdAt,
-    user: { _id: isMine ? String(meId) : String(otherUser.id), name: isMine ? "You" : nameOf(otherUser) },
-    __server: true,
-  };
+    return {
+      _id: String(m.id || `${Date.now()}_${Math.random()}`),
+      text,
+      createdAt,
+      user: { _id: isMine ? String(meId) : String(otherUser.id), name: isMine ? "You" : nameOf(otherUser) },
+      __server: true,
+    };
+  } catch {
+    return null;
+  }
 };
 
+// Sticky-focus search (prevents keyboard from closing)
 const UncontrolledLockedSearch = React.memo(function UncontrolledLockedSearch({
   placeholder = "🔍 Search neighbors…",
   initialValue = "",
@@ -90,8 +112,13 @@ const UncontrolledLockedSearch = React.memo(function UncontrolledLockedSearch({
     [onDebouncedChange, debounceMs]
   );
   const onChangeText = useCallback((text) => { debouncedEmit(text); }, [debouncedEmit]);
-  const onBlur = useCallback(() => { if (lockFocus.current && inputRef.current) setTimeout(() => inputRef.current?.focus(), 0); }, []);
-  useEffect(() => { if (autoFocus) setTimeout(() => inputRef.current?.focus(), 0); return () => debouncedEmit.cancel(); }, [autoFocus, debouncedEmit]);
+  const onBlur = useCallback(() => {
+    if (lockFocus.current && inputRef.current) setTimeout(() => inputRef.current?.focus(), 0);
+  }, []);
+  useEffect(() => {
+    if (autoFocus) setTimeout(() => inputRef.current?.focus(), 0);
+    return () => debouncedEmit.cancel();
+  }, [autoFocus, debouncedEmit]);
   return (
     <View pointerEvents="box-none">
       <TextInput
@@ -113,6 +140,7 @@ const UncontrolledLockedSearch = React.memo(function UncontrolledLockedSearch({
   );
 });
 
+// =============== Component ===============
 const ChatScreen = ({ navigation }) => {
   const { authToken, user, keysReady } = useContext(AuthContext);
 
@@ -133,16 +161,35 @@ const ChatScreen = ({ navigation }) => {
   const [readyLocal, setReadyLocal] = useState(keysReady);
   const effectiveReady = keysReady || readyLocal;
 
-  // hydrate UI state
   const [loadingHydrateId, setLoadingHydrateId] = useState(null);
   const hydrateTimeoutRef = useRef(null);
 
   const pageRef = useRef({ next: null });
   const wsSubRef = useRef(null);
+  const processedIdsRef = useRef(new Set());          // de-dupe incoming (server ids)
+  const pendingClientIdsRef = useRef(new Set());      // de-dupe our own optimistic sends (client_tmp_id echoes)
 
-  // Composer + list ref
   const [draft, setDraft] = useState("");
+  const [sendInFlight, setSendInFlight] = useState(false); // prevent double sends
   const listRef = useRef(null);
+
+  const DebugHUD = ({ ws, threads, messages }) => {
+    const ready = !!ws?.ready;
+    const qlen = ws?._state?.sendQueue?.length ?? 0;
+    const processed = ws?._state?.processedIds?.size ?? 0;
+    return (
+      <View style={{
+        position: "absolute", right: 8, top: 8, backgroundColor: "#0008",
+        paddingHorizontal: 8, paddingVertical: 6, borderRadius: 8
+      }}>
+        <Text style={{ color: "#9cf", fontSize: 11 }}>WS: {ready ? "open" : "closed"}</Text>
+        <Text style={{ color: "#9cf", fontSize: 11 }}>Queue: {qlen}</Text>
+        <Text style={{ color: "#9cf", fontSize: 11 }}>Processed: {processed}</Text>
+        <Text style={{ color: "#9cf", fontSize: 11 }}>Threads: {Object.keys(threads||{}).length}</Text>
+        <Text style={{ color: "#9cf", fontSize: 11 }}>Msgs: {messages?.length ?? 0}</Text>
+      </View>
+    );
+  };
 
   // ---- Cache helpers
   const loadCachedThreads = useCallback(async () => {
@@ -191,9 +238,11 @@ const ChatScreen = ({ navigation }) => {
     });
   }, [searchResults]);
 
+  // Ensure process-wide privateKey is present (fallback from per-user slot)
   useEffect(() => { (async () => {
     if (user?.id) {
-      const perUser = await AsyncStorage.getItem(`privateKey_${user.id}`);
+      let perUser = await AsyncStorage.getItem(`privateKey_${user.id}`);
+      if (!perUser) perUser = await AsyncStorage.getItem("privateKey");
       if (perUser) await AsyncStorage.setItem("privateKey", perUser);
     }
   })(); }, [user?.id]);
@@ -249,6 +298,13 @@ const ChatScreen = ({ navigation }) => {
     }
   }, []);
 
+  const mergeUniqueById = (a, b) => {
+    const map = new Map();
+    for (const m of a) map.set(String(m._id), m);
+    for (const m of b) map.set(String(m._id), m);
+    return Array.from(map.values()).sort((x, y) => new Date(x.createdAt) - new Date(y.createdAt));
+  };
+
   const hydrateConversation = useCallback(async (neighbor) => {
     if (!neighbor?.id) return;
     const oid = String(neighbor.id);
@@ -264,24 +320,34 @@ const ChatScreen = ({ navigation }) => {
       console.log(`💧 hydrateConversation start other=${oid}`);
 
       const cached = await loadCachedMessages(neighbor.id);
-      console.log(`💾 cached messages: ${cached.length}`);
-      if (cached.length) {
-        const normalized = cached.map(m => ({
-          ...m,
-          _id: String(m._id),
-          user: { ...m.user, _id: String(m.user?._id) },
-          createdAt: new Date(m.createdAt),
-        })).sort((a,b) => new Date(a.createdAt) - new Date(b.createdAt));
-        setMessages(normalized);
-      } else {
-        setMessages([]);
-      }
+      const normalizedCached = (cached || []).map(m => ({
+        ...m,
+        _id: String(m._id),
+        user: { ...m.user, _id: String(m.user?._id) },
+        createdAt: new Date(m.createdAt),
+      })).sort((a,b) => new Date(a.createdAt) - new Date(b.createdAt));
+      setMessages(normalizedCached);
 
-      const privateKeyPem = await AsyncStorage.getItem("privateKey");
+      let privateKeyPem = await AsyncStorage.getItem("privateKey");
+      const myPublicKey = await AsyncStorage.getItem("publicKey");
+      if (!privateKeyPem && user?.id) {
+        privateKeyPem = await AsyncStorage.getItem(`privateKey_${user.id}`);
+        if (privateKeyPem) await AsyncStorage.setItem("privateKey", privateKeyPem);
+      }
       if (!privateKeyPem) {
-        console.log("🔐 no privateKey yet; rendering empty UI until keys are ready");
+        console.log("🔐 no privateKey yet; rendering cached only until keys are ready");
         return;
       }
+
+      // quick self-check
+      try {
+        const probe = encryptAES("probe");
+        const wrapped = encryptRSA(probe.keyB64, myPublicKey);
+        const unwrapped = decryptRSA(wrapped, privateKeyPem);
+        if (b64FixPadding(unwrapped) !== b64FixPadding(probe.keyB64)) {
+          console.warn("⚠️ Local keypair mismatch — hydration decrypts may fail.");
+        }
+      } catch {}
 
       const first = await fetchConversationPage(neighbor.id, { page: 1, limit: 50 });
       const decrypted = (first.results || [])
@@ -290,11 +356,16 @@ const ChatScreen = ({ navigation }) => {
         .map(m => ({ ...m, _id: String(m._id), user: { ...m.user, _id: String(m.user._id) } }))
         .sort((a,b) => new Date(a.createdAt) - new Date(b.createdAt));
 
-      console.log(`[hydrate] cache=${cached.length} server=${first.results?.length ?? 0} dec=${decrypted.length} next=${first.next_page ?? null}`);
-      setMessages(decrypted);
-      await saveCachedMessages(neighbor.id, decrypted);
+      console.log(`[hydrate] cache=${normalizedCached.length} server=${first.results?.length ?? 0} dec=${decrypted.length} next=${first.next_page ?? null}`);
+
+      setMessages(prev => {
+        const merged = mergeUniqueById(prev, decrypted);
+        saveCachedMessages(neighbor.id, merged);
+        console.log(`🟢 UI messages count=${merged.length}`);
+        return merged;
+      });
+
       pageRef.current = { next: first.next_page || null };
-      console.log(`🟢 UI messages count=${decrypted.length}`);
     } catch (e) {
       console.log("❌ hydrate error", e?.message);
     } finally {
@@ -302,19 +373,32 @@ const ChatScreen = ({ navigation }) => {
     }
   }, [fetchConversationPage, user?.id, loadCachedMessages, saveCachedMessages, clearHydrateBanner]);
 
-  // ---- WebSocket subscribe
+  // ---- WebSocket subscribe (singleton + de-dupe)
   useEffect(() => {
-    if (!authToken || !effectiveReady || !user?.id) return;
+    // Subscribe as soon as we have an auth token & user id.
+    // Keys are only required for decryption, not for receiving & unread bumps.
+    if (!authToken || !user?.id) return;
 
     let unsub = null;
     (async () => {
-      const ok = await loadPrivateKeyForUser(user.id);
-      if (!ok) return;
+      // best effort: load keys (optional)
+      await loadPrivateKeyForUser(user.id);
+
+      // ensure only one active subscriber
+      if (wsSubRef.current?.socket && wsSubRef.current?.unsubscribe) {
+        try { wsSubRef.current.unsubscribe(); } catch {}
+        wsSubRef.current = null;
+      }
 
       const sub = createOrGetChatSocket({
         token: authToken,
-        onMessage: async (incoming) => {
+        onMessage: async (incomingRaw) => {
           try {
+            const incoming = normalizeWrapAliases(incomingRaw);
+            const msgId = String(incoming.id ?? `${incoming.timestamp || ""}_${incoming.sender ?? ""}_${incoming.receiver ?? ""}`);
+            if (processedIdsRef.current.has(msgId)) return;
+            processedIdsRef.current.add(msgId);
+
             const senderId = incoming.sender ?? incoming.sender_id;
             const receiverId = incoming.receiver ?? incoming.receiver_id;
             if (senderId == null || receiverId == null) return;
@@ -322,23 +406,44 @@ const ChatScreen = ({ navigation }) => {
             const myIdStr = String(user.id);
             const otherId = String(senderId) === myIdStr ? String(receiverId) : String(senderId);
 
+            // maintain minimal directory entry for name fallback
+            setDirectory((d) => {
+              if (d[asId(otherId)]) return d;
+              return { ...d, [asId(otherId)]: { id: otherId, first_name: "", last_name: "", email: "" } };
+            });
+
+            // echo filter for our optimistic sends
+            const clientTmpId = incoming.client_tmp_id || incoming.client_id || incoming.tmp_id;
+            if (String(senderId) === myIdStr && clientTmpId && pendingClientIdsRef.current.has(clientTmpId)) {
+              pendingClientIdsRef.current.delete(clientTmpId);
+              return;
+            }
+
+            // bump threads (unread if not currently open)
             setThreads((t) => {
               const knownMeta = t[asId(otherId)]?.meta || {};
+              const isIncoming = String(senderId) !== myIdStr;
+              const shouldCountUnread = isIncoming && (!selectedUser || String(selectedUser.id) !== otherId);
               return upsertThread(
                 t,
                 { id: otherId, ...knownMeta },
                 "New message",
                 new Date(),
-                String(senderId) !== myIdStr
+                shouldCountUnread
               );
             });
 
+            // only attempt decrypt + append if this convo is open and we have keys
             if (!selectedUser || String(selectedUser.id) !== otherId) return;
 
-            const privateKeyPem = await AsyncStorage.getItem("privateKey");
+            let privateKeyPem = await AsyncStorage.getItem("privateKey");
+            if (!privateKeyPem && user?.id) {
+              privateKeyPem = await AsyncStorage.getItem(`privateKey_${user.id}`);
+              if (privateKeyPem) await AsyncStorage.setItem("privateKey", privateKeyPem);
+            }
             if (!privateKeyPem) return;
 
-            const wrap = pickWrapForMe(incoming, user.id);
+            const { value: wrap } = pickWrapForMe(incoming, user.id);
             if (!wrap) return;
 
             let keyB64;
@@ -353,7 +458,7 @@ const ChatScreen = ({ navigation }) => {
 
             const isMine = String(senderId) === myIdStr;
             const newMsg = {
-              _id: String(incoming.id || Math.random()),
+              _id: String(incoming.id || `${Date.now()}_${Math.random()}`),
               text: decryptedText || "🔒 Encrypted Message",
               createdAt: incoming.timestamp ? new Date(incoming.timestamp)
                 : (incoming.created_at ? new Date(incoming.created_at) : new Date()),
@@ -361,10 +466,9 @@ const ChatScreen = ({ navigation }) => {
             };
 
             setMessages((prev) => {
-              const next = [...prev, newMsg].sort((a,b) => new Date(a.createdAt) - new Date(b.createdAt));
-              if (selectedUser?.id) saveCachedMessages(selectedUser.id, next);
-              console.log(`🟢 UI messages count=${next.length}`);
-              return next;
+              const merged = mergeUniqueById(prev, [newMsg]);
+              if (selectedUser?.id) saveCachedMessages(selectedUser.id, merged);
+              return merged;
             });
 
             setThreads((t) => upsertThread(
@@ -372,7 +476,7 @@ const ChatScreen = ({ navigation }) => {
               { id: selectedUser.id, ...selectedUser },
               decryptedText,
               newMsg.createdAt,
-              !isMine,
+              false,
               { resetUnread: true }
             ));
           } catch (e) {
@@ -386,10 +490,10 @@ const ChatScreen = ({ navigation }) => {
     })();
 
     return () => { if (unsub) unsub(); };
-  }, [authToken, effectiveReady, user?.id, selectedUser, saveCachedMessages]);
+  }, [authToken, user?.id, selectedUser, saveCachedMessages]);
 
-  // ---- Thread utils
-  const upsertThread = (threads, otherUser, lastText, at, isIncoming, opts = {}) => {
+  // ---- Thread helpers
+  const upsertThread = (threads, otherUser, lastText, at, countUnread, opts = {}) => {
     const key = asId(otherUser.id);
     const prev = threads[key] || {
       id: key,
@@ -416,7 +520,7 @@ const ChatScreen = ({ navigation }) => {
         },
         lastText: typeof lastText === "string" ? lastText : prev.lastText,
         updatedAt: (at || new Date()).toISOString(),
-        unread: opts.resetUnread ? 0 : Math.max(0, (prev.unread || 0) + (isIncoming ? 1 : 0)),
+        unread: opts.resetUnread ? 0 : Math.max(0, (prev.unread || 0) + (countUnread ? 1 : 0)),
       },
     };
   };
@@ -431,14 +535,13 @@ const ChatScreen = ({ navigation }) => {
 
     (async () => {
       const cached = await loadCachedMessages(known.id);
-      const normalized = cached.map(m => ({
+      const normalized = (cached || []).map(m => ({
         ...m,
         _id: String(m._id),
         user: { ...m.user, _id: String(m.user?._id) },
         createdAt: new Date(m.createdAt),
       })).sort((a,b) => new Date(a.createdAt) - new Date(b.createdAt));
       setMessages(normalized);
-      console.log(`🟡 initial UI messages count=${normalized.length}`);
     })();
 
     setThreads((t) => upsertThread(t, known, "", new Date(), false, { resetUnread: true }));
@@ -458,13 +561,14 @@ const ChatScreen = ({ navigation }) => {
   };
 
   const sendMessage = async (messageVal) => {
+    if (sendInFlight) return;
     const messageText = typeof messageVal === "string" ? messageVal : (messageVal?.text ?? "");
     const text = messageText.trim();
     if (!text) return;
 
     const sub = wsSubRef.current;
     const activeSocket = sub?.socket;
-    if (!selectedUser || !activeSocket) return;
+    if (!selectedUser || !activeSocket) { Alert.alert("Not connected", "Chat connection not ready yet."); return; }
 
     const privateKey = await AsyncStorage.getItem("privateKey");
     const myPublicKey = await AsyncStorage.getItem("publicKey");
@@ -478,6 +582,8 @@ const ChatScreen = ({ navigation }) => {
     }
 
     try {
+      setSendInFlight(true);
+
       let recipientPub = await AsyncStorage.getItem(`publicKey_${selectedUser.id}`);
       if (!recipientPub) {
         const response = await fetch(`${API_URL}/users/${selectedUser.id}/public_key/`, {
@@ -486,6 +592,7 @@ const ChatScreen = ({ navigation }) => {
         const data = await response.json();
         if (!data?.public_key) {
           Alert.alert("Encryption Error", "Public key not found for this user.");
+          setSendInFlight(false);
           return;
         }
         recipientPub = data.public_key;
@@ -496,6 +603,26 @@ const ChatScreen = ({ navigation }) => {
       const encrypted_key_for_receiver = encryptRSA(bundle.keyB64, recipientPub);
       const encrypted_key_for_sender   = encryptRSA(bundle.keyB64, myPublicKey);
 
+      // optimistic add
+      const now = new Date();
+      const optimisticId = `opt_${now.getTime()}_${Math.random()}`;
+      pendingClientIdsRef.current.add(optimisticId);
+      const optimistic = {
+        _id: optimisticId,
+        text,
+        createdAt: now,
+        user: { _id: String(user.id), name: "You" },
+      };
+      setMessages((prev) => {
+        const merged = mergeUniqueById(prev, [optimistic]);
+        if (selectedUser?.id) saveCachedMessages(selectedUser.id, merged);
+        return merged;
+      });
+      setThreads((t) => upsertThread(t, selectedUser, text, now, false));
+      setDraft("");
+      requestAnimationFrame(() => listRef.current?.scrollToOffset({ offset: 0, animated: true }));
+
+      // send over WS
       sub.send({
         receiver_id: selectedUser.id,
         encrypted_message: bundle.ciphertextB64,
@@ -503,42 +630,25 @@ const ChatScreen = ({ navigation }) => {
         encrypted_key_for_sender,
         iv: bundle.ivB64,
         mac: bundle.macB64,
+        client_tmp_id: optimisticId,
       });
-
-      const now = new Date();
-      const optimistic = {
-        _id: String(Math.random()),
-        text,
-        createdAt: now,
-        user: { _id: String(user.id), name: "You" },
-      };
-
-      setMessages((prev) => {
-        const next = [...prev, optimistic].sort((a,b) => new Date(a.createdAt) - new Date(b.createdAt));
-        if (selectedUser?.id) saveCachedMessages(selectedUser.id, next);
-        console.log(`🟢 UI messages count=${next.length}`);
-        return next;
-      });
-
-      setThreads((t) => upsertThread(t, selectedUser, text, now, false));
-      setDraft("");
-      // scroll to bottom (top of inverted list)
-      requestAnimationFrame(() => listRef.current?.scrollToOffset({ offset: 0, animated: true }));
     } catch (error) {
       console.error("❌ Error sending message:", error);
       Alert.alert("Send Error", "Failed to send message.");
+    } finally {
+      setTimeout(() => setSendInFlight(false), 250);
     }
   };
 
   const onRefresh = useCallback(() => { setRefreshing(true); setTimeout(() => setRefreshing(false), 600); }, []);
 
-  // SimpleChat used newest-first; FlatList inverted expects the same
+  // newest-first for FlatList inverted
   const messagesForUI = useMemo(() => {
     const arr = messages.slice().reverse();
-    console.log(`📊 rendering messagesForUI=${arr.length}`);
     return arr;
-  }, [messages]);
+    }, [messages]);
 
+  // ---------- UI ----------
   const ThreadsList = () => {
     const items = Object.values(threads).sort((a, b) => new Date(b.updatedAt) - new Date(a.updatedAt));
     return (
@@ -550,7 +660,7 @@ const ChatScreen = ({ navigation }) => {
             <FlatList
               data={searchResults}
               keyExtractor={(u) => asId(u.id)}
-              keyboardShouldPersistTaps="always"
+              keyboardShouldPersistTaps="handled"
               keyboardDismissMode="none"
               removeClippedSubviews={false}
               renderItem={({ item }) => (
@@ -567,7 +677,7 @@ const ChatScreen = ({ navigation }) => {
         <FlatList
           data={items}
           keyExtractor={(t) => t.id}
-          keyboardShouldPersistTaps="always"
+          keyboardShouldPersistTaps="handled"
           keyboardDismissMode="none"
           removeClippedSubviews={false}
           contentContainerStyle={{ paddingBottom: 12 }}
@@ -632,7 +742,7 @@ const ChatScreen = ({ navigation }) => {
         )}
 
         {pageRef.current?.next && (
-          <TouchableOpacity onPress={() => { /* optional: implement loadOlder hook here if needed */ }} style={{ paddingVertical: 8, alignSelf: "center" }}>
+          <TouchableOpacity onPress={() => { /* optional: implement loadOlder */ }} style={{ paddingVertical: 8, alignSelf: "center" }}>
             <Text style={{ color: "#9cc1ff" }}>Load earlier</Text>
           </TouchableOpacity>
         )}
@@ -644,8 +754,9 @@ const ChatScreen = ({ navigation }) => {
             inverted
             data={messagesForUI}
             keyExtractor={(m) => String(m._id)}
-            keyboardShouldPersistTaps="always"
+            keyboardShouldPersistTaps="handled"
             keyboardDismissMode="none"
+            removeClippedSubviews={false}
             renderItem={({ item }) => {
               const mine = String(item.user?._id) === String(user.id);
               return (
@@ -677,8 +788,9 @@ const ChatScreen = ({ navigation }) => {
             <TouchableOpacity
               style={styles.composerSend}
               onPress={() => { const t = (draft||"").trim(); if (!t) return; setDraft(""); sendMessage(t); }}
+              disabled={sendInFlight}
             >
-              <Text style={styles.composerSendTxt}>Send</Text>
+              <Text style={styles.composerSendTxt}>{sendInFlight ? "…" : "Send"}</Text>
             </TouchableOpacity>
           </View>
         </View>
@@ -688,6 +800,7 @@ const ChatScreen = ({ navigation }) => {
 
   return (
     <SafeAreaView style={styles.safeContainer}>
+      <DebugHUD ws={wsSubRef.current} threads={threads} messages={messages} />
       <KeyboardAvoidingView behavior={Platform.OS === "ios" ? "padding" : "height"} style={styles.container}>
         {mode === "conversation" ? <Conversation /> : <ThreadsList />}
       </KeyboardAvoidingView>
@@ -695,6 +808,7 @@ const ChatScreen = ({ navigation }) => {
   );
 };
 
+// ---------- styles ----------
 const styles = StyleSheet.create({
   safeContainer: { flex: 1, backgroundColor: "#1E1E1E" },
   container: { flex: 1, padding: 12 },
