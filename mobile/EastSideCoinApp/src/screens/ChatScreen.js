@@ -8,18 +8,16 @@ import { SafeAreaView } from "react-native-safe-area-context";
 import { useFocusEffect } from "@react-navigation/native";
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import debounce from "lodash.debounce";
-import SimpleChat from "react-native-simple-chat";
 
 import { AuthContext } from "../context/AuthProvider";
 import { API_URL } from "../config";
 import { encryptAES, encryptRSA, decryptAES, decryptRSA } from "../utils/encryption";
 import { isKeysReady, loadPrivateKeyForUser } from "../utils/keyManager";
-import { createChatSocket } from "../utils/wsClient";
+import { createOrGetChatSocket } from "../utils/wsClient";
 
 const THREADS_KEY = "chat_threads_index_v1";
-const MSGS_KEY_PREFIX = "chat_msgs_"; // per-thread cache
+const MSGS_KEY_PREFIX = "chat_msgs_";
 
-// ---------- helpers ----------
 const asId = (v) => String(v ?? "");
 const formatTime = (d) => {
   const date = typeof d === "string" ? new Date(d) : d;
@@ -30,7 +28,6 @@ const formatTime = (d) => {
 };
 const nameOf = (u) => (`${u?.first_name || ""} ${u?.last_name || ""}`.trim() || u?.email || "Neighbor");
 
-// base64 normalizer
 const b64FixPadding = (b64) => {
   if (!b64) return b64;
   const s = String(b64).replace(/\s+/g, "").replace(/-/g, "+").replace(/_/g, "/");
@@ -38,14 +35,13 @@ const b64FixPadding = (b64) => {
   return pad === 0 ? s : s + "=".repeat(4 - pad);
 };
 
-// choose the correct key-wrap for me
 const pickWrapForMe = (m, meId) => {
-  if (m.encrypted_key_for_me) return m.encrypted_key_for_me; // optional convenience field
+  if (m.encrypted_key_for_me) return m.encrypted_key_for_me;
   const me = String(meId);
   const sender = String(m.sender ?? m.sender_id);
   const receiver = String(m.receiver ?? m.receiver_id);
   if (receiver === me && (m.encrypted_key_for_receiver || m.encrypted_key)) {
-    return m.encrypted_key_for_receiver || m.encrypted_key; // API uses 'encrypted_key' for receiver
+    return m.encrypted_key_for_receiver || m.encrypted_key;
   }
   if (sender === me && m.encrypted_key_for_sender) return m.encrypted_key_for_sender;
   return null;
@@ -56,11 +52,7 @@ const decryptServerMessage = (m, privateKeyPem, meId, otherUser) => {
   if (!wrap) return null;
 
   let keyB64;
-  try {
-    keyB64 = decryptRSA(b64FixPadding(wrap), privateKeyPem);
-  } catch {
-    return null;
-  }
+  try { keyB64 = decryptRSA(b64FixPadding(wrap), privateKeyPem); } catch { return null; }
 
   const text = decryptAES({
     ciphertextB64: b64FixPadding(m.encrypted_message),
@@ -76,15 +68,14 @@ const decryptServerMessage = (m, privateKeyPem, meId, otherUser) => {
      m.created_at ? new Date(m.created_at) : new Date());
 
   return {
-    _id: m.id || Math.random().toString(),
+    _id: String(m.id || Math.random()),
     text,
     createdAt,
-    user: { _id: isMine ? meId : otherUser.id, name: isMine ? "You" : nameOf(otherUser) },
+    user: { _id: isMine ? String(meId) : String(otherUser.id), name: isMine ? "You" : nameOf(otherUser) },
     __server: true,
   };
 };
 
-// ---- Uncontrolled, focus-locked search input ----
 const UncontrolledLockedSearch = React.memo(function UncontrolledLockedSearch({
   placeholder = "🔍 Search neighbors…",
   initialValue = "",
@@ -125,21 +116,16 @@ const UncontrolledLockedSearch = React.memo(function UncontrolledLockedSearch({
 const ChatScreen = ({ navigation }) => {
   const { authToken, user, keysReady } = useContext(AuthContext);
 
-  // ---- Namespaced storage helpers (per user) ----
   const userPrefix = user?.id ? `u${user.id}:` : "u?:";
   const threadsKey = `${userPrefix}${THREADS_KEY}`;
   const msgsKey = (otherId) => `${userPrefix}${MSGS_KEY_PREFIX}${asId(otherId)}`;
 
-  // ---- State ----
-  const [mode, setMode] = useState("threads"); // 'threads' | 'conversation'
+  const [mode, setMode] = useState("threads");
   const [threads, setThreads] = useState({});
   const [messages, setMessages] = useState([]);
   const [selectedUser, setSelectedUser] = useState(null);
 
-  // Minimal directory to keep real names/emails available
-  const [directory, setDirectory] = useState({}); // { [id]: {id, first_name, last_name, email} }
-
-  // Search (debounced)
+  const [directory, setDirectory] = useState({});
   const [effectiveQuery, setEffectiveQuery] = useState("");
   const [searchResults, setSearchResults] = useState([]);
 
@@ -147,20 +133,23 @@ const ChatScreen = ({ navigation }) => {
   const [readyLocal, setReadyLocal] = useState(keysReady);
   const effectiveReady = keysReady || readyLocal;
 
-  // Pagination for conversation history
+  // hydrate UI state
+  const [loadingHydrateId, setLoadingHydrateId] = useState(null);
+  const hydrateTimeoutRef = useRef(null);
+
   const pageRef = useRef({ next: null });
+  const wsSubRef = useRef(null);
 
-  // WebSocket (via util)
-  const socketRef = useRef(null);
+  // Composer + list ref
+  const [draft, setDraft] = useState("");
+  const listRef = useRef(null);
 
-  // ---------- Cache IO (now namespaced) ----------
+  // ---- Cache helpers
   const loadCachedThreads = useCallback(async () => {
     try {
       const raw = await AsyncStorage.getItem(threadsKey);
       return raw ? JSON.parse(raw) : {};
-    } catch {
-      return {};
-    }
+    } catch { return {}; }
   }, [threadsKey]);
 
   const saveCachedThreads = useCallback(async (val) => {
@@ -178,11 +167,10 @@ const ChatScreen = ({ navigation }) => {
     try { await AsyncStorage.setItem(msgsKey(otherId), JSON.stringify(msgs)); } catch {}
   }, [msgsKey]);
 
-  // ---- Bootstrap per-user threads on mount & when user changes ----
+  // ---- Bootstrap
   useEffect(() => {
     let mounted = true;
     (async () => {
-      // clear in-memory when account switches
       setThreads({});
       setMessages([]);
       setSelectedUser(null);
@@ -190,13 +178,10 @@ const ChatScreen = ({ navigation }) => {
       if (mounted) setThreads(t);
     })();
     return () => { mounted = false; };
-    // re-run whenever authed user (and thus prefix/threadsKey) changes
   }, [user?.id, loadCachedThreads]);
 
-  // Persist threads when they change
   useEffect(() => { saveCachedThreads(threads); }, [threads, saveCachedThreads]);
 
-  // Index search results into directory (for stable names later)
   useEffect(() => {
     if (!Array.isArray(searchResults)) return;
     setDirectory((d) => {
@@ -206,7 +191,6 @@ const ChatScreen = ({ navigation }) => {
     });
   }, [searchResults]);
 
-  // Hydrate default privateKey slot when user changes
   useEffect(() => { (async () => {
     if (user?.id) {
       const perUser = await AsyncStorage.getItem(`privateKey_${user.id}`);
@@ -214,7 +198,6 @@ const ChatScreen = ({ navigation }) => {
     }
   })(); }, [user?.id]);
 
-  // Re-check key readiness on focus
   useFocusEffect(useCallback(() => {
     let mounted = true;
     (async () => {
@@ -227,7 +210,7 @@ const ChatScreen = ({ navigation }) => {
     return () => { mounted = false; };
   }, [user?.id]));
 
-  // ---------- Search (debounced + abortable) ----------
+  // ---- Search
   const abortRef = useRef(null);
   const doRemoteSearch = useCallback(async (query) => {
     if (abortRef.current) abortRef.current.abort();
@@ -247,106 +230,109 @@ const ChatScreen = ({ navigation }) => {
   const debouncedSearchGateway = useRef(debounce((q) => { doRemoteSearch(q); }, 300)).current;
   const handleDebouncedSearch = useCallback((q) => { debouncedSearchGateway(q); }, [debouncedSearchGateway]);
 
-  // ---------- Conversation fetch (DB) ----------
+  // ---- Conversation fetch
   const fetchConversationPage = useCallback(async (otherId, { page = 1, limit = 50 } = {}) => {
     const url = `${API_URL}/conversations/${otherId}/?limit=${limit}&page=${page}`;
+    console.log(`📡 fetchConversationPage other=${otherId} page=${page} limit=${limit}`);
     const res = await fetch(url, { headers: { Authorization: `Bearer ${authToken}` } });
     if (!res.ok) throw new Error(`Conversation fetch failed: ${res.status}`);
     const data = await res.json();
-    return data; // { results, next_page, prev_page, count }
+    console.log(`📥 server returned count=${data?.count ?? "?"} results=${data?.results?.length ?? 0} next=${data?.next_page ?? null}`);
+    return data;
   }, [authToken]);
 
+  const clearHydrateBanner = useCallback((oid) => {
+    setLoadingHydrateId((curr) => (curr === oid ? null : curr));
+    if (hydrateTimeoutRef.current) {
+      clearTimeout(hydrateTimeoutRef.current);
+      hydrateTimeoutRef.current = null;
+    }
+  }, []);
+
   const hydrateConversation = useCallback(async (neighbor) => {
+    if (!neighbor?.id) return;
+    const oid = String(neighbor.id);
+
+    setLoadingHydrateId(oid);
+    if (hydrateTimeoutRef.current) clearTimeout(hydrateTimeoutRef.current);
+    hydrateTimeoutRef.current = setTimeout(() => {
+      console.warn("⏱️ hydrate timeout fallback — clearing banner");
+      clearHydrateBanner(oid);
+    }, 12000);
+
     try {
-      // show cached immediately (namespaced)
+      console.log(`💧 hydrateConversation start other=${oid}`);
+
       const cached = await loadCachedMessages(neighbor.id);
+      console.log(`💾 cached messages: ${cached.length}`);
       if (cached.length) {
-        const normalized = cached.map(m => ({ ...m, createdAt: new Date(m.createdAt) }))
-                                 .sort((a,b) => new Date(a.createdAt) - new Date(b.createdAt));
+        const normalized = cached.map(m => ({
+          ...m,
+          _id: String(m._id),
+          user: { ...m.user, _id: String(m.user?._id) },
+          createdAt: new Date(m.createdAt),
+        })).sort((a,b) => new Date(a.createdAt) - new Date(b.createdAt));
         setMessages(normalized);
       } else {
         setMessages([]);
       }
 
-      // fetch and decrypt
       const privateKeyPem = await AsyncStorage.getItem("privateKey");
-      if (!privateKeyPem) return;
+      if (!privateKeyPem) {
+        console.log("🔐 no privateKey yet; rendering empty UI until keys are ready");
+        return;
+      }
 
       const first = await fetchConversationPage(neighbor.id, { page: 1, limit: 50 });
-
       const decrypted = (first.results || [])
         .map(m => decryptServerMessage(m, privateKeyPem, user.id, neighbor))
         .filter(Boolean)
+        .map(m => ({ ...m, _id: String(m._id), user: { ...m.user, _id: String(m.user._id) } }))
         .sort((a,b) => new Date(a.createdAt) - new Date(b.createdAt));
 
+      console.log(`[hydrate] cache=${cached.length} server=${first.results?.length ?? 0} dec=${decrypted.length} next=${first.next_page ?? null}`);
       setMessages(decrypted);
       await saveCachedMessages(neighbor.id, decrypted);
       pageRef.current = { next: first.next_page || null };
-      console.log("[hydrate] rows:", first.results?.length ?? 0, "decrypted:", decrypted.length);
+      console.log(`🟢 UI messages count=${decrypted.length}`);
     } catch (e) {
-      console.log("conversation hydrate error", e?.message);
+      console.log("❌ hydrate error", e?.message);
+    } finally {
+      clearHydrateBanner(oid);
     }
-  }, [fetchConversationPage, user?.id, loadCachedMessages, saveCachedMessages]);
+  }, [fetchConversationPage, user?.id, loadCachedMessages, saveCachedMessages, clearHydrateBanner]);
 
-  const loadOlder = useCallback(async () => {
-    const pg = pageRef.current?.next;
-    if (!pg || !selectedUser) return;
-    try {
-      const privateKeyPem = await AsyncStorage.getItem("privateKey");
-      if (!privateKeyPem) return;
-      const data = await fetchConversationPage(selectedUser.id, { page: pg, limit: 50 });
-      const older = (data.results || [])
-        .map(m => decryptServerMessage(m, privateKeyPem, user.id, selectedUser))
-        .filter(Boolean)
-        .sort((a,b) => new Date(a.createdAt) - new Date(b.createdAt));
-      setMessages(prev => {
-        const map = new Map(prev.map(m => [String(m._id), m]));
-        older.forEach(m => map.set(String(m._id), m));
-        const merged = Array.from(map.values()).sort((a,b) => new Date(a.createdAt) - new Date(b.createdAt));
-        saveCachedMessages(selectedUser.id, merged);
-        return merged;
-      });
-      pageRef.current = { next: data.next_page || null };
-    } catch (e) {
-      console.log("loadOlder error", e?.message);
-    }
-  }, [selectedUser, fetchConversationPage, user?.id, saveCachedMessages]);
-
-  // ---------- WebSocket lifecycle via util (conversation only) ----------
+  // ---- WebSocket subscribe
   useEffect(() => {
-    let cleanup = null;
+    if (!authToken || !effectiveReady || !user?.id) return;
 
+    let unsub = null;
     (async () => {
-      if (mode !== "conversation" || !selectedUser || !authToken || !effectiveReady) return;
+      const ok = await loadPrivateKeyForUser(user.id);
+      if (!ok) return;
 
-      const privForUser = await loadPrivateKeyForUser(user?.id);
-      if (!privForUser) return;
-
-      const { socket, close } = createChatSocket({
+      const sub = createOrGetChatSocket({
         token: authToken,
-        onOpen: () => {},
-        onClose: () => {},
-        onError: (e) => console.warn("[ws] error", e?.message || e),
         onMessage: async (incoming) => {
           try {
             const senderId = incoming.sender ?? incoming.sender_id;
             const receiverId = incoming.receiver ?? incoming.receiver_id;
+            if (senderId == null || receiverId == null) return;
+
             const myIdStr = String(user.id);
             const otherId = String(senderId) === myIdStr ? String(receiverId) : String(senderId);
 
-            // bump thread preview/unread — clear later if active
             setThreads((t) => {
-              const existingMeta = t[asId(otherId)]?.meta || {};
+              const knownMeta = t[asId(otherId)]?.meta || {};
               return upsertThread(
                 t,
-                { id: otherId, ...existingMeta },
+                { id: otherId, ...knownMeta },
                 "New message",
                 new Date(),
                 String(senderId) !== myIdStr
               );
             });
 
-            // only add to UI if this is the active thread
             if (!selectedUser || String(selectedUser.id) !== otherId) return;
 
             const privateKeyPem = await AsyncStorage.getItem("privateKey");
@@ -367,20 +353,20 @@ const ChatScreen = ({ navigation }) => {
 
             const isMine = String(senderId) === myIdStr;
             const newMsg = {
-              _id: incoming.id || Math.random().toString(),
+              _id: String(incoming.id || Math.random()),
               text: decryptedText || "🔒 Encrypted Message",
               createdAt: incoming.timestamp ? new Date(incoming.timestamp)
                 : (incoming.created_at ? new Date(incoming.created_at) : new Date()),
-              user: { _id: isMine ? user.id : selectedUser.id, name: isMine ? "You" : nameOf(selectedUser) },
+              user: { _id: isMine ? String(user.id) : String(selectedUser.id), name: isMine ? "You" : nameOf(selectedUser) },
             };
 
             setMessages((prev) => {
               const next = [...prev, newMsg].sort((a,b) => new Date(a.createdAt) - new Date(b.createdAt));
               if (selectedUser?.id) saveCachedMessages(selectedUser.id, next);
+              console.log(`🟢 UI messages count=${next.length}`);
               return next;
             });
 
-            // active thread → reset unread & set preview text
             setThreads((t) => upsertThread(
               t,
               { id: selectedUser.id, ...selectedUser },
@@ -395,23 +381,19 @@ const ChatScreen = ({ navigation }) => {
         },
       });
 
-      socketRef.current = socket;
-      cleanup = () => { try { close(); } catch {} };
+      wsSubRef.current = sub;
+      unsub = () => { try { sub.unsubscribe?.(); } catch {} wsSubRef.current = null; };
     })();
 
-    return () => {
-      if (cleanup) cleanup();
-      socketRef.current = null;
-    };
-  }, [mode, selectedUser, authToken, effectiveReady, user?.id, saveCachedMessages]);
+    return () => { if (unsub) unsub(); };
+  }, [authToken, effectiveReady, user?.id, selectedUser, saveCachedMessages]);
 
-  // ---------- Thread utils ----------
+  // ---- Thread utils
   const upsertThread = (threads, otherUser, lastText, at, isIncoming, opts = {}) => {
     const key = asId(otherUser.id);
-    const baseName = nameOf(otherUser);
     const prev = threads[key] || {
       id: key,
-      name: baseName,
+      name: nameOf(otherUser),
       meta: {
         first_name: otherUser.first_name,
         last_name: otherUser.last_name,
@@ -421,15 +403,16 @@ const ChatScreen = ({ navigation }) => {
       updatedAt: new Date().toISOString(),
       unread: 0,
     };
+    const nextName = nameOf({ ...prev.meta, ...otherUser }) || prev.name;
     return {
       ...threads,
       [key]: {
         ...prev,
-        name: baseName || prev.name,
+        name: nextName,
         meta: {
-          first_name: otherUser.first_name ?? prev.meta?.first_name,
-          last_name: otherUser.last_name ?? prev.meta?.last_name,
-          email: otherUser.email ?? prev.meta?.email,
+          first_name: (otherUser.first_name ?? prev.meta?.first_name),
+          last_name: (otherUser.last_name ?? prev.meta?.last_name),
+          email: (otherUser.email ?? prev.meta?.email),
         },
         lastText: typeof lastText === "string" ? lastText : prev.lastText,
         updatedAt: (at || new Date()).toISOString(),
@@ -438,16 +421,30 @@ const ChatScreen = ({ navigation }) => {
     };
   };
 
-  // ---- actions ----
+  // ---- actions
   const openConversation = (neighbor) => {
     if (!neighbor?.id) return;
     const known = directory[asId(neighbor.id)] || neighbor;
-    setThreads((t) => upsertThread(t, known, "", new Date(), false, { resetUnread: true }));
+
     setSelectedUser(known);
-    setMessages([]);
     setMode("conversation");
+
+    (async () => {
+      const cached = await loadCachedMessages(known.id);
+      const normalized = cached.map(m => ({
+        ...m,
+        _id: String(m._id),
+        user: { ...m.user, _id: String(m.user?._id) },
+        createdAt: new Date(m.createdAt),
+      })).sort((a,b) => new Date(a.createdAt) - new Date(b.createdAt));
+      setMessages(normalized);
+      console.log(`🟡 initial UI messages count=${normalized.length}`);
+    })();
+
+    setThreads((t) => upsertThread(t, known, "", new Date(), false, { resetUnread: true }));
     setEffectiveQuery("");
     setSearchResults([]);
+
     hydrateConversation(known);
   };
 
@@ -458,7 +455,6 @@ const ChatScreen = ({ navigation }) => {
     }
     setSelectedUser(null);
     setMessages([]);
-    if (socketRef.current) { try { socketRef.current.close(); } catch {} socketRef.current = null; }
   };
 
   const sendMessage = async (messageVal) => {
@@ -466,8 +462,9 @@ const ChatScreen = ({ navigation }) => {
     const text = messageText.trim();
     if (!text) return;
 
-    const sock = socketRef.current;
-    if (!selectedUser || !sock) return;
+    const sub = wsSubRef.current;
+    const activeSocket = sub?.socket;
+    if (!selectedUser || !activeSocket) return;
 
     const privateKey = await AsyncStorage.getItem("privateKey");
     const myPublicKey = await AsyncStorage.getItem("publicKey");
@@ -475,13 +472,12 @@ const ChatScreen = ({ navigation }) => {
       Alert.alert("Encryption Setup", "Your device keys are still generating. Try again in a moment.");
       return;
     }
-    if (sock.readyState !== WebSocket.OPEN) {
+    if (activeSocket.readyState !== WebSocket.OPEN) {
       Alert.alert("WebSocket not connected. Try again.");
       return;
     }
 
     try {
-      // get or cache recipient public key
       let recipientPub = await AsyncStorage.getItem(`publicKey_${selectedUser.id}`);
       if (!recipientPub) {
         const response = await fetch(`${API_URL}/users/${selectedUser.id}/public_key/`, {
@@ -496,35 +492,38 @@ const ChatScreen = ({ navigation }) => {
         await AsyncStorage.setItem(`publicKey_${selectedUser.id}`, recipientPub);
       }
 
-      // encrypt message with fresh AES; wrap for both parties
       const bundle = encryptAES(text);
       const encrypted_key_for_receiver = encryptRSA(bundle.keyB64, recipientPub);
       const encrypted_key_for_sender   = encryptRSA(bundle.keyB64, myPublicKey);
 
-      sock.send(JSON.stringify({
+      sub.send({
         receiver_id: selectedUser.id,
         encrypted_message: bundle.ciphertextB64,
         encrypted_key_for_receiver,
         encrypted_key_for_sender,
         iv: bundle.ivB64,
         mac: bundle.macB64,
-      }));
+      });
 
       const now = new Date();
       const optimistic = {
-        _id: Math.random().toString(),
+        _id: String(Math.random()),
         text,
         createdAt: now,
-        user: { _id: user.id, name: "You" },
+        user: { _id: String(user.id), name: "You" },
       };
 
       setMessages((prev) => {
         const next = [...prev, optimistic].sort((a,b) => new Date(a.createdAt) - new Date(b.createdAt));
         if (selectedUser?.id) saveCachedMessages(selectedUser.id, next);
+        console.log(`🟢 UI messages count=${next.length}`);
         return next;
       });
 
       setThreads((t) => upsertThread(t, selectedUser, text, now, false));
+      setDraft("");
+      // scroll to bottom (top of inverted list)
+      requestAnimationFrame(() => listRef.current?.scrollToOffset({ offset: 0, animated: true }));
     } catch (error) {
       console.error("❌ Error sending message:", error);
       Alert.alert("Send Error", "Failed to send message.");
@@ -532,9 +531,14 @@ const ChatScreen = ({ navigation }) => {
   };
 
   const onRefresh = useCallback(() => { setRefreshing(true); setTimeout(() => setRefreshing(false), 600); }, []);
-  const messagesForUI = useMemo(() => messages.slice().reverse(), [messages]); // SimpleChat expects newest first
 
-  // ---- UI blocks ----
+  // SimpleChat used newest-first; FlatList inverted expects the same
+  const messagesForUI = useMemo(() => {
+    const arr = messages.slice().reverse();
+    console.log(`📊 rendering messagesForUI=${arr.length}`);
+    return arr;
+  }, [messages]);
+
   const ThreadsList = () => {
     const items = Object.values(threads).sort((a, b) => new Date(b.updatedAt) - new Date(a.updatedAt));
     return (
@@ -611,6 +615,8 @@ const ChatScreen = ({ navigation }) => {
         </View>
       );
     }
+    const loadingBanner = loadingHydrateId && String(selectedUser?.id) === String(loadingHydrateId);
+
     return (
       <>
         <View style={styles.convHeader}>
@@ -618,24 +624,64 @@ const ChatScreen = ({ navigation }) => {
           <Text style={styles.headerName}>{nameOf(selectedUser)}</Text>
         </View>
 
+        {loadingBanner && (
+          <View style={styles.loadingBanner}>
+            <ActivityIndicator size="small" />
+            <Text style={styles.loadingBannerText}> Loading messages…</Text>
+          </View>
+        )}
+
         {pageRef.current?.next && (
-          <TouchableOpacity onPress={loadOlder} style={{ paddingVertical: 8, alignSelf: "center" }}>
+          <TouchableOpacity onPress={() => { /* optional: implement loadOlder hook here if needed */ }} style={{ paddingVertical: 8, alignSelf: "center" }}>
             <Text style={{ color: "#9cc1ff" }}>Load earlier</Text>
           </TouchableOpacity>
         )}
 
-        <SimpleChat
-          messages={messagesForUI}
-          onPressSendButton={(val) => {
-            const text = typeof val === "string" ? val : (val?.text ?? "");
-            if (text.trim().length) sendMessage(text.trim());
-          }}
-          user={{ _id: user.id, name: "You" }}
-          placeholder="Type a message…"
-          inputStyle={styles.input}
-          listProps={{ keyboardShouldPersistTaps: "always", keyboardDismissMode: "none" }}
-          refreshControl={<RefreshControl refreshing={refreshing} onRefresh={onRefresh} />}
-        />
+        <View style={{ flex: 1 }}>
+          <FlatList
+            ref={listRef}
+            style={{ flex: 1 }}
+            inverted
+            data={messagesForUI}
+            keyExtractor={(m) => String(m._id)}
+            keyboardShouldPersistTaps="always"
+            keyboardDismissMode="none"
+            renderItem={({ item }) => {
+              const mine = String(item.user?._id) === String(user.id);
+              return (
+                <View style={[styles.bubble, mine ? styles.bubbleMine : styles.bubbleTheirs]}>
+                  <Text style={styles.bubbleText}>{item.text}</Text>
+                  <Text style={styles.bubbleTime}>
+                    {new Date(item.createdAt).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })}
+                  </Text>
+                </View>
+              );
+            }}
+            refreshControl={<RefreshControl refreshing={refreshing} onRefresh={onRefresh} />}
+            onContentSizeChange={() => listRef.current?.scrollToOffset({ offset: 0, animated: true })}
+            onLayout={() => listRef.current?.scrollToOffset({ offset: 0, animated: false })}
+          />
+
+          <View style={styles.composerRow}>
+            <TextInput
+              value={draft}
+              onChangeText={setDraft}
+              placeholder="Type a message…"
+              placeholderTextColor="#AAA"
+              style={styles.composerInput}
+              autoCorrect={false}
+              autoCapitalize="none"
+              onSubmitEditing={() => { const t = (draft||"").trim(); if (!t) return; setDraft(""); sendMessage(t); }}
+              returnKeyType="send"
+            />
+            <TouchableOpacity
+              style={styles.composerSend}
+              onPress={() => { const t = (draft||"").trim(); if (!t) return; setDraft(""); sendMessage(t); }}
+            >
+              <Text style={styles.composerSendTxt}>Send</Text>
+            </TouchableOpacity>
+          </View>
+        </View>
       </>
     );
   };
@@ -659,6 +705,9 @@ const styles = StyleSheet.create({
   backButton: { paddingHorizontal: 10, paddingVertical: 6, backgroundColor: "#333", borderRadius: 6, alignSelf: "flex-start" },
   backText: { color: "#FFD700", fontSize: 16 },
 
+  loadingBanner: { flexDirection: "row", alignItems: "center", alignSelf: "center", marginBottom: 6 },
+  loadingBannerText: { color: "#BDBDBD", marginLeft: 8 },
+
   sectionTitle: { color: "#BDBDBD", fontSize: 13, marginTop: 8, marginBottom: 6, paddingHorizontal: 2 },
 
   threadItem: {
@@ -677,11 +726,22 @@ const styles = StyleSheet.create({
   unreadBadge: { minWidth: 20, paddingHorizontal: 6, height: 20, borderRadius: 10, backgroundColor: "#E63946", alignItems: "center", justifyContent: "center" },
   unreadTxt: { color: "#FFF", fontWeight: "700", fontSize: 12 },
 
-  searchInput: { backgroundColor: "#222", padding: 12, color: "#FFF", borderRadius: 10, marginBottom: 10 },
+  searchInput: { backgroundColor: "#222", padding: 12, color: "#FFF", borderRadius: 10 },
   userItem: { padding: 12, backgroundColor: "#2C2C2C", borderRadius: 8, marginBottom: 8 },
   userText: { color: "#FFF", fontSize: 15 },
 
-  input: { backgroundColor: "#333", padding: 10, color: "#FFF", borderRadius: 8 },
+  // Chat bubbles
+  bubble: { maxWidth: "78%", marginVertical: 4, padding: 10, borderRadius: 10 },
+  bubbleMine: { alignSelf: "flex-end", backgroundColor: "#3a3f5a" },
+  bubbleTheirs: { alignSelf: "flex-start", backgroundColor: "#2f2f2f" },
+  bubbleText: { color: "#fff", fontSize: 15 },
+  bubbleTime: { color: "#ccc", fontSize: 11, marginTop: 4, alignSelf: "flex-end" },
+
+  // Composer
+  composerRow: { flexDirection: "row", alignItems: "center", gap: 8, paddingTop: 8 },
+  composerInput: { flex: 1, backgroundColor: "#333", borderRadius: 10, paddingHorizontal: 12, paddingVertical: 10, color: "#FFF" },
+  composerSend: { paddingHorizontal: 14, paddingVertical: 10, backgroundColor: "#4B6BFB", borderRadius: 10 },
+  composerSendTxt: { color: "#FFF", fontWeight: "700" },
 });
 
 export default ChatScreen;

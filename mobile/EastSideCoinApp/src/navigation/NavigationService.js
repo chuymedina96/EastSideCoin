@@ -3,13 +3,14 @@ import { createNavigationContainerRef, CommonActions } from "@react-navigation/n
 
 export const navigationRef = createNavigationContainerRef();
 
-// ---- Queue + dedupe ---------------------------------------------------------
+// ---------------- Queue + dedupe ----------------
 const MAX_QUEUE = 20;
 const pendingActions = [];
-let lastActionKey = "";
+let lastActionSig = null;
+let lastActionSigExpiry = 0;
 
 /**
- * Call once in App root:
+ * Call once at the root:
  * <NavigationContainer ref={navigationRef} onReady={onNavReady}>...</NavigationContainer>
  */
 export function onNavReady() {
@@ -27,11 +28,17 @@ export function onNavReady() {
   else setTimeout(flush, 0);
 }
 
+function dedupeGuard(signature, cooldownMs = 750) {
+  const now = Date.now();
+  if (lastActionSig === signature && now < lastActionSigExpiry) return true; // duplicate → ignore
+  lastActionSig = signature;
+  lastActionSigExpiry = now + cooldownMs;
+  return false;
+}
+
 function enqueueOrDispatch(action) {
-  // Prevent rapid duplicate dispatches that can cause flicker
-  const key = JSON.stringify(action?.payload ?? action);
-  if (key === lastActionKey) return false;
-  lastActionKey = key;
+  const sig = JSON.stringify(action?.payload ?? action);
+  if (dedupeGuard(sig)) return false;
 
   if (!navigationRef.isReady()) {
     if (pendingActions.length >= MAX_QUEUE) pendingActions.shift(); // drop oldest
@@ -42,7 +49,7 @@ function enqueueOrDispatch(action) {
   return true;
 }
 
-// ---- Route existence check ---------------------------------------------------
+// --------------- Route existence check ---------------
 function stateHasRoute(state, targetName) {
   if (!state) return false;
   const { routes = [] } = state;
@@ -53,8 +60,13 @@ function stateHasRoute(state, targetName) {
   return false;
 }
 
-// ---- Public API --------------------------------------------------------------
-/** Safer reset with route existence warning */
+// --------------- Public API ----------------
+/**
+ * Safer reset:
+ * - Validates route exists in current tree.
+ * - Falls back to navigate() if it doesn't (prevents warnings).
+ * - Dedupes rapid identical calls.
+ */
 export function resetNavigation(routeName, params) {
   const action = CommonActions.reset({
     index: 0,
@@ -65,17 +77,18 @@ export function resetNavigation(routeName, params) {
     const root = navigationRef.getRootState?.();
     if (root && !stateHasRoute(root, routeName)) {
       console.warn(
-        `⚠️ resetNavigation("${routeName}") is not in the mounted navigator tree. ` +
-          `Ensure this route exists in the current stack/tab.`
+        `⚠️ resetNavigation("${routeName}") is not in the mounted navigator tree. Falling back to navigate().`
       );
+      return navigate(routeName, params);
     }
+  } else {
+    // Not ready yet — still enqueue the reset; it will run after onNavReady.
   }
 
   console.log(`🚀 Resetting Navigation to ${routeName}`);
   enqueueOrDispatch(action);
 }
 
-/** Regular navigate (queued if not ready) */
 export function navigate(routeName, params = {}) {
   const action = CommonActions.navigate({ name: routeName, params });
   console.log(`📡 Navigating to ${routeName}`);
@@ -92,7 +105,7 @@ export function canGoBack() {
   return navigationRef.isReady() && navigationRef.canGoBack();
 }
 
-// Opinionated helpers for your flows
-export const resetToAuth     = () => resetNavigation("Login");
-export const resetToApp      = () => resetNavigation("HomeTabs");
-export const resetToKeySetup = () => resetNavigation("KeyScreenSetup");
+// Opinionated helpers for common flows
+export const resetToAuth     = (params) => resetNavigation("Login", params);        // or "Landing" for your auth entry
+export const resetToApp      = (params) => resetNavigation("HomeTabs", params);
+export const resetToKeySetup = (params) => resetNavigation("KeyScreenSetup", params);
