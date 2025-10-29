@@ -1,34 +1,62 @@
 from django.urls import path
 from .views import (
+    # 🔐 Auth / Keys
     register_user,
     login_user,
     logout_user,
-    generate_keys,  # ✅ Added missing key generation endpoint
+    generate_keys,
+    delete_account,
+
+    # 👥 Users
     search_users,
+    get_user_public_key,
+
+    # 💬 Chat / Messaging
     send_message,
     get_messages,
-    mark_message_read,
-    check_balance,
-    get_user_public_key,
     get_conversation,
-    delete_account
+    mark_message_read,
+    mark_messages_read_batch,
+    conversations_index,
+    mark_thread_read,
+
+    # 💰 Wallet
+    check_balance,
 )
 
 urlpatterns = [
-    path("register/", register_user, name="register"),  # ✅ Register new users
-    path("login/", login_user, name="login"),  # ✅ User login
-    path("logout/", logout_user, name="logout"),  # ✅ User logout
-    path("generate_keys/", generate_keys, name="generate_keys"),  # ✅ NEW: Key Generation Endpoint
-    path("users/search/", search_users, name="search_users"),  # ✅ Search users by name/email
-    path("users/<int:user_id>/public_key/", get_user_public_key), # ✅ Get public key of a user
-    
-    # ✅ Messages (Grouped URLs)
-    path("messages/send/", send_message, name="send_message"),  # ✅ Send encrypted messages
-    path("messages/", get_messages, name="get_messages"),  # ✅ Retrieve encrypted messages
-    path("messages/read/", mark_message_read, name="mark_message_read"),  # ✅ Mark messages as read
+    # ===========================
+    # 🔐 Auth
+    # ===========================
+    path("register/", register_user, name="register_user"),
+    path("login/", login_user, name="login_user"),
+    path("logout/", logout_user, name="logout_user"),
+    path("generate_keys/", generate_keys, name="generate_keys"),
+    path("delete_account/", delete_account, name="delete_account"),
 
-    # ✅ Wallet (Consistent URL Pattern)
-    path("wallet/<str:wallet_address>/balance/", check_balance, name="check_balance"),  # ✅ Check ESC balance
+    # ===========================
+    # 👥 Users
+    # ===========================
+    path("users/search/", search_users, name="search_users"),
+    path("users/<int:user_id>/public_key/", get_user_public_key, name="get_user_public_key"),
+
+    # ===========================
+    # 💬 Conversations / Threads
+    # ===========================
+    path("conversations/index/", conversations_index, name="conversations_index"),
+    path("conversations/mark_read/<int:other_id>/", mark_thread_read, name="mark_thread_read"),
     path("conversations/<int:other_id>/", get_conversation, name="get_conversation"),
-    path("delete_account/", delete_account, name="delete_account"),  # NEW
+
+    # ===========================
+    # 💌 Messages
+    # ===========================
+    path("messages/send/", send_message, name="send_message"),
+    path("messages/", get_messages, name="get_messages"),
+    path("messages/read/", mark_message_read, name="mark_message_read"),
+    path("messages/read_batch/", mark_messages_read_batch, name="mark_messages_read_batch"),
+
+    # ===========================
+    # 💰 Wallet
+    # ===========================
+    path("wallet/<str:wallet_address>/balance/", check_balance, name="check_balance"),
 ]

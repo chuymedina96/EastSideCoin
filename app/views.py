@@ -1,7 +1,7 @@
 # views.py
 from django.utils.dateparse import parse_datetime
 from django.core.paginator import Paginator, EmptyPage
-from django.db.models import Q
+from django.db.models import Q, Max, Count
 from django.utils import timezone
 
 from rest_framework.decorators import api_view, permission_classes
@@ -32,10 +32,18 @@ def _serialize_user(u: User):
 
 def _serialize_message_for_requester(m: ChatMessage, requester_id: int):
     """
-    Mobile client expects these fields. We expose wraps as:
-    - encrypted_key          -> receiver wrap (RSA-OAEP key for the recipient)
-    - encrypted_key_sender   -> sender wrap  (RSA-OAEP key for the sender)
+    Mobile client expects these fields. Expose both REST names and WS-style aliases
+    so the app can hydrate regardless of naming differences.
+
+    REST canonical:
+      - encrypted_key          -> receiver wrap (RSA-OAEP key for recipient)
+      - encrypted_key_sender   -> sender wrap   (RSA-OAEP key for sender)
+
+    WS aliases also included:
+      - encrypted_key_for_receiver
+      - encrypted_key_for_sender
     """
+    ts = m.timestamp or timezone.now()
     return {
         "id": str(m.id),
         "sender": m.sender_id,
@@ -43,9 +51,13 @@ def _serialize_message_for_requester(m: ChatMessage, requester_id: int):
         "encrypted_message": m.encrypted_message,
         "iv": m.iv,
         "mac": m.mac,
+        # REST canon
         "encrypted_key": m.encrypted_key_for_receiver,
         "encrypted_key_sender": m.encrypted_key_for_sender,
-        "timestamp": (m.timestamp or timezone.now()).isoformat(),
+        # WS aliases
+        "encrypted_key_for_receiver": m.encrypted_key_for_receiver,
+        "encrypted_key_for_sender": m.encrypted_key_for_sender,
+        "timestamp": ts.isoformat(),
         "is_read": m.is_read,
     }
 
@@ -237,6 +249,89 @@ def search_users(request):
 
 
 # ===========================
+# Threads (Server-backed)
+# ===========================
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def conversations_index(request):
+    """
+    GET /api/conversations/index/
+    Returns the canonical list of conversation partners for the authed user,
+    with latest message timestamp and unread count (server-owned).
+    """
+    me = request.user
+    try:
+        # All messages where I'm involved
+        base = ChatMessage.objects.filter(Q(sender=me) | Q(receiver=me))
+
+        # Latest timestamp per partner (me, other)
+        # Build a dict: partner_id -> latest_ts
+        latest_rows = base.values("sender_id", "receiver_id").annotate(last_ts=Max("timestamp"))
+
+        partner_latest = {}
+        for row in latest_rows:
+            s_id, r_id, ts = row["sender_id"], row["receiver_id"], row["last_ts"]
+            other_id = r_id if s_id == me.id else s_id
+            if other_id == me.id or other_id is None:
+                continue
+            prev = partner_latest.get(other_id)
+            if (not prev) or (ts and ts > prev):
+                partner_latest[other_id] = ts
+
+        partner_ids = list(partner_latest.keys())
+        if not partner_ids:
+            return Response([], status=status.HTTP_200_OK)
+
+        # Unread counts per partner = messages sent *to me* and not read
+        unread_qs = ChatMessage.objects.filter(receiver=me, is_read=False, sender_id__in=partner_ids) \
+            .values("sender_id").annotate(unread=Count("id"))
+        unread_map = {row["sender_id"]: row["unread"] for row in unread_qs}
+
+        # Load partners
+        partners = User.objects.filter(id__in=partner_ids).only("id", "first_name", "last_name", "email")
+
+        # Build response items
+        items = []
+        for u in partners:
+            items.append({
+                "id": u.id,
+                "first_name": u.first_name,
+                "last_name": u.last_name,
+                "email": u.email,
+                "updatedAt": (partner_latest.get(u.id) or timezone.now()).isoformat(),
+                "unread": unread_map.get(u.id, 0),
+                "lastText": "",  # keep empty; client can fill after first decrypt page
+            })
+
+        # Sort newest first
+        items.sort(key=lambda x: x["updatedAt"], reverse=True)
+        return Response(items, status=status.HTTP_200_OK)
+    except Exception as e:
+        print("❌ conversations_index error:", e)
+        return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+
+@api_view(["POST"])
+@permission_classes([IsAuthenticated])
+def mark_thread_read(request, other_id: int):
+    """
+    POST /api/conversations/mark_read/<other_id>/
+    Marks messages from other_id -> me as read.
+    """
+    me = request.user
+    try:
+        updated = ChatMessage.objects.filter(
+            sender_id=other_id,
+            receiver=me,
+            is_read=False
+        ).update(is_read=True)
+        return Response({"updated": updated}, status=status.HTTP_200_OK)
+    except Exception as e:
+        print("❌ mark_thread_read error:", e)
+        return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+
+# ===========================
 # Messages / Conversations
 # ===========================
 @api_view(["GET"])
@@ -248,7 +343,7 @@ def get_messages(request):
     """
     print("🚀 Get Messages API Hit!")
     try:
-        messages = ChatMessage.objects.filter(receiver=request.user).order_by("-timestamp")
+        messages = ChatMessage.objects.filter(receiver=request.user).order_by("-timestamp", "-id")
         results = [_serialize_message_for_requester(m, request.user.id) for m in messages]
         return Response(results, status=status.HTTP_200_OK)
     except Exception as e:
@@ -260,14 +355,13 @@ def get_messages(request):
 @permission_classes([IsAuthenticated])
 def my_threads(request):
     """
-    Returns a list of peers the authed user has chatted with,
-    with latest timestamp and a small preview snippet.
+    (Legacy) Returns a list of peers with latest timestamp and a ciphertext preview.
+    Kept for backward compatibility; prefer conversations_index.
     """
     print("🚀 My Threads API Hit!")
     try:
         me = request.user
 
-        # Who are my peers?
         peer_pairs = ChatMessage.objects.filter(
             Q(sender=me) | Q(receiver=me)
         ).values_list("sender_id", "receiver_id", "id", "timestamp", "encrypted_message")
@@ -331,7 +425,7 @@ def get_conversation(request, other_id: int):
         if before:
             qs = qs.filter(timestamp__lt=before)
 
-        qs = qs.order_by("timestamp")  # ASC for UI
+        qs = qs.order_by("timestamp", "id")  # ASC for UI; id tiebreaker for null/dupes
 
         paginator = Paginator(qs, limit)
         try:
@@ -349,11 +443,11 @@ def get_conversation(request, other_id: int):
         prev_page = page - 1 if page_obj.has_previous() else None
 
         return Response({
-            "results": items,
-            "next_page": next_page,
-            "prev_page": prev_page,
-            "count": paginator.count,
-        }, status=status.HTTP_200_OK)
+                "results": items,
+                "next_page": next_page,
+                "prev_page": prev_page,
+                "count": paginator.count,
+            }, status=status.HTTP_200_OK)
     except Exception as e:
         print("❌ get_conversation error:", e)
         return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
@@ -410,14 +504,15 @@ def send_message(request):
       "encrypted_message": "<b64>",
       "iv": "<b64>",
       "mac": "<b64>",
-      "encrypted_key": "<b64>",          # RSA-OAEP(key) for receiver  (required)
-      "encrypted_key_sender": "<b64>"    # RSA-OAEP(key) for sender    (optional but recommended)
+      # either naming is accepted:
+      "encrypted_key" or "encrypted_key_for_receiver": "<b64>",  # required
+      "encrypted_key_sender" or "encrypted_key_for_sender": "<b64>"  # optional
     }
     """
     print("🚀 Send Message API Hit!")
     try:
         data = request.data
-        # NOISY LOG (keys only) to debug client payload shape
+        # Debug payload shape (keys only)
         try:
             print("📥 send_message keys:", list(data.keys()))
         except Exception:
@@ -427,12 +522,14 @@ def send_message(request):
         enc_msg = data.get("encrypted_message")
         iv = data.get("iv")
         mac = data.get("mac")
-        enc_key_recv = data.get("encrypted_key")
-        enc_key_sender = data.get("encrypted_key_sender")
+
+        # Accept both REST and WS aliases for wraps
+        enc_key_recv = data.get("encrypted_key") or data.get("encrypted_key_for_receiver")
+        enc_key_sender = data.get("encrypted_key_sender") or data.get("encrypted_key_for_sender")
 
         if not all([receiver_id, enc_msg, iv, mac, enc_key_recv]):
             return Response(
-                {"error": "receiver_id, encrypted_message, iv, mac, encrypted_key are required"},
+                {"error": "receiver_id, encrypted_message, iv, mac, and encrypted_key (receiver) are required"},
                 status=status.HTTP_400_BAD_REQUEST
             )
 
@@ -454,7 +551,7 @@ def send_message(request):
 
         print(f"✅ Message stored: {msg.id}")
 
-        # Echo back a canonical payload so the client can merge immediately if needed
+        # Echo canonical payload (with aliases too) for immediate client merge
         payload = _serialize_message_for_requester(msg, request.user.id)
         return Response(payload, status=status.HTTP_201_CREATED)
     except Exception as e:
