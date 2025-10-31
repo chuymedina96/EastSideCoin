@@ -8,9 +8,9 @@ import {
   Animated,
   Easing,
   Pressable,
-  SafeAreaView,
 } from "react-native";
 import { useNavigation } from "@react-navigation/native";
+import { SafeAreaView } from "react-native-safe-area-context";
 
 const LandingScreen = () => {
   const navigation = useNavigation();

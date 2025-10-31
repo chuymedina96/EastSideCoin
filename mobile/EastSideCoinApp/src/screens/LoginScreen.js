@@ -11,7 +11,6 @@ import {
   Easing,
   Image,
   Pressable,
-  SafeAreaView,
   KeyboardAvoidingView,
   Platform,
 } from "react-native";
@@ -20,6 +19,7 @@ import { AuthContext } from "../context/AuthProvider";
 import { useNavigation } from "@react-navigation/native";
 import { resetNavigation } from "../navigation/NavigationService";
 import { loadPrivateKeyForUser, loadPublicKeyForUser } from "../utils/keyManager";
+import { SafeAreaView } from "react-native-safe-area-context";
 
 const MIN_PW = 6;
 

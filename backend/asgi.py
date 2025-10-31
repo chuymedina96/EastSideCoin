@@ -1,16 +1,17 @@
+# backend/asgi.py
 import os
-import django
-from django.core.asgi import get_asgi_application
 from channels.routing import ProtocolTypeRouter, URLRouter
-from channels.auth import AuthMiddlewareStack
-from app.routing import websocket_urlpatterns  # ✅ Import WebSocket routing
+from django.core.asgi import get_asgi_application
+from django.urls import path
+from app.consumers import ChatConsumer
 
 os.environ.setdefault("DJANGO_SETTINGS_MODULE", "backend.settings")
-django.setup()
+
+django_asgi_app = get_asgi_application()
 
 application = ProtocolTypeRouter({
-    "http": get_asgi_application(),
-    "websocket": AuthMiddlewareStack(
-        URLRouter(websocket_urlpatterns)
-    ),
+    "http": django_asgi_app,
+    "websocket": URLRouter([
+        path("ws/chat/", ChatConsumer.as_asgi()),
+    ]),
 })

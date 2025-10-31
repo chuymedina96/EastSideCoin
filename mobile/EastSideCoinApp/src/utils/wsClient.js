@@ -2,46 +2,34 @@
 import { WS_URL } from "../config";
 
 /**
- * Sticky singleton WS client (one socket per session/token).
- * - Tries BOTH auth styles: ?token=... and Authorization header.
- * - Auto-reconnect with backoff, heartbeats.
- * - Multiple listeners; each createOrGetChatSocket() returns an unsubscribe.
- * - Heartbeats filtered from onMessage.
- * - Small send queue survives reconnects.
- * - Auto-subscribe to the user's channel on open if you pass userId.
- * - Loud console logging so you can see exactly why it’s closed.
+ * Robust singleton WS client per (baseUrl+path+userId).
+ * - Accepts token string OR async token provider () => Promise<string|null>
+ * - Awaits fresh token before each connect/reconnect
+ * - Query or Authorization header auth with fallback (only on auth close codes)
+ * - Ready promise + queued sends until OPEN
+ * - Idempotent: multiple createOrGetChatSocket() calls reuse one connection
+ * - Listener set (onOpen/onClose/onError/onMessage/onHeartbeat)
+ * - Auto subscribe AFTER OPEN
+ * - Reconnect with backoff + jitter; NO reconnect on normal close (1000)
+ * - Heartbeats (ping/pong)
  */
 
-let socket = null;
-let lastToken = null;
-let lastUrl = null;
-let manualClose = false;
-
-let listeners = new Set(); // { onOpen, onClose, onError, onMessage, onHeartbeat }
-let reconnectTimer = null;
-let reconnectAttempts = 0;
-
-// Heartbeat
-let heartbeatTimer = null;
 const HEARTBEAT_MS = 25000;
+const WS_OPEN = 1;
 
-// Light debug / internals we surface for HUDs
-const _state = {
-  sendQueue: [],          // queued payloads while not OPEN
-  processedIds: new Set() // optional use by consumers
-};
+// Auth-related close codes: no token / unauthorized / policy violation
+const AUTH_CLOSE_CODES = new Set([4001, 4401, 4403, 1008]);
 
-// ---- utils ------------------------------------------------------------------
+const instances = new Map(); // key -> WsInstance
+
 function trimSlash(s) { return (s || "").replace(/\/+$/, ""); }
 function buildUrl({ baseUrl, path, token, authMode }) {
   const b = trimSlash(baseUrl || WS_URL || "");
   const p = (path || "/chat/").replace(/^\/?/, "/");
-  if (authMode === "query") {
-    return `${b}${p}?token=${encodeURIComponent(token)}`;
-  }
-  return `${b}${p}`;
+  return authMode === "query"
+    ? `${b}${p}?token=${encodeURIComponent(token)}`
+    : `${b}${p}`;
 }
-
 function isHeartbeatPayload(obj) {
   if (!obj || typeof obj !== "object") return false;
   const hasTsType = ("type" in obj) && ("ts" in obj);
@@ -55,171 +43,304 @@ function isHeartbeatPayload(obj) {
     ("receiver_id" in obj);
   return hasTsType && !hasEncrypted;
 }
-
-function startHeartbeat() {
-  stopHeartbeat();
-  heartbeatTimer = setInterval(() => {
-    try {
-      if (socket && socket.readyState === WebSocket.OPEN) {
-        socket.send(JSON.stringify({ type: "ping", ts: Date.now() }));
-      }
-    } catch { /* noop */ }
-  }, HEARTBEAT_MS);
+function backoffJitter(attempt) {
+  const base = Math.min(15000, 800 * Math.pow(1.6, attempt));
+  return Math.floor(base * (0.7 + Math.random() * 0.6)); // jitter +/-30%
 }
-function stopHeartbeat() {
-  if (heartbeatTimer) {
-    clearInterval(heartbeatTimer);
-    heartbeatTimer = null;
+async function resolveToken(tokenOrProvider) {
+  try {
+    if (typeof tokenOrProvider === "function") {
+      return await tokenOrProvider();
+    }
+    return tokenOrProvider || null;
+  } catch {
+    return null;
   }
 }
 
-function notify(kind, payload) {
-  for (const h of Array.from(listeners)) {
-    try {
-      if (kind === "open")           h.onOpen?.();
-      else if (kind === "close")     h.onClose?.(payload);
-      else if (kind === "error")     h.onError?.(payload);
-      else if (kind === "message")   h.onMessage?.(payload);
-      else if (kind === "heartbeat") h.onHeartbeat?.(payload);
-    } catch (e) {
-      console.warn("[wsClient] listener error:", e?.message || e);
+// -------------------- Instance --------------------
+class WsInstance {
+  constructor({ tokenOrProvider, baseUrl, path, prefer, userId }) {
+    this.tokenOrProvider = tokenOrProvider; // string OR async () => token
+    this.token = null; // last resolved token
+    this.baseUrl = baseUrl || WS_URL;
+    this.path = path || "/chat/";
+    this.prefer = prefer || "query"; // "query" | "header"
+    this.userId = userId ? String(userId) : null;
+
+    this.socket = null;
+    this.lastMode = null; // "query" | "header"
+    this.lastUrl = null;
+    this.manualClose = false;
+
+    this.listeners = new Set(); // { onOpen, onClose, onError, onMessage, onHeartbeat }
+    this.reconnectTimer = null;
+    this.reconnectAttempts = 0;
+
+    this.heartbeatTimer = null;
+    this.sendQueue = [];
+    this.openResolvers = [];
+    this.subscribed = false;
+    this.connecting = false; // guard multiple connect() calls
+  }
+
+  key() {
+    return [
+      trimSlash(this.baseUrl || ""),
+      this.path,
+      this.userId || "no-user",
+    ].join("|");
+  }
+
+  // ---- Public API ----
+  addListener(handler) { this.listeners.add(handler); }
+  removeListener(handler) { this.listeners.delete(handler); }
+
+  get api() {
+    return {
+      get socket() { return { ready: !!(this.socket && this.socket.readyState === WS_OPEN) }; },
+      send: (payload) => this.send(payload),
+      ready: () => this.ready(),
+      unsubscribe: () => this._unsubscribeCaller?.(), // overwritten below
+      close: () => this.close(),
+    };
+  }
+
+  ready() {
+    if (this.socket && this.socket.readyState === WS_OPEN) return Promise.resolve();
+    return new Promise((res) => this.openResolvers.push(res));
+  }
+
+  send(payload) {
+    const data = typeof payload === "string" ? payload : JSON.stringify(payload);
+    if (this.socket && this.socket.readyState === WS_OPEN) {
+      try { this.socket.send(data); return true; } catch {}
+    }
+    this.sendQueue.push(payload);
+    return false;
+  }
+
+  close() {
+    this.manualClose = true;
+    this.clearReconnect();
+    this.stopHeartbeat();
+    try { this.socket?.close?.(); } catch {}
+    this.socket = null;
+  }
+
+  destroyIfUnused() {
+    if (this.listeners.size === 0) {
+      this.close();
+      instances.delete(this.key());
     }
   }
-}
 
-function scheduleReconnect() {
-  if (manualClose) return;
-  if (reconnectTimer) return;
-  const delay = Math.min(10000, 500 * Math.pow(2, reconnectAttempts));
-  reconnectAttempts += 1;
-  console.log(`[wsClient] reconnect in ${delay}ms (attempt ${reconnectAttempts})`);
-  reconnectTimer = setTimeout(() => {
-    reconnectTimer = null;
-    if (!manualClose && lastToken && lastUrl) tryOpen({ url: lastUrl.url, authMode: lastUrl.authMode, headers: lastUrl.headers, subscribeUserId: lastUrl.subscribeUserId });
-  }, delay);
-}
+  // ---- Connection lifecycle ----
+  async connect() {
+    if (this.connecting) return;
+    this.connecting = true;
 
-function clearReconnect() {
-  if (reconnectTimer) {
-    clearTimeout(reconnectTimer);
-    reconnectTimer = null;
-  }
-  reconnectAttempts = 0;
-}
-
-function flushQueue() {
-  if (!socket || socket.readyState !== WebSocket.OPEN) return;
-  while (_state.sendQueue.length) {
-    const payload = _state.sendQueue.shift();
-    try {
-      const data = typeof payload === "string" ? payload : JSON.stringify(payload);
-      socket.send(data);
-    } catch (e) {
-      // push back and bail; we'll try again next open
-      _state.sendQueue.unshift(payload);
-      break;
+    // Always resolve a fresh token before (re)connect
+    this.token = await resolveToken(this.tokenOrProvider);
+    if (!this.token) {
+      console.log("❌ No token found in WebSocket connection.");
+      this.connecting = false;
+      // Don't schedule reconnect until a caller tries again with a token
+      return;
     }
+
+    const authMode = this.lastMode || this.prefer;
+    const url = buildUrl({ baseUrl: this.baseUrl, path: this.path, token: this.token, authMode });
+    const headers = authMode === "header" ? { Authorization: `Bearer ${this.token}` } : undefined;
+    this._openOnce({ url, headers, mode: authMode });
   }
-}
 
-// Actually open a socket (single attempt for a specific authMode)
-function _openOnce({ url, headers, subscribeUserId }) {
-  // different URL → close the old one
-  if (socket && lastUrl?.url !== url) {
-    try { socket.close(); } catch {}
-    socket = null;
-  }
-  manualClose = false;
-  lastUrl = { url, headers, authMode: headers ? "header" : "query", subscribeUserId };
-
-  // React Native signature: new WebSocket(url, protocols?, options?)
-  // options.headers is supported
-  console.log("[wsClient] opening", url, headers ? "(Authorization header)" : "(query token)");
-  socket = headers ? new WebSocket(url, null, { headers }) : new WebSocket(url);
-
-  socket.onopen = () => {
-    console.log("[wsClient] OPEN");
-    clearReconnect();
-    startHeartbeat();
-    // Subscribe to user channel if provided
-    if (subscribeUserId) {
-      try {
-        socket.send(JSON.stringify({ type: "subscribe", user_id: String(subscribeUserId) }));
-        console.log("[wsClient] subscribed to user channel", subscribeUserId);
-      } catch (e) {
-        console.warn("[wsClient] subscribe failed:", e?.message || e);
-      }
+  _openOnce({ url, headers, mode }) {
+    // If URL changes, close old
+    if (this.socket && this.lastUrl !== url) {
+      try { this.socket.close(); } catch {}
+      this.socket = null;
     }
-    flushQueue();
-    notify("open");
-  };
 
-  socket.onclose = (e) => {
-    console.log("[wsClient] CLOSE", e?.code, e?.reason);
-    stopHeartbeat();
-    notify("close", e);
-    if (!manualClose) scheduleReconnect();
-  };
+    this.manualClose = false;
+    this.lastUrl = url;
+    this.lastMode = mode;
 
-  socket.onerror = (e) => {
-    console.warn("[wsClient] ERROR", e?.message || e);
-    notify("error", e);
-  };
+    console.log("[wsClient] opening", url, headers ? "(Authorization header)" : "(query token)");
+    // React Native supports headers via 3rd arg: WebSocket(url, protocols, options)
+    this.socket = headers ? new WebSocket(url, null, { headers }) : new WebSocket(url);
 
-  socket.onmessage = (e) => {
-    try {
-      const data = JSON.parse(e.data);
-      if (isHeartbeatPayload(data)) {
-        notify("heartbeat", data);
+    this.socket.onopen = () => {
+      console.log("[wsClient] OPEN");
+      this.connecting = false;
+      this.clearReconnect();
+      this.startHeartbeat();
+      this.resolveOpens();
+      this.flushQueue();
+      this.subscribeIfNeeded();
+      this.notify("open");
+    };
+
+    this.socket.onclose = async (e) => {
+      console.log("[wsClient] CLOSE", e?.code, e?.reason || "");
+      this.stopHeartbeat();
+      this.notify("close", e);
+      this.subscribed = false;
+
+      if (this.manualClose) return;
+
+      // 🚫 Do NOT reconnect on normal close
+      if (e?.code === 1000) {
         return;
       }
-      notify("message", data);
-    } catch (err) {
-      console.warn("[wsClient] parse error", err?.message || err);
-      notify("error", err);
+
+      // Auth-related? Try alternate auth mode immediately (one hop).
+      if (AUTH_CLOSE_CODES.has(e?.code)) {
+        // Resolve a fresh token (e.g., refresh)
+        this.token = await resolveToken(this.tokenOrProvider);
+        if (!this.token) {
+          console.log("[wsClient] auth close but no token available; not reconnecting.");
+          return;
+        }
+        // Flip mode: if we were query, try header; else try query.
+        const nextMode = (this.lastMode === "query") ? "header" : "query";
+        const url = buildUrl({ baseUrl: this.baseUrl, path: this.path, token: this.token, authMode: nextMode });
+        const headers = nextMode === "header" ? { Authorization: `Bearer ${this.token}` } : undefined;
+
+        // Small delay to avoid tight-loop on policy disconnects
+        setTimeout(() => this._openOnce({ url, headers, mode: nextMode }), 200);
+        return;
+      }
+
+      // Abnormal closes → backoff reconnect using lastMode
+      this.scheduleReconnect(false);
+    };
+
+    this.socket.onerror = (e) => {
+      console.warn("[wsClient] ERROR", e?.message || e);
+      this.notify("error", e);
+    };
+
+    this.socket.onmessage = (e) => {
+      let data = null;
+      try { data = JSON.parse(e.data); } catch { data = e.data; }
+      if (isHeartbeatPayload(data)) { this.notify("heartbeat", data); return; }
+      this.notify("message", data);
+    };
+  }
+
+  resolveOpens() {
+    const rs = this.openResolvers;
+    this.openResolvers = [];
+    rs.forEach((r) => r());
+  }
+
+  flushQueue() {
+    if (!this.socket || this.socket.readyState !== WS_OPEN) return;
+    const q = this.sendQueue;
+    this.sendQueue = [];
+    for (const payload of q) {
+      try { this.socket.send(typeof payload === "string" ? payload : JSON.stringify(payload)); }
+      catch { this.sendQueue.unshift(payload); break; }
     }
-  };
-  return socket;
-}
+  }
 
-/**
- * Open with a preferred auth mode, fallback to the other if the first fails quickly.
- */
-function tryOpen({ url, authMode, headers, subscribeUserId }) {
-  // If already open and URL matches, reuse
-  if (socket && socket.readyState === WebSocket.OPEN && lastUrl?.url === url) return socket;
+  subscribeIfNeeded() {
+    if (this.subscribed || !this.userId) return;
+    if (!this.socket || this.socket.readyState !== WS_OPEN) return;
 
-  // Kick once
-  _openOnce({ url, headers, subscribeUserId });
+    try {
+      // If your server needs explicit subscribe; harmless if path-based already scopes
+      this.socket.send(JSON.stringify({ type: "subscribe", user_id: this.userId }));
+      this.subscribed = true;
+      console.log("[wsClient] subscribed to user channel", this.userId);
+    } catch (e) {
+      this.subscribed = false;
+      console.warn("[wsClient] subscribe failed:", e?.message || e);
+    }
+  }
 
-  // If it doesn't open within 1.2s, try the other mode once
-  const fallbackTimer = setTimeout(() => {
-    if (!socket || socket.readyState !== WebSocket.OPEN) {
-      try { socket.close(); } catch {}
-      socket = null;
+  startHeartbeat() {
+    this.stopHeartbeat();
+    this.heartbeatTimer = setInterval(() => {
+      try {
+        if (this.socket && this.socket.readyState === WS_OPEN) {
+          this.socket.send(JSON.stringify({ type: "ping", ts: Date.now() }));
+        }
+      } catch {}
+    }, HEARTBEAT_MS);
+  }
+  stopHeartbeat() {
+    if (this.heartbeatTimer) {
+      clearInterval(this.heartbeatTimer);
+      this.heartbeatTimer = null;
+    }
+  }
 
-      if (authMode === "query") {
-        // fallback to header
-        const hdrs = { Authorization: `Bearer ${lastToken}` };
-        const bareUrl = url.replace(/\?token=.*$/, "");
-        console.log("[wsClient] falling back to Authorization header");
-        _openOnce({ url: bareUrl, headers: hdrs, subscribeUserId });
-      } else {
-        // fallback to query
-        const qUrl = `${trimSlash(WS_URL)}${new URL(url).pathname}?token=${encodeURIComponent(lastToken)}`;
-        console.log("[wsClient] falling back to ?token query");
-        _openOnce({ url: qUrl, headers: undefined, subscribeUserId });
+  scheduleReconnect(forceResolveToken) {
+    if (this.manualClose || this.reconnectTimer) return;
+    const wait = backoffJitter(this.reconnectAttempts++);
+    console.log(`[wsClient] reconnect in ${wait}ms (attempt ${this.reconnectAttempts})`);
+    this.reconnectTimer = setTimeout(async () => {
+      this.reconnectTimer = null;
+      if (this.manualClose) return;
+
+      if (forceResolveToken) {
+        this.token = await resolveToken(this.tokenOrProvider);
+        if (!this.token) {
+          console.log("[wsClient] reconnect aborted; no token.");
+          return;
+        }
+      }
+
+      // Rebuild URL from lastMode preference
+      const authMode = this.lastMode || this.prefer;
+      const url = buildUrl({
+        baseUrl: this.baseUrl,
+        path: this.path,
+        token: this.token,
+        authMode,
+      });
+      const headers = authMode === "header" ? { Authorization: `Bearer ${this.token}` } : undefined;
+      this._openOnce({ url, headers, mode: authMode });
+    }, wait);
+  }
+  clearReconnect() {
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
+    this.reconnectAttempts = 0;
+  }
+
+  notify(kind, payload) {
+    for (const h of Array.from(this.listeners)) {
+      try {
+        if (kind === "open")           h.onOpen?.();
+        else if (kind === "close")     h.onClose?.(payload);
+        else if (kind === "error")     h.onError?.(payload);
+        else if (kind === "message")   h.onMessage?.(payload);
+        else if (kind === "heartbeat") h.onHeartbeat?.(payload);
+      } catch (e) {
+        console.warn("[wsClient] listener error:", e?.message || e);
       }
     }
-    clearTimeout(fallbackTimer);
-  }, 1200);
-
-  return socket;
+  }
 }
 
-// ---- public API -------------------------------------------------------------
+// -------------------- Public factory --------------------
+/**
+ * createOrGetChatSocket({
+ *   token: string | () => Promise<string|null>,  // can pass auth.getAccessToken
+ *   baseUrl?: string,
+ *   path?: string,                // default "/chat/"
+ *   onOpen?, onClose?, onError?, onMessage?, onHeartbeat?,
+ *   userId?: string|number,      // for auto-subscribe
+ *   prefer?: "query" | "header", // default "query"
+ * })
+ */
 export function createOrGetChatSocket({
-  token,
+  token,                 // string OR async provider
   baseUrl = WS_URL,
   path = "/chat/",
   onOpen,
@@ -227,77 +348,58 @@ export function createOrGetChatSocket({
   onError,
   onMessage,
   onHeartbeat,
-  userId,           // <-- pass current user id here so we auto-subscribe
-  prefer = "query", // "query" | "header"
+  userId,
+  prefer = "query",
 }) {
-  if (!baseUrl) {
-    const err = new Error("WS baseUrl is missing (WS_URL undefined).");
-    onError?.(err);
-    throw err;
-  }
-  if (!token) {
-    const err = new Error("WS token missing; pass authToken.");
-    onError?.(err);
-    throw err;
-  }
+  if (!baseUrl) throw new Error("WS baseUrl is missing (WS_URL undefined).");
+  if (!token) throw new Error("WS token missing; pass string or async provider.");
 
-  // token changed → hard destroy
-  if (lastToken && lastToken !== token) {
-    destroyChatSocket();
-  }
-  lastToken = token;
+  const key = [trimSlash(baseUrl || ""), path, userId ? String(userId) : "no-user"].join("|");
+  let inst = instances.get(key);
 
-  const url = buildUrl({ baseUrl, path, token, authMode: prefer });
-  const headers = prefer === "header" ? { Authorization: `Bearer ${token}` } : undefined;
+  if (!inst) {
+    inst = new WsInstance({ tokenOrProvider: token, baseUrl, path, prefer, userId });
+    instances.set(key, inst);
+    // start connecting once (async)
+    inst.connect();
+  } else {
+    // If caller replaced token with a different provider or string, update and reconnect as needed
+    const prev = String(inst.tokenOrProvider);
+    const next = String(token);
+    if (prev !== next) {
+      inst.tokenOrProvider = token;
+      inst.close();
+      inst.connect();
+    }
+  }
 
   const handler = { onOpen, onClose, onError, onMessage, onHeartbeat };
-  listeners.add(handler);
-
-  tryOpen({ url, authMode: prefer, headers, subscribeUserId: userId });
+  inst.addListener(handler);
 
   const api = {
-    get socket() {
-      if (!socket) return null;
-      return {
-        ...socket,
-        get ready() { return socket.readyState === WebSocket.OPEN; },
-        _state
-      };
-    },
-    send: (payload) => {
-      const data = typeof payload === "string" ? payload : JSON.stringify(payload);
-      if (socket && socket.readyState === WebSocket.OPEN) {
-        socket.send(data);
-      } else {
-        _state.sendQueue.push(payload);
-      }
-    },
+    get socket() { return { ready: !!(inst.socket && inst.socket.readyState === WS_OPEN) }; },
+    send: (payload) => inst.send(payload),
+    ready: () => inst.ready(),
     unsubscribe: () => {
-      listeners.delete(handler);
-      // if (listeners.size === 0) destroyChatSocket(); // optional
+      inst.removeListener(handler);
+      inst.destroyIfUnused();
     },
     close: () => {
-      listeners.delete(handler);
-    }
+      inst.removeListener(handler);
+      inst.destroyIfUnused();
+    },
   };
+
+  // Bind methods for safety
+  api.unsubscribe = api.unsubscribe.bind(api);
+  api.close = api.close.bind(api);
 
   return api;
 }
 
-export function getActiveChatSocket() {
-  return socket || null;
-}
-
-export function destroyChatSocket() {
-  manualClose = true;
-  clearReconnect();
-  stopHeartbeat();
-  if (socket) {
-    try { socket.close(); } catch {}
+export function destroyAllChatSockets() {
+  for (const inst of Array.from(instances.values())) {
+    try { inst.close(); } catch {}
   }
-  socket = null;
-  lastToken = null;
-  lastUrl = null;
-  listeners.clear();
-  _state.sendQueue.length = 0;
+  instances.clear();
 }

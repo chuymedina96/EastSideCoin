@@ -1,3 +1,4 @@
+# urls.py
 from django.urls import path
 from .views import (
     # 🔐 Auth / Keys
@@ -21,6 +22,7 @@ from .views import (
     mark_thread_read,
 
     # 💰 Wallet
+    wallet_balance,     # NEW
     check_balance,
 )
 
@@ -37,7 +39,10 @@ urlpatterns = [
     # ===========================
     # 👥 Users
     # ===========================
-    path("users/search/", search_users, name="search_users"),
+    # Primary search endpoint used by the app
+    path("search_users/", search_users, name="search_users"),
+    # Back-compat alias (your old route)
+    path("users/search/", search_users, name="users_search_alias"),
     path("users/<int:user_id>/public_key/", get_user_public_key, name="get_user_public_key"),
 
     # ===========================
@@ -58,5 +63,10 @@ urlpatterns = [
     # ===========================
     # 💰 Wallet
     # ===========================
-    path("wallet/<str:wallet_address>/balance/", check_balance, name="check_balance"),
+    # Primary authed balance endpoint used by WalletScreen
+    path("wallet/balance/", wallet_balance, name="wallet_balance"),
+    # Admin/debug balance by address (primary)
+    path("check_balance/<str:wallet_address>/", check_balance, name="check_balance"),
+    # Back-compat alias (your old route)
+    path("wallet/<str:wallet_address>/balance/", check_balance, name="check_balance_legacy"),
 ]

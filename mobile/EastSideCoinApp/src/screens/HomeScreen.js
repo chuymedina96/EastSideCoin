@@ -18,17 +18,22 @@ import {
   RefreshControl,
   Animated,
   Easing,
+  Alert,
 } from "react-native";
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import { SafeAreaView } from "react-native-safe-area-context";
 import { AuthContext } from "../context/AuthProvider";
+import { listServices } from "../utils/api"; // ✅ pulls marketplace items
 
 // 60617 (South Chicago / East Side / South Deering nearby)
 const ZIP_60617_LAT = 41.7239;
 const ZIP_60617_LON = -87.5550;
 
-// Open-Meteo (no key) — request °F + mph
+// Weather — Open-Meteo (no key) — request °F + mph
 const OPEN_METEO = `https://api.open-meteo.com/v1/forecast?latitude=${ZIP_60617_LAT}&longitude=${ZIP_60617_LON}&current=temperature_2m,apparent_temperature,weather_code,wind_speed_10m&daily=temperature_2m_max,temperature_2m_min,precipitation_probability_max&temperature_unit=fahrenheit&wind_speed_unit=mph&timezone=America%2FChicago`;
+
+// Air Quality — Open-Meteo (no key) — US AQI & particulates
+const OPEN_METEO_AIR = `https://air-quality-api.open-meteo.com/v1/air-quality?latitude=${ZIP_60617_LAT}&longitude=${ZIP_60617_LON}&hourly=us_aqi,pm2_5,pm10,ozone,carbon_monoxide&timezone=America%2FChicago`;
 
 const BRIDGES = [
   { id: "95th", name: "95th St Bridge (Calumet River)" },
@@ -37,16 +42,48 @@ const BRIDGES = [
   { id: "92nd", name: "92nd St Bridge (Ewing Ave)" },
 ];
 
+// Civil Rights “Quote of the Day”
+const QUOTES = [
+  { a: "Martin Luther King Jr.", q: "The time is always right to do what is right." },
+  { a: "Malcolm X", q: "The future belongs to those who prepare for it today." },
+  { a: "Angela Davis", q: "I am no longer accepting the things I cannot change. I am changing the things I cannot accept." },
+  { a: "Fred Hampton", q: "We’re going to fight racism not with racism, but we’re going to fight with solidarity." },
+  { a: "Fannie Lou Hamer", q: "Nobody’s free until everybody’s free." },
+  { a: "James Baldwin", q: "Not everything that is faced can be changed, but nothing can be changed until it is faced." },
+  { a: "Assata Shakur", q: "A wall is just a wall and nothing more at all. It can be broken down." },
+  { a: "Audre Lorde", q: "Your silence will not protect you." },
+  { a: "Dolores Huerta", q: "Sí, se puede." },
+  { a: "César Chávez", q: "We cannot seek achievement for ourselves and forget about progress and prosperity for our community." },
+];
+
+// Daily hash to keep quote stable per day
+function pickDailyQuote(dateStr) {
+  let h = 0;
+  for (let i = 0; i < dateStr.length; i++) h = (h * 31 + dateStr.charCodeAt(i)) >>> 0;
+  const idx = h % QUOTES.length;
+  return QUOTES[idx];
+}
+
 const HomeScreen = () => {
   const { user } = useContext(AuthContext);
 
   const [greeting, setGreeting] = useState("Welcome");
   const [weather, setWeather] = useState(null);
+  const [air, setAir] = useState(null);
   const [news, setNews] = useState([]);
   const [bridgeInfo, setBridgeInfo] = useState([]);
   const [traffic, setTraffic] = useState(null);
+  const [escSpots, setEscSpots] = useState([]);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
+
+  // Quote of the day
+  const [quote, setQuote] = useState(null);
+
+  // Mini-game state
+  const [score, setScore] = useState(0);
+  const [streak, setStreak] = useState(0);
+  const coinAnim = useRef(new Animated.Value(0)).current;
 
   // Animations
   const fadeIn = useRef(new Animated.Value(0)).current;
@@ -95,6 +132,22 @@ const HomeScreen = () => {
     setGreeting(g);
   }, []);
 
+  // ---------- quote of the day ----------
+  const loadQuote = useCallback(async () => {
+    const todayKey = new Date().toISOString().slice(0, 10);
+    const cached = await AsyncStorage.getItem("home_quote_cache");
+    if (cached) {
+      const stored = JSON.parse(cached);
+      if (stored?.date === todayKey) {
+        setQuote(stored.quote);
+        return;
+      }
+    }
+    const q = pickDailyQuote(todayKey);
+    setQuote(q);
+    await AsyncStorage.setItem("home_quote_cache", JSON.stringify({ date: todayKey, quote: q }));
+  }, []);
+
   // ---------- weather ----------
   const loadWeather = useCallback(async () => {
     try {
@@ -111,6 +164,29 @@ const HomeScreen = () => {
       });
     } catch (e) {
       console.warn("Weather error:", e?.message || e);
+    }
+  }, []);
+
+  // ---------- air quality ----------
+  const loadAir = useCallback(async () => {
+    try {
+      const res = await fetch(OPEN_METEO_AIR, { headers: { "Cache-Control": "no-cache" } });
+      const json = await res.json();
+      const hours = json?.hourly?.time || [];
+      const i = hours.length ? hours.length - 1 : -1;
+      if (i >= 0) {
+        const aqi = json?.hourly?.us_aqi?.[i];
+        const pm25 = json?.hourly?.pm2_5?.[i];
+        const pm10 = json?.hourly?.pm10?.[i];
+        setAir({ aqi, pm25, pm10 });
+        await AsyncStorage.setItem("home_air_cache", JSON.stringify({ aqi, pm25, pm10, t: Date.now() }));
+      } else {
+        setAir(null);
+      }
+    } catch (e) {
+      console.warn("Air quality error:", e?.message || e);
+      const cached = await AsyncStorage.getItem("home_air_cache");
+      if (cached) setAir(JSON.parse(cached));
     }
   }, []);
 
@@ -190,20 +266,85 @@ const HomeScreen = () => {
     }
   }, []);
 
+  // ---------- ESC-accepting spots (Food) ----------
+  const loadEscSpots = useCallback(async () => {
+    try {
+      // Filters to Food — adjust category labels as your backend uses them
+      const data = await listServices({ category: "Food", limit: 12 });
+      const list = Array.isArray(data?.results) ? data.results : Array.isArray(data) ? data : [];
+      // pick the first 6; if later you add accepts_esc flag, filter by it here
+      setEscSpots(list.slice(0, 6));
+      await AsyncStorage.setItem("home_esc_spots_cache", JSON.stringify(list.slice(0, 12)));
+    } catch (e) {
+      console.warn("ESC spots error:", e?.message || e);
+      const cached = await AsyncStorage.getItem("home_esc_spots_cache");
+      if (cached) setEscSpots(JSON.parse(cached).slice(0, 6));
+    }
+  }, []);
+
+  // ---------- mini-game: load streak/score ----------
+  const loadGame = useCallback(async () => {
+    const raw = await AsyncStorage.getItem("home_coin_game");
+    if (raw) {
+      const { score: s = 0, streak: st = 0, lastDate = "" } = JSON.parse(raw) || {};
+      const today = new Date().toISOString().slice(0, 10);
+      const newStreak = lastDate === today ? st : (lastDate ? st + 1 : 1);
+      setScore(s);
+      setStreak(newStreak);
+      await AsyncStorage.setItem("home_coin_game", JSON.stringify({ score: s, streak: newStreak, lastDate: today }));
+    } else {
+      const today = new Date().toISOString().slice(0, 10);
+      setScore(0);
+      setStreak(1);
+      await AsyncStorage.setItem("home_coin_game", JSON.stringify({ score: 0, streak: 1, lastDate: today }));
+    }
+  }, []);
+
+  const saveGame = useCallback(async (s, st) => {
+    const today = new Date().toISOString().slice(0, 10);
+    await AsyncStorage.setItem("home_coin_game", JSON.stringify({ score: s, streak: st, lastDate: today }));
+  }, []);
+
+  const tapCoin = useCallback(() => {
+    const next = score + 1;
+    setScore(next);
+    saveGame(next, streak);
+    // little bounce
+    coinAnim.setValue(0);
+    Animated.timing(coinAnim, {
+      toValue: 1,
+      duration: 240,
+      easing: Easing.out(Easing.quad),
+      useNativeDriver: true,
+    }).start();
+  }, [score, streak, saveGame, coinAnim]);
+
+  const coinScale = coinAnim.interpolate({ inputRange: [0, 1], outputRange: [1, 1.16] });
+  const coinUp = coinAnim.interpolate({ inputRange: [0, 1], outputRange: [0, -4] });
+
   // ---------- boot ----------
   useEffect(() => {
     (async () => {
       setLoading(true);
-      await Promise.all([loadWeather(), loadNews(), loadBridgeInfo(), loadTraffic()]);
+      await Promise.all([
+        loadQuote(),
+        loadWeather(),
+        loadAir(),
+        loadNews(),
+        loadBridgeInfo(),
+        loadTraffic(),
+        loadEscSpots(),
+        loadGame(),
+      ]);
       setLoading(false);
     })();
-  }, [loadWeather, loadNews, loadBridgeInfo, loadTraffic]);
+  }, [loadQuote, loadWeather, loadAir, loadNews, loadBridgeInfo, loadTraffic, loadEscSpots, loadGame]);
 
   const onRefresh = useCallback(async () => {
     setRefreshing(true);
-    await Promise.all([loadWeather(), loadNews(), loadBridgeInfo(), loadTraffic()]);
+    await Promise.all([loadQuote(), loadWeather(), loadAir(), loadNews(), loadBridgeInfo(), loadTraffic(), loadEscSpots()]);
     setRefreshing(false);
-  }, [loadWeather, loadNews, loadBridgeInfo, loadTraffic]);
+  }, [loadQuote, loadWeather, loadAir, loadNews, loadBridgeInfo, loadTraffic, loadEscSpots]);
 
   // ---------- helpers ----------
   const weatherLabel = useMemo(() => {
@@ -219,6 +360,17 @@ const HomeScreen = () => {
     return "Weather";
   }, [weather]);
 
+  const aqiBadge = useMemo(() => {
+    const a = air?.aqi ?? null;
+    if (a == null) return { label: "—", color: "#666" };
+    if (a <= 50) return { label: "Good", color: "#2f8f46" };
+    if (a <= 100) return { label: "Moderate", color: "#d1a000" };
+    if (a <= 150) return { label: "Unhealthy (SG)", color: "#d17b00" };
+    if (a <= 200) return { label: "Unhealthy", color: "#c93636" };
+    if (a <= 300) return { label: "Very Unhealthy", color: "#7b3dc9" };
+    return { label: "Hazardous", color: "#7d0022" };
+  }, [air]);
+
   const NewsCard = ({ item, idx }) => (
     <TouchableOpacity
       key={`${idx}-${item.title}`}
@@ -232,6 +384,25 @@ const HomeScreen = () => {
         {item.source}
       </Text>
     </TouchableOpacity>
+  );
+
+  const Spot = ({ s }) => (
+    <View key={s.id} style={styles.spotRow}>
+      <View style={{ flex: 1 }}>
+        <Text style={styles.spotTitle} numberOfLines={1}>
+          {s.title || s.name || "Local spot"}
+        </Text>
+        {!!s.description && (
+          <Text style={styles.spotMeta} numberOfLines={2}>
+            {s.description}
+          </Text>
+        )}
+        {!!s.price && <Text style={styles.spotPrice}>~ {s.price} ESC</Text>}
+      </View>
+      <View style={styles.escPill}>
+        <Text style={styles.escPillText}>ESC</Text>
+      </View>
+    </View>
   );
 
   const today = new Date().toLocaleDateString("en-US", {
@@ -265,17 +436,32 @@ const HomeScreen = () => {
             <Text style={styles.subtleDate}>{today} • America/Chicago</Text>
           </Animated.View>
 
-          {/* Weather Card */}
+          {/* Quote of the Day */}
           <View style={styles.card}>
             <View style={styles.cardHeaderRow}>
-              <Text style={styles.cardHeader}>60617 Weather</Text>
+              <Text style={styles.cardHeader}>Quote of the Day</Text>
+            </View>
+            {quote ? (
+              <View>
+                <Text style={styles.quoteText}>“{quote.q}”</Text>
+                <Text style={styles.quoteAuthor}>— {quote.a}</Text>
+              </View>
+            ) : (
+              <ActivityIndicator />
+            )}
+          </View>
+
+          {/* Weather + Air */}
+          <View style={styles.card}>
+            <View style={styles.cardHeaderRow}>
+              <Text style={styles.cardHeader}>60617 Weather & Air</Text>
               <TouchableOpacity style={styles.smallBtn} onPress={onRefresh}>
                 <Text style={styles.smallBtnText}>Refresh</Text>
               </TouchableOpacity>
             </View>
 
-            {weather ? (
-              <View style={styles.weatherRow}>
+            <View style={styles.weatherRow}>
+              {weather ? (
                 <View style={{ flex: 1 }}>
                   <Text style={styles.weatherTemp}>{weather.temp}°</Text>
                   <Text style={styles.weatherSub}>
@@ -288,10 +474,25 @@ const HomeScreen = () => {
                     <Text style={styles.weatherSub}>Rain chance {weather.precip}%</Text>
                   )}
                 </View>
+              ) : (
+                <ActivityIndicator />
+              )}
+
+              <View style={styles.aqiBox}>
+                <Text style={styles.aqiTitle}>Air</Text>
+                {air ? (
+                  <>
+                    <View style={[styles.aqiBadge, { borderColor: aqiBadge.color }]}>
+                      <Text style={[styles.aqiBadgeText, { color: aqiBadge.color }]}>{aqiBadge.label}</Text>
+                    </View>
+                    <Text style={styles.aqiMeta}>US AQI {Math.round(air.aqi ?? 0)}</Text>
+                    <Text style={styles.aqiMeta}>PM2.5 {Math.round(air.pm25 ?? 0)} µg/m³</Text>
+                  </>
+                ) : (
+                  <Text style={styles.aqiMeta}>—</Text>
+                )}
               </View>
-            ) : (
-              <ActivityIndicator />
-            )}
+            </View>
           </View>
 
           {/* Chicago Headlines (horizontal) */}
@@ -307,6 +508,19 @@ const HomeScreen = () => {
               </ScrollView>
             ) : (
               <Text style={styles.empty}>No headlines right now. Pull to refresh.</Text>
+            )}
+          </View>
+
+          {/* Accepts ESC — local Food spots */}
+          <View style={styles.card}>
+            <View style={styles.cardHeaderRow}>
+              <Text style={styles.cardHeader}>Eat Local • Accepts ESC</Text>
+              <Text style={styles.tag}>Food</Text>
+            </View>
+            {escSpots.length ? (
+              escSpots.map((s) => <Spot key={s.id} s={s} />)
+            ) : (
+              <Text style={styles.empty}>No listings yet. Add your spot in Marketplace → Create Service.</Text>
             )}
           </View>
 
@@ -388,6 +602,22 @@ const HomeScreen = () => {
             </Text>
           </View>
 
+          {/* Mini Retro Game: Coin Tap */}
+          <View style={styles.card}>
+            <View style={styles.cardHeaderRow}>
+              <Text style={styles.cardHeader}>Mini Game • Coin Tap</Text>
+              <Text style={styles.tag}>Just for fun</Text>
+            </View>
+            <Text style={styles.gameMeta}>Daily streak: {streak} day{streak === 1 ? "" : "s"}</Text>
+            <Text style={styles.gameMeta}>Score: {score}</Text>
+            <Animated.View style={{ transform: [{ scale: coinScale }, { translateY: coinUp }] }}>
+              <TouchableOpacity onPress={tapCoin} style={styles.coinBtn} activeOpacity={0.8}>
+                <Text style={styles.coinBtnText}>🪙 Tap</Text>
+              </TouchableOpacity>
+            </Animated.View>
+            <Text style={styles.note}>Tap to collect coins. It’s silly on purpose. 😄</Text>
+          </View>
+
           {/* Footer */}
           <Text style={styles.footer}>America/Chicago</Text>
         </ScrollView>
@@ -449,9 +679,33 @@ const styles = StyleSheet.create({
     borderRadius: 999,
   },
 
+  // Quote
+  quoteText: { color: "#EEE", fontSize: 16, lineHeight: 22, fontStyle: "italic" },
+  quoteAuthor: { color: "#CFCFCF", fontSize: 13, marginTop: 6, textAlign: "right" },
+
+  // Weather + Air
   weatherRow: { flexDirection: "row", alignItems: "center", marginTop: 8 },
   weatherTemp: { color: "#FFFFFF", fontSize: 44, fontWeight: "800", lineHeight: 46 },
   weatherSub: { color: "#BEBEBE", marginTop: 2, fontSize: 13 },
+
+  aqiBox: {
+    width: 150,
+    marginLeft: 12,
+    paddingLeft: 12,
+    borderLeftWidth: 1,
+    borderLeftColor: "#2a2a2e",
+  },
+  aqiTitle: { color: "#EEE", fontWeight: "700", marginBottom: 6 },
+  aqiBadge: {
+    borderWidth: 1.5,
+    paddingVertical: 2,
+    paddingHorizontal: 8,
+    borderRadius: 999,
+    alignSelf: "flex-start",
+    marginBottom: 6,
+  },
+  aqiBadgeText: { fontWeight: "800" },
+  aqiMeta: { color: "#BEBEBE", fontSize: 12 },
 
   // Horizontal news cards
   newsCard: {
@@ -466,6 +720,28 @@ const styles = StyleSheet.create({
   newsTitle: { color: "#EEE", fontSize: 15, fontWeight: "700", marginBottom: 6 },
   newsMeta: { color: "#8a8a8f", fontSize: 12 },
 
+  // ESC spots
+  spotRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    paddingVertical: 10,
+    borderBottomColor: "#2a2a2e",
+    borderBottomWidth: 1,
+  },
+  spotTitle: { color: "#EEE", fontSize: 15, fontWeight: "700" },
+  spotMeta: { color: "#BEBEBE", fontSize: 12, marginTop: 2 },
+  spotPrice: { color: "#FFD700", fontSize: 12, marginTop: 4, fontWeight: "800" },
+  escPill: {
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+    borderRadius: 999,
+    borderWidth: 1,
+    borderColor: "#FFD700",
+    marginLeft: 10,
+  },
+  escPillText: { color: "#FFD700", fontWeight: "800", letterSpacing: 0.5 },
+
+  // Bridges
   bridgeRow: {
     flexDirection: "row",
     alignItems: "center",
@@ -489,9 +765,25 @@ const styles = StyleSheet.create({
   idle: { borderColor: "#555" },
   pillText: { color: "#DDD", fontSize: 11, fontWeight: "800", letterSpacing: 0.5 },
 
+  // Traffic
   trafficLine: { color: "#BEBEBE", fontSize: 13, marginTop: 3 },
   bold: { color: "#EEE", fontWeight: "700" },
 
+  // Mini-game
+  gameMeta: { color: "#BEBEBE", fontSize: 12, marginBottom: 6 },
+  coinBtn: {
+    alignSelf: "center",
+    backgroundColor: "#FF7A1B",
+    paddingVertical: 12,
+    paddingHorizontal: 26,
+    borderRadius: 999,
+    borderWidth: 2,
+    borderColor: "#FFB067",
+    marginTop: 6,
+  },
+  coinBtnText: { color: "#fff", fontSize: 18, fontWeight: "900", letterSpacing: 0.5 },
+
+  // Common
   smallBtn: {
     backgroundColor: "#2d2d2f",
     paddingVertical: 8,

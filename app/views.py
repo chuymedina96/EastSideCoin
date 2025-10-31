@@ -7,8 +7,11 @@ from django.utils import timezone
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
-from rest_framework_simplejwt.tokens import RefreshToken
 from rest_framework import status
+
+from rest_framework_simplejwt.tokens import RefreshToken
+from rest_framework_simplejwt.exceptions import InvalidToken, TokenError
+from rest_framework_simplejwt.tokens import AccessToken
 
 from django.contrib.auth.hashers import make_password, check_password
 from django.contrib.auth import get_user_model
@@ -30,18 +33,20 @@ def _serialize_user(u: User):
     }
 
 
+def _serialize_user_with_wallet(u: User):
+    return {
+        "id": u.id,
+        "email": u.email,
+        "first_name": u.first_name,
+        "last_name": u.last_name,
+        "wallet_address": getattr(u, "wallet_address", None),
+    }
+
+
 def _serialize_message_for_requester(m: ChatMessage, requester_id: int):
     """
     Mobile client expects these fields. Expose both REST names and WS-style aliases
     so the app can hydrate regardless of naming differences.
-
-    REST canonical:
-      - encrypted_key          -> receiver wrap (RSA-OAEP key for recipient)
-      - encrypted_key_sender   -> sender wrap   (RSA-OAEP key for sender)
-
-    WS aliases also included:
-      - encrypted_key_for_receiver
-      - encrypted_key_for_sender
     """
     ts = m.timestamp or timezone.now()
     return {
@@ -84,7 +89,7 @@ def register_user(request):
         data = request.data
         first_name = data.get("first_name")
         last_name = data.get("last_name")
-        email = data.get("email")
+        email = (data.get("email") or "").strip().lower()
         password = data.get("password")
         wallet_address = data.get("wallet_address")
 
@@ -140,7 +145,7 @@ def generate_keys(request):
 def login_user(request):
     print("🚀 Login API Hit!")
     try:
-        email = request.data.get("email")
+        email = (request.data.get("email") or "").strip().lower()
         password = request.data.get("password")
 
         if not email or not password:
@@ -157,13 +162,14 @@ def login_user(request):
             return Response({"error": "Invalid credentials"}, status=status.HTTP_401_UNAUTHORIZED)
 
         refresh = RefreshToken.for_user(user)
-        access = str(refresh.access_token)
+        access = refresh.access_token
 
         print(f"✅ Login Successful for {user.email}")
         return Response(
             {
-                "access": access,
+                "access": str(access),
                 "refresh": str(refresh),
+                "exp": int(access["exp"]),
                 "user": {
                     **_serialize_user(user),
                     "wallet_address": user.wallet_address,
@@ -175,6 +181,28 @@ def login_user(request):
     except Exception as e:
         print(f"❌ CRITICAL ERROR in login: {e}")
         return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+
+@api_view(["POST"])
+@permission_classes([AllowAny])
+def refresh_token_view(request):
+    """
+    POST /api/refresh/
+    Body: { "refresh": "<refresh-token>" }
+    Returns: { "access": "<new-access>", "exp": <unix-seconds> }
+    """
+    try:
+        raw = request.data.get("refresh")
+        if not raw:
+            return Response({"error": "Missing refresh"}, status=400)
+        rt = RefreshToken(raw)
+        at = rt.access_token
+        return Response({"access": str(at), "exp": int(at["exp"])}, status=200)
+    except (InvalidToken, TokenError):
+        return Response({"error": "Invalid refresh"}, status=401)
+    except Exception as e:
+        print("❌ refresh error:", e)
+        return Response({"error": str(e)}, status=500)
 
 
 @api_view(["POST"])
@@ -231,21 +259,27 @@ def delete_account(request):
 @api_view(["GET"])
 @permission_classes([IsAuthenticated])
 def search_users(request):
-    query = (request.GET.get("query") or "").strip().lower()
+    # accept both ?q= and ?query=
+    raw = request.GET.get("q") or request.GET.get("query") or ""
+    query = raw.strip()
     print(f"🚀 Searching Users: '{query}'")
     if not query:
         return Response([], status=status.HTTP_200_OK)
 
-    users = (
-        User.objects.filter(
-            Q(first_name__icontains=query) |
-            Q(last_name__icontains=query) |
-            Q(email__icontains=query)
+    # Tokenize so "alan major" matches first + last
+    tokens = [t for t in query.split() if t]
+    qs = User.objects.exclude(id=request.user.id)
+
+    for t in tokens:
+        qs = qs.filter(
+            Q(first_name__icontains=t) |
+            Q(last_name__icontains=t)  |
+            Q(email__icontains=t)      |
+            Q(wallet_address__icontains=t)
         )
-        .exclude(id=request.user.id)
-        .only("id", "first_name", "last_name", "email")
-    )
-    return Response([_serialize_user(u) for u in users], status=status.HTTP_200_OK)
+
+    users = qs.only("id", "first_name", "last_name", "email", "wallet_address")[:25]
+    return Response([_serialize_user_with_wallet(u) for u in users], status=status.HTTP_200_OK)
 
 
 # ===========================
@@ -261,11 +295,8 @@ def conversations_index(request):
     """
     me = request.user
     try:
-        # All messages where I'm involved
         base = ChatMessage.objects.filter(Q(sender=me) | Q(receiver=me))
 
-        # Latest timestamp per partner (me, other)
-        # Build a dict: partner_id -> latest_ts
         latest_rows = base.values("sender_id", "receiver_id").annotate(last_ts=Max("timestamp"))
 
         partner_latest = {}
@@ -282,15 +313,15 @@ def conversations_index(request):
         if not partner_ids:
             return Response([], status=status.HTTP_200_OK)
 
-        # Unread counts per partner = messages sent *to me* and not read
-        unread_qs = ChatMessage.objects.filter(receiver=me, is_read=False, sender_id__in=partner_ids) \
-            .values("sender_id").annotate(unread=Count("id"))
+        unread_qs = (
+            ChatMessage.objects.filter(receiver=me, is_read=False, sender_id__in=partner_ids)
+            .values("sender_id")
+            .annotate(unread=Count("id"))
+        )
         unread_map = {row["sender_id"]: row["unread"] for row in unread_qs}
 
-        # Load partners
         partners = User.objects.filter(id__in=partner_ids).only("id", "first_name", "last_name", "email")
 
-        # Build response items
         items = []
         for u in partners:
             items.append({
@@ -300,10 +331,9 @@ def conversations_index(request):
                 "email": u.email,
                 "updatedAt": (partner_latest.get(u.id) or timezone.now()).isoformat(),
                 "unread": unread_map.get(u.id, 0),
-                "lastText": "",  # keep empty; client can fill after first decrypt page
+                "lastText": "",
             })
 
-        # Sort newest first
         items.sort(key=lambda x: x["updatedAt"], reverse=True)
         return Response(items, status=status.HTTP_200_OK)
     except Exception as e:
@@ -425,7 +455,7 @@ def get_conversation(request, other_id: int):
         if before:
             qs = qs.filter(timestamp__lt=before)
 
-        qs = qs.order_by("timestamp", "id")  # ASC for UI; id tiebreaker for null/dupes
+        qs = qs.order_by("timestamp", "id")  # ASC for UI; id tiebreaker
 
         paginator = Paginator(qs, limit)
         try:
@@ -504,7 +534,6 @@ def send_message(request):
       "encrypted_message": "<b64>",
       "iv": "<b64>",
       "mac": "<b64>",
-      # either naming is accepted:
       "encrypted_key" or "encrypted_key_for_receiver": "<b64>",  # required
       "encrypted_key_sender" or "encrypted_key_for_sender": "<b64>"  # optional
     }
@@ -512,7 +541,6 @@ def send_message(request):
     print("🚀 Send Message API Hit!")
     try:
         data = request.data
-        # Debug payload shape (keys only)
         try:
             print("📥 send_message keys:", list(data.keys()))
         except Exception:
@@ -522,8 +550,6 @@ def send_message(request):
         enc_msg = data.get("encrypted_message")
         iv = data.get("iv")
         mac = data.get("mac")
-
-        # Accept both REST and WS aliases for wraps
         enc_key_recv = data.get("encrypted_key") or data.get("encrypted_key_for_receiver")
         enc_key_sender = data.get("encrypted_key_sender") or data.get("encrypted_key_for_sender")
 
@@ -550,8 +576,6 @@ def send_message(request):
         )
 
         print(f"✅ Message stored: {msg.id}")
-
-        # Echo canonical payload (with aliases too) for immediate client merge
         payload = _serialize_message_for_requester(msg, request.user.id)
         return Response(payload, status=status.HTTP_201_CREATED)
     except Exception as e:
@@ -560,17 +584,36 @@ def send_message(request):
 
 
 # ===========================
-# Wallet / Keys
+# Wallet
 # ===========================
 @api_view(["GET"])
 @permission_classes([IsAuthenticated])
+def wallet_balance(request):
+    """
+    GET /api/wallet/balance/
+    Returns authed user's wallet address and balance.
+    """
+    me = request.user
+    return Response({
+        "address": me.wallet_address,
+        "balance": float(me.esc_balance),
+        "pending": False,
+    }, status=status.HTTP_200_OK)
+
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
 def check_balance(request, wallet_address):
+    """
+    GET /api/check_balance/<wallet_address>/
+    Useful for admin/debug; client typically uses wallet_balance.
+    """
     try:
         print(f"🚀 Checking wallet balance for: {wallet_address}")
         user = User.objects.filter(wallet_address=wallet_address).first()
         if not user:
             return Response({"error": "Wallet not found"}, status=status.HTTP_404_NOT_FOUND)
-        return Response({"wallet": wallet_address, "balance": user.esc_balance}, status=status.HTTP_200_OK)
+        return Response({"wallet": wallet_address, "balance": float(user.esc_balance)}, status=status.HTTP_200_OK)
     except Exception as e:
         print(f"❌ ERROR Fetching Balance: {e}")
         return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)

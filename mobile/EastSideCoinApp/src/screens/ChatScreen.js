@@ -10,10 +10,11 @@ import AsyncStorage from "@react-native-async-storage/async-storage";
 import debounce from "lodash.debounce";
 
 import { AuthContext } from "../context/AuthProvider";
-import { API_URL } from "../config";
+import { WS_URL } from "../config";
 import { encryptAES, encryptRSA, decryptAES, decryptRSA } from "../utils/encryption";
 import { isKeysReady, loadPrivateKeyForUser } from "../utils/keyManager";
 import { createOrGetChatSocket } from "../utils/wsClient";
+import { api, fetchConversation, fetchThreadsIndex as _unused, searchUsersSmart } from "../utils/api"; // use direct returns
 
 const THREADS_KEY = "chat_threads_index_v1";
 const MSGS_KEY_PREFIX = "chat_msgs_";
@@ -142,7 +143,7 @@ const UncontrolledLockedSearch = React.memo(function UncontrolledLockedSearch({
 
 // =============== Component ===============
 const ChatScreen = ({ navigation }) => {
-  const { authToken, user, keysReady } = useContext(AuthContext);
+  const { user, keysReady, getAccessToken } = useContext(AuthContext);
 
   const userPrefix = user?.id ? `u${user.id}:` : "u?:";
   const threadsKey = `${userPrefix}${THREADS_KEY}`;
@@ -152,6 +153,8 @@ const ChatScreen = ({ navigation }) => {
   const [threads, setThreads] = useState({});
   const [messages, setMessages] = useState([]);
   const [selectedUser, setSelectedUser] = useState(null);
+  const selectedUserRef = useRef(null);
+  useEffect(() => { selectedUserRef.current = selectedUser; }, [selectedUser]);
 
   const [directory, setDirectory] = useState({});
   const [effectiveQuery, setEffectiveQuery] = useState("");
@@ -166,21 +169,17 @@ const ChatScreen = ({ navigation }) => {
 
   const pageRef = useRef({ next: null });
   const wsSubRef = useRef(null);
-  const pendingClientIdsRef = useRef(new Set()); // de-dupe optimistic echoes
+  const pendingClientIdsRef = useRef(new Set());
 
   const [draft, setDraft] = useState("");
   const [sendInFlight, setSendInFlight] = useState(false);
   const listRef = useRef(null);
-
-  // prevent programmatic scroll from blurring composer while typing
   const isComposingRef = useRef(false);
 
-  // ---- Cache helpers (still used as *cache*, server is source of truth)
+  // ---- Cache helpers
   const loadCachedThreads = useCallback(async () => {
-    try {
-      const raw = await AsyncStorage.getItem(threadsKey);
-      return raw ? JSON.parse(raw) : {};
-    } catch { return {}; }
+    try { const raw = await AsyncStorage.getItem(threadsKey); return raw ? JSON.parse(raw) : {}; }
+    catch { return {}; }
   }, [threadsKey]);
 
   const saveCachedThreads = useCallback(async (val) => {
@@ -188,10 +187,8 @@ const ChatScreen = ({ navigation }) => {
   }, [threadsKey]);
 
   const loadCachedMessages = useCallback(async (otherId) => {
-    try {
-      const raw = await AsyncStorage.getItem(msgsKey(otherId));
-      return raw ? JSON.parse(raw) : [];
-    } catch { return []; }
+    try { const raw = await AsyncStorage.getItem(msgsKey(otherId)); return raw ? JSON.parse(raw) : []; }
+    catch { return []; }
   }, [msgsKey]);
 
   const saveCachedMessages = useCallback(async (otherId, msgs) => {
@@ -200,16 +197,11 @@ const ChatScreen = ({ navigation }) => {
 
   // ---- Server-backed threads index
   const fetchThreadsIndex = useCallback(async () => {
-    if (!authToken) return;
     try {
-      const res = await fetch(`${API_URL}/conversations/index/`, {
-        headers: { Authorization: `Bearer ${authToken}` },
-      });
-      if (!res.ok) throw new Error(`index ${res.status}`);
-      const items = await res.json(); // [{id, first_name, last_name, email, updatedAt, unread, lastText}]
-      // Build state object
+      const items = await api.get("/conversations/index/"); // <-- returns array
+      const arr = Array.isArray(items) ? items : (Array.isArray(items?.results) ? items.results : []);
       const next = {};
-      for (const t of items) {
+      for (const t of arr) {
         const id = asId(t.id);
         next[id] = {
           id,
@@ -221,37 +213,28 @@ const ChatScreen = ({ navigation }) => {
         };
       }
       setThreads(next);
-      saveCachedThreads(next); // cache the server index
-      // also seed directory for names
-      setDirectory((d) => ({ ...d, ...Object.fromEntries(items.map(u => [asId(u.id), u])) }));
+      saveCachedThreads(next);
+      setDirectory((d) => ({ ...d, ...Object.fromEntries(arr.map((u) => [asId(u.id), u])) }));
     } catch (e) {
       console.warn("⚠️ fetchThreadsIndex failed:", e?.message || e);
-      // fallback to cached
       const cached = await loadCachedThreads();
-      setThreads(cached);
+      setThreads(cached || {});
     }
-  }, [authToken, saveCachedThreads, loadCachedThreads]);
+  }, [saveCachedThreads, loadCachedThreads]);
 
   const markThreadRead = useCallback(async (otherId) => {
-    if (!authToken || !otherId) return;
-    try {
-      await fetch(`${API_URL}/conversations/mark_read/${otherId}/`, {
-        method: "POST",
-        headers: { Authorization: `Bearer ${authToken}` },
-      });
-    } catch {}
-  }, [authToken]);
+    if (!otherId) return;
+    try { await api.post(`/conversations/mark_read/${otherId}/`); } catch {}
+  }, []);
 
   // ---- Bootstrap
   useEffect(() => {
-    let mounted = true;
     (async () => {
       setThreads({});
       setMessages([]);
       setSelectedUser(null);
-      await fetchThreadsIndex(); // server-first
+      await fetchThreadsIndex();
     })();
-    return () => { mounted = false; };
   }, [user?.id, fetchThreadsIndex]);
 
   useEffect(() => { saveCachedThreads(threads); }, [threads, saveCachedThreads]);
@@ -265,7 +248,7 @@ const ChatScreen = ({ navigation }) => {
     });
   }, [searchResults]);
 
-  // Ensure process-wide privateKey is present (fallback from per-user slot)
+  // Ensure process-wide privateKey is present
   useEffect(() => { (async () => {
     if (user?.id) {
       let perUser = await AsyncStorage.getItem(`privateKey_${user.id}`);
@@ -274,7 +257,7 @@ const ChatScreen = ({ navigation }) => {
     }
   })(); }, [user?.id]);
 
-  // Reload server index when screen gains focus (catch up after background)
+  // Reload index on focus
   useFocusEffect(useCallback(() => {
     let mounted = true;
     (async () => {
@@ -290,7 +273,7 @@ const ChatScreen = ({ navigation }) => {
     return () => { mounted = false; };
   }, [user?.id, fetchThreadsIndex]));
 
-  // ---- Search
+  // ---- Search (HTTP-only)
   const abortRef = useRef(null);
   const doRemoteSearch = useCallback(async (query) => {
     if (abortRef.current) abortRef.current.abort();
@@ -299,25 +282,25 @@ const ChatScreen = ({ navigation }) => {
     if (!query || query.length < 2) { setSearchResults([]); setEffectiveQuery(query); return; }
     try {
       setEffectiveQuery(query);
-      const url = `${API_URL}/users/search/?query=${encodeURIComponent(query)}`;
-      const response = await fetch(url, { headers: { Authorization: `Bearer ${authToken}` }, signal: ctrl.signal });
-      const data = await response.json();
+      const data = await searchUsersSmart(query);
+      if (ctrl.signal.aborted) return;
       setSearchResults(Array.isArray(data) ? data : []);
     } catch (err) {
-      if (err.name !== "AbortError") console.error("❌ Error searching users:", err);
+      if (err.name !== "CanceledError" && err.name !== "AbortError") {
+        console.error("❌ Error searching users:", err?.message || err);
+      }
     }
-  }, [authToken]);
+  }, []);
   const debouncedSearchGateway = useRef(debounce((q) => { doRemoteSearch(q); }, 300)).current;
   const handleDebouncedSearch = useCallback((q) => { debouncedSearchGateway(q); }, [debouncedSearchGateway]);
 
   // ---- Conversation fetch
-  const fetchConversationPage = useCallback(async (otherId, { page = 1, limit = 50 } = {}) => {
-    const url = `${API_URL}/conversations/${otherId}/?limit=${limit}&page=${page}`;
-    const res = await fetch(url, { headers: { Authorization: `Bearer ${authToken}` } });
-    if (!res.ok) throw new Error(`Conversation fetch failed: ${res.status}`);
-    const data = await res.json();
-    return data;
-  }, [authToken]);
+  const fetchConversationPage = useCallback(async (otherId, { page = 1, limit = 50, since = null } = {}) => {
+    const params = { limit, page };
+    if (since) params.since = since;
+    // our api.get returns JSON directly
+    return api.get(`/conversations/${otherId}/`, { params });
+  }, []);
 
   const clearHydrateBanner = useCallback((oid) => {
     setLoadingHydrateId((curr) => (curr === oid ? null : curr));
@@ -334,7 +317,7 @@ const ChatScreen = ({ navigation }) => {
     return Array.from(map.values()).sort((x, y) => new Date(x.createdAt) - new Date(y.createdAt));
   };
 
-  const hydrateConversation = useCallback(async (neighbor) => {
+  const hydrateConversation = useCallback(async (neighbor, { onlyIfNewerThan } = {}) => {
     if (!neighbor?.id) return;
     const oid = String(neighbor.id);
 
@@ -343,14 +326,6 @@ const ChatScreen = ({ navigation }) => {
     hydrateTimeoutRef.current = setTimeout(() => { clearHydrateBanner(oid); }, 12000);
 
     try {
-      const cached = await loadCachedMessages(neighbor.id);
-      const normalizedCached = (cached || []).map(m => ({
-        ...m, _id: String(m._id),
-        user: { ...m.user, _id: String(m.user?._id) },
-        createdAt: new Date(m.createdAt),
-      })).sort((a,b) => new Date(a.createdAt) - new Date(b.createdAt));
-      setMessages(normalizedCached);
-
       let privateKeyPem = await AsyncStorage.getItem("privateKey");
       const myPublicKey = await AsyncStorage.getItem("publicKey");
       if (!privateKeyPem && user?.id) {
@@ -359,7 +334,7 @@ const ChatScreen = ({ navigation }) => {
       }
       if (!privateKeyPem) return;
 
-      // sanity check keypair
+      // sanity check (non-fatal)
       try {
         const probe = encryptAES("probe");
         const wrapped = encryptRSA(probe.keyB64, myPublicKey);
@@ -369,42 +344,52 @@ const ChatScreen = ({ navigation }) => {
         }
       } catch {}
 
-      const first = await fetchConversationPage(neighbor.id, { page: 1, limit: 50 });
-      const decrypted = (first.results || [])
+      const apiResp = await fetchConversationPage(neighbor.id, {
+        page: 1,
+        limit: 50,
+        since: onlyIfNewerThan || undefined,
+      });
+
+      const rows = Array.isArray(apiResp?.results) ? apiResp.results : (Array.isArray(apiResp) ? apiResp : []);
+      const decrypted = rows
         .map(m => decryptServerMessage(m, privateKeyPem, user.id, neighbor))
         .filter(Boolean)
         .map(m => ({ ...m, _id: String(m._id), user: { ...m.user, _id: String(m.user._id) } }))
         .sort((a,b) => new Date(a.createdAt) - new Date(b.createdAt));
 
-      setMessages(prev => {
-        const merged = mergeUniqueById(prev, decrypted);
-        saveCachedMessages(neighbor.id, merged);
-        return merged;
-      });
+      if (decrypted.length > 0) {
+        setMessages(prev => {
+          const merged = mergeUniqueById(prev, decrypted);
+          saveCachedMessages(neighbor.id, merged);
+          return merged;
+        });
+      }
 
-      pageRef.current = { next: first.next_page || null };
+      pageRef.current = { next: apiResp?.next_page || null };
     } catch (e) {
       console.log("❌ hydrate error", e?.message);
     } finally {
       clearHydrateBanner(oid);
     }
-  }, [fetchConversationPage, user?.id, loadCachedMessages, saveCachedMessages, clearHydrateBanner]);
+  }, [fetchConversationPage, user?.id, saveCachedMessages, clearHydrateBanner]);
 
-  // ---- WebSocket subscribe (singleton + de-dupe)
+  // ---- WebSocket subscribe (mount once per user)
   useEffect(() => {
-    if (!authToken || !user?.id) return;
-
+    if (!user?.id) return;
     let unsub = null;
+
     (async () => {
       await loadPrivateKeyForUser(user.id);
 
-      if (wsSubRef.current?.socket && wsSubRef.current?.unsubscribe) {
+      if (wsSubRef.current?.unsubscribe) {
         try { wsSubRef.current.unsubscribe(); } catch {}
         wsSubRef.current = null;
       }
 
       const sub = createOrGetChatSocket({
-        token: authToken,
+        token: () => getAccessToken(), // always fresh
+        baseUrl: WS_URL,   // e.g., "ws://192.168.1.131:8000"
+        path: "/ws/chat/",
         userId: user.id,
         prefer: "query",
         onMessage: async (incomingRaw) => {
@@ -417,23 +402,20 @@ const ChatScreen = ({ navigation }) => {
             const myIdStr = String(user.id);
             const otherId = String(senderId) === myIdStr ? String(receiverId) : String(senderId);
 
-            // maintain minimal directory entry
             setDirectory((d) => d[asId(otherId)] ? d : { ...d, [asId(otherId)]: { id: otherId } });
 
-            // echo filter for our optimistic sends
             const clientTmpId = incoming.client_tmp_id || incoming.client_id || incoming.tmp_id;
             if (String(senderId) === myIdStr && clientTmpId && pendingClientIdsRef.current.has(clientTmpId)) {
               pendingClientIdsRef.current.delete(clientTmpId);
               return;
             }
 
-            // ---- bump threads on *any* message, but don't tick unread while typing
             const isTyping = isComposingRef.current === true;
             setThreads((t) => {
               const prev = t[asId(otherId)];
               const isIncoming = String(senderId) !== myIdStr;
               const shouldCountUnread =
-                isIncoming && (!selectedUser || String(selectedUser.id) !== otherId) && !isTyping;
+                isIncoming && (!selectedUserRef.current || String(selectedUserRef.current.id) !== otherId) && !isTyping;
               const next = upsertThread(
                 t,
                 { id: otherId, ...(prev?.meta || {}) },
@@ -445,8 +427,9 @@ const ChatScreen = ({ navigation }) => {
               return next;
             });
 
-            // only decrypt + append if this convo is open and keys exist
-            if (!selectedUser || String(selectedUser.id) !== otherId) return;
+            // Only append to open conversation
+            const activeSelected = selectedUserRef.current;
+            if (!activeSelected || String(activeSelected.id) !== otherId) return;
 
             let privateKeyPem = await AsyncStorage.getItem("privateKey");
             if (!privateKeyPem && user?.id) {
@@ -474,20 +457,19 @@ const ChatScreen = ({ navigation }) => {
               text: decryptedText || "🔒 Encrypted Message",
               createdAt: incoming.timestamp ? new Date(incoming.timestamp)
                 : (incoming.created_at ? new Date(incoming.created_at) : new Date()),
-              user: { _id: isMine ? String(user.id) : String(selectedUser.id), name: isMine ? "You" : nameOf(selectedUser) },
+              user: { _id: isMine ? String(user.id) : String(activeSelected.id), name: isMine ? "You" : nameOf(activeSelected) },
             };
 
             setMessages((prev) => {
               const merged = mergeUniqueById(prev, [newMsg]);
-              if (selectedUser?.id) saveCachedMessages(selectedUser.id, merged);
+              if (activeSelected?.id) saveCachedMessages(activeSelected.id, merged);
               return merged;
             });
 
-            // reset unread for open convo
             setThreads((t) => {
               const next = upsertThread(
                 t,
-                { id: selectedUser.id, ...selectedUser },
+                { id: activeSelected.id, ...activeSelected },
                 decryptedText,
                 newMsg.createdAt,
                 false,
@@ -507,7 +489,8 @@ const ChatScreen = ({ navigation }) => {
     })();
 
     return () => { if (unsub) unsub(); };
-  }, [authToken, user?.id, selectedUser, saveCachedThreads, saveCachedMessages]);
+    // ⚠️ keep deps minimal so typing/searching doesn't close WS
+  }, [user?.id, getAccessToken]);
 
   // ---- Thread helpers
   const upsertThread = (threads, otherUser, lastText, at, countUnread, opts = {}) => {
@@ -559,6 +542,21 @@ const ChatScreen = ({ navigation }) => {
         createdAt: new Date(m.createdAt),
       })).sort((a,b) => new Date(a.createdAt) - new Date(b.createdAt));
       setMessages(normalized);
+
+      const lastCachedAt = normalized.length
+        ? new Date(normalized[normalized.length - 1].createdAt).toISOString()
+        : null;
+      const threadMeta = threads[asId(known.id)];
+      const threadUpdatedAt = threadMeta?.updatedAt ? new Date(threadMeta.updatedAt).toISOString() : null;
+
+      const shouldHydrate =
+        !lastCachedAt ||
+        (threadUpdatedAt && threadUpdatedAt > lastCachedAt) ||
+        (threadMeta?.unread > 0);
+
+      if (shouldHydrate) {
+        hydrateConversation(known, { onlyIfNewerThan: lastCachedAt || undefined });
+      }
     })();
 
     setThreads((t) => {
@@ -568,10 +566,7 @@ const ChatScreen = ({ navigation }) => {
     });
     setEffectiveQuery("");
     setSearchResults([]);
-
-    // tell server unread=0
     markThreadRead(known.id);
-    hydrateConversation(known);
   };
 
   const backToThreads = () => {
@@ -586,7 +581,6 @@ const ChatScreen = ({ navigation }) => {
     }
     setSelectedUser(null);
     setMessages([]);
-    // also refresh from server (ensures unread is reflected)
     fetchThreadsIndex();
   };
 
@@ -597,8 +591,7 @@ const ChatScreen = ({ navigation }) => {
     if (!text) return;
 
     const sub = wsSubRef.current;
-    const activeSocket = sub?.socket;
-    if (!selectedUser || !activeSocket) { Alert.alert("Not connected", "Chat connection not ready yet."); return; }
+    if (!selectedUser || !sub) { Alert.alert("Not connected", "Chat connection not ready yet."); return; }
 
     const privateKey = await AsyncStorage.getItem("privateKey");
     const myPublicKey = await AsyncStorage.getItem("publicKey");
@@ -606,9 +599,10 @@ const ChatScreen = ({ navigation }) => {
       Alert.alert("Encryption Setup", "Your device keys are still generating. Try again in a moment.");
       return;
     }
-    if (activeSocket.readyState !== WebSocket.OPEN) {
-      Alert.alert("WebSocket not connected. Try again.");
-      return;
+
+    // Ensure socket is ready
+    if (!sub.socket?.ready) {
+      try { await sub.ready(); } catch { Alert.alert("WebSocket not connected. Try again."); return; }
     }
 
     try {
@@ -616,16 +610,13 @@ const ChatScreen = ({ navigation }) => {
 
       let recipientPub = await AsyncStorage.getItem(`publicKey_${selectedUser.id}`);
       if (!recipientPub) {
-        const response = await fetch(`${API_URL}/users/${selectedUser.id}/public_key/`, {
-          headers: { Authorization: `Bearer ${authToken}` },
-        });
-        const data = await response.json();
-        if (!data?.public_key) {
+        const resp = await api.get(`/users/${selectedUser.id}/public_key/`);
+        if (!resp?.public_key) {
           Alert.alert("Encryption Error", "Public key not found for this user.");
           setSendInFlight(false);
           return;
         }
-        recipientPub = data.public_key;
+        recipientPub = resp.public_key;
         await AsyncStorage.setItem(`publicKey_${selectedUser.id}`, recipientPub);
       }
 
@@ -633,7 +624,6 @@ const ChatScreen = ({ navigation }) => {
       const encrypted_key_for_receiver = encryptRSA(bundle.keyB64, recipientPub);
       const encrypted_key_for_sender   = encryptRSA(bundle.keyB64, myPublicKey);
 
-      // optimistic add
       const now = new Date();
       const optimisticId = `opt_${now.getTime()}_${Math.random()}`;
       pendingClientIdsRef.current.add(optimisticId);
@@ -659,7 +649,6 @@ const ChatScreen = ({ navigation }) => {
         requestAnimationFrame(() => listRef.current?.scrollToOffset({ offset: 0, animated: true }));
       }
 
-      // send over WS
       sub.send({
         receiver_id: selectedUser.id,
         encrypted_message: bundle.ciphertextB64,
@@ -682,12 +671,11 @@ const ChatScreen = ({ navigation }) => {
     fetchThreadsIndex().finally(() => setRefreshing(false));
   }, [fetchThreadsIndex]);
 
-  // newest-first for FlatList inverted
   const messagesForUI = useMemo(() => messages.slice().reverse(), [messages]);
 
   // ---------- UI ----------
   const ThreadsList = () => {
-    const items = Object.values(threads).sort((a, b) => new Date(b.updatedAt) - new Date(a.updatedAt));
+    const items = Object.values(threads || {}).sort((a, b) => new Date(b.updatedAt) - new Date(a.updatedAt));
     return (
       <View style={{ flex: 1 }}>
         <Text style={styles.sectionTitle}>Start new</Text>
@@ -713,7 +701,7 @@ const ChatScreen = ({ navigation }) => {
         <Text style={[styles.sectionTitle, { marginTop: 10 }]}>Conversations</Text>
         <FlatList
           data={items}
-          keyExtractor={(t) => t.id}
+          keyExtractor={(t) => String(t.id)}
           keyboardShouldPersistTaps="always"
           keyboardDismissMode="none"
           removeClippedSubviews={false}
@@ -767,8 +755,9 @@ const ChatScreen = ({ navigation }) => {
     return (
       <>
         <View style={styles.convHeader}>
-          <TouchableOpacity onPress={backToThreads} style={styles.backButton}><Text style={styles.backText}>← Back</Text></TouchableOpacity>
-          <Text style={styles.headerName}>{nameOf(selectedUser)}</Text>
+          <TouchableOpacity onPress={backToThreads} style={styles.backButton}><Text style={styles.backText}>←</Text></TouchableOpacity>
+          <Text style={styles.headerName} numberOfLines={1}>{nameOf(selectedUser)}</Text>
+          <View style={{ width: 36 }} />
         </View>
 
         {loadingBanner && (
@@ -778,16 +767,11 @@ const ChatScreen = ({ navigation }) => {
           </View>
         )}
 
-        {pageRef.current?.next && (
-          <TouchableOpacity onPress={() => { /* optional: implement loadOlder */ }} style={{ paddingVertical: 8, alignSelf: "center" }}>
-            <Text style={{ color: "#9cc1ff" }}>Load earlier</Text>
-          </TouchableOpacity>
-        )}
-
         <View style={{ flex: 1 }}>
           <FlatList
             ref={listRef}
-            style={{ flex: 1 }}
+            style={styles.messagesList}
+            contentContainerStyle={styles.messagesListContent}
             inverted
             data={messagesForUI}
             keyExtractor={(m) => String(m._id)}
@@ -811,88 +795,22 @@ const ChatScreen = ({ navigation }) => {
 
           {Platform.OS === "ios" ? (
             <KeyboardAvoidingView behavior="padding" keyboardVerticalOffset={80}>
-              <View style={styles.composerRow}>
-                <TextInput
-                  value={draft}
-                  onChangeText={(t) => { isComposingRef.current = true; setDraft(t); }}
-                  placeholder="Type a message…"
-                  placeholderTextColor="#AAA"
-                  style={styles.composerInput}
-                  autoCorrect={false}
-                  autoCapitalize="none"
-                  blurOnSubmit={false}
-                  autoFocus={false}
-                  importantForAutofill="no"
-                  textContentType="none"
-                  enablesReturnKeyAutomatically
-                  returnKeyType="send"
-                  scrollEnabled={false}
-                  onFocus={() => { isComposingRef.current = true; }}
-                  onBlur={() => { setTimeout(() => { isComposingRef.current = false; }, 50); }}
-                  onSubmitEditing={() => {
-                    const t = (draft || "").trim();
-                    if (!t) return;
-                    setDraft("");
-                    isComposingRef.current = false;
-                    sendMessage(t);
-                  }}
-                />
-                <TouchableOpacity
-                  style={styles.composerSend}
-                  onPress={() => {
-                    const t = (draft||"").trim();
-                    if (!t) return;
-                    setDraft("");
-                    isComposingRef.current = false;
-                    sendMessage(t);
-                  }}
-                  disabled={sendInFlight}
-                >
-                  <Text style={styles.composerSendTxt}>{sendInFlight ? "…" : "Send"}</Text>
-                </TouchableOpacity>
-              </View>
+              <Composer
+                draft={draft}
+                setDraft={setDraft}
+                sendMessage={sendMessage}
+                sendInFlight={sendInFlight}
+                isComposingRef={isComposingRef}
+              />
             </KeyboardAvoidingView>
           ) : (
-            <View style={styles.composerRow}>
-              <TextInput
-                value={draft}
-                onChangeText={(t) => { isComposingRef.current = true; setDraft(t); }}
-                placeholder="Type a message…"
-                placeholderTextColor="#AAA"
-                style={styles.composerInput}
-                autoCorrect={false}
-                autoCapitalize="none"
-                blurOnSubmit={false}
-                autoFocus={false}
-                importantForAutofill="no"
-                textContentType="none"
-                enablesReturnKeyAutomatically
-                returnKeyType="send"
-                scrollEnabled={false}
-                onFocus={() => { isComposingRef.current = true; }}
-                onBlur={() => { setTimeout(() => { isComposingRef.current = false; }, 50); }}
-                onSubmitEditing={() => {
-                  const t = (draft || "").trim();
-                  if (!t) return;
-                  setDraft("");
-                  isComposingRef.current = false;
-                  sendMessage(t);
-                }}
-              />
-              <TouchableOpacity
-                style={styles.composerSend}
-                onPress={() => {
-                  const t = (draft||"").trim();
-                  if (!t) return;
-                  setDraft("");
-                  isComposingRef.current = false;
-                  sendMessage(t);
-                }}
-                disabled={sendInFlight}
-              >
-                <Text style={styles.composerSendTxt}>{sendInFlight ? "…" : "Send"}</Text>
-              </TouchableOpacity>
-            </View>
+            <Composer
+              draft={draft}
+              setDraft={setDraft}
+              sendMessage={sendMessage}
+              sendInFlight={sendInFlight}
+              isComposingRef={isComposingRef}
+            />
           )}
         </View>
       </>
@@ -906,54 +824,152 @@ const ChatScreen = ({ navigation }) => {
   );
 };
 
+// ----- Composer -----
+const Composer = ({ draft, setDraft, sendMessage, sendInFlight, isComposingRef }) => {
+  return (
+    <View style={styles.composerRow}>
+      <TextInput
+        value={draft}
+        onChangeText={(t) => { isComposingRef.current = true; setDraft(t); }}
+        placeholder="Type a message…"
+        placeholderTextColor="#AAA"
+        style={styles.composerInput}
+        autoCorrect={false}
+        autoCapitalize="none"
+        blurOnSubmit={false}
+        autoFocus={false}
+        importantForAutofill="no"
+        textContentType="none"
+        enablesReturnKeyAutomatically
+        returnKeyType="send"
+        scrollEnabled={false}
+        onFocus={() => { isComposingRef.current = true; }}
+        onBlur={() => { setTimeout(() => { isComposingRef.current = false; }, 50); }}
+        onSubmitEditing={() => {
+          const t = (draft || "").trim();
+          if (!t) return;
+          setDraft("");
+          isComposingRef.current = false;
+          sendMessage(t);
+        }}
+      />
+      <TouchableOpacity
+        style={styles.composerSend}
+        onPress={() => {
+          const t = (draft||"").trim();
+          if (!t) return;
+          setDraft("");
+          isComposingRef.current = false;
+          sendMessage(t);
+        }}
+        disabled={sendInFlight}
+      >
+        <Text style={styles.composerSendTxt}>{sendInFlight ? "…" : "Send"}</Text>
+      </TouchableOpacity>
+    </View>
+  );
+};
+
 // ---------- styles ----------
 const styles = StyleSheet.create({
-  safeContainer: { flex: 1, backgroundColor: "#1E1E1E" },
-  container: { flex: 1, padding: 12 },
+  safeContainer: { flex: 1, backgroundColor: "#0F1012" },
 
-  convHeader: { flexDirection: "row", alignItems: "center", marginBottom: 8, paddingHorizontal: 12, paddingTop: 12 },
-  headerName: { color: "#FFF", fontSize: 18, fontWeight: "700", marginLeft: 8 },
+  // Header
+  convHeader: {
+    flexDirection: "row",
+    alignItems: "center",
+    paddingHorizontal: 12,
+    paddingTop: 6,
+    paddingBottom: 4,
+    borderBottomWidth: 1,
+    borderBottomColor: "rgba(255,255,255,0.06)",
+  },
+  headerName: { color: "#FFF", fontSize: 18, fontWeight: "800", flex: 1, textAlign: "center" },
 
-  backButton: { paddingHorizontal: 10, paddingVertical: 6, backgroundColor: "#333", borderRadius: 6, alignSelf: "flex-start" },
+  backButton: { paddingHorizontal: 10, paddingVertical: 6, backgroundColor: "#1C1E24", borderRadius: 8 },
   backText: { color: "#FFD700", fontSize: 16 },
 
-  loadingBanner: { flexDirection: "row", alignItems: "center", alignSelf: "center", marginBottom: 6 },
+  loadingBanner: { flexDirection: "row", alignItems: "center", alignSelf: "center", marginVertical: 6 },
   loadingBannerText: { color: "#BDBDBD", marginLeft: 8 },
 
-  sectionTitle: { color: "#BDBDBD", fontSize: 13, marginTop: 8, marginBottom: 6, paddingHorizontal: 12 },
+  sectionTitle: { color: "#AEB3BB", fontSize: 13, marginTop: 10, marginBottom: 6, paddingHorizontal: 12 },
 
   threadItem: {
     flexDirection: "row", alignItems: "center",
-    paddingVertical: 10, paddingHorizontal: 12, backgroundColor: "#272727",
-    borderRadius: 10, marginBottom: 8, marginHorizontal: 12,
+    paddingVertical: 10, paddingHorizontal: 12, backgroundColor: "#17181D",
+    borderRadius: 12, marginBottom: 8, marginHorizontal: 12,
+    borderWidth: 1, borderColor: "rgba(255,255,255,0.06)",
   },
-  avatar: { width: 42, height: 42, borderRadius: 21, backgroundColor: "#3A3A3A", alignItems: "center", justifyContent: "center", marginRight: 10 },
-  avatarTxt: { color: "#FFD700", fontWeight: "800", fontSize: 16 },
+  avatar: { width: 42, height: 42, borderRadius: 21, backgroundColor: "#242733", alignItems: "center", justifyContent: "center", marginRight: 10 },
+  avatarTxt: { color: "#FFD700", fontWeight: "900", fontSize: 16 },
   threadTextCol: { flex: 1 },
   threadTopRow: { flexDirection: "row", alignItems: "center", justifyContent: "space-between" },
-  threadName: { color: "#FFF", fontSize: 15, fontWeight: "700", flex: 1, marginRight: 8 },
-  threadTime: { color: "#888", fontSize: 12 },
+  threadName: { color: "#FFF", fontSize: 15, fontWeight: "800", flex: 1, marginRight: 8 },
+  threadTime: { color: "#8A8F98", fontSize: 12 },
   threadBottomRow: { flexDirection: "row", alignItems: "center", justifyContent: "space-between", marginTop: 2 },
-  threadPreview: { color: "#BEBEBE", fontSize: 13, flex: 1, marginRight: 8 },
+  threadPreview: { color: "#C0C5CF", fontSize: 13, flex: 1, marginRight: 8 },
   unreadBadge: { minWidth: 20, paddingHorizontal: 6, height: 20, borderRadius: 10, backgroundColor: "#E63946", alignItems: "center", justifyContent: "center" },
-  unreadTxt: { color: "#FFF", fontWeight: "700", fontSize: 12 },
+  unreadTxt: { color: "#FFF", fontWeight: "800", fontSize: 12 },
 
-  searchInput: { backgroundColor: "#222", padding: 12, color: "#FFF", borderRadius: 10, marginHorizontal: 12 },
-  userItem: { padding: 12, backgroundColor: "#2C2C2C", borderRadius: 8, marginBottom: 8, marginHorizontal: 12 },
-  userText: { color: "#FFF", fontSize: 15 },
+  searchInput: {
+    backgroundColor: "#17181D",
+    padding: 12,
+    color: "#FFF",
+    borderRadius: 12,
+    marginHorizontal: 12,
+    borderWidth: 1,
+    borderColor: "rgba(255,255,255,0.06)",
+  },
+  userItem: { padding: 12, backgroundColor: "#17181D", borderRadius: 12, marginBottom: 8, marginHorizontal: 12, borderWidth: 1, borderColor: "rgba(255,255,255,0.06)" },
+  userText: { color: "#FFF", fontSize: 15, fontWeight: "600" },
 
-  // Chat bubbles
-  bubble: { maxWidth: "78%", marginVertical: 4, padding: 10, borderRadius: 10, marginHorizontal: 12 },
-  bubbleMine: { alignSelf: "flex-end", backgroundColor: "#3a3f5a" },
-  bubbleTheirs: { alignSelf: "flex-start", backgroundColor: "#2f2f2f" },
-  bubbleText: { color: "#fff", fontSize: 15 },
-  bubbleTime: { color: "#ccc", fontSize: 11, marginTop: 4, alignSelf: "flex-end" },
+  messagesList: { flex: 1, backgroundColor: "#0F1012" },
+  messagesListContent: { paddingHorizontal: 8, paddingBottom: 6, paddingTop: 8 },
 
-  // Composer
-  composerRow: { flexDirection: "row", alignItems: "center", gap: 8, paddingTop: 8, paddingHorizontal: 12, paddingBottom: 10, backgroundColor: "#1E1E1E" },
-  composerInput: { flex: 1, backgroundColor: "#333", borderRadius: 10, paddingHorizontal: 12, paddingVertical: 10, color: "#FFF" },
-  composerSend: { paddingHorizontal: 14, paddingVertical: 10, backgroundColor: "#4B6BFB", borderRadius: 10, marginLeft: 6 },
-  composerSendTxt: { color: "#FFF", fontWeight: "700" },
+  bubble: {
+    maxWidth: "90%",
+    marginVertical: 5,
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+    borderRadius: 16,
+    marginHorizontal: 6,
+  },
+  bubbleMine: {
+    alignSelf: "flex-end",
+    backgroundColor: "#3E4A76",
+  },
+  bubbleTheirs: {
+    alignSelf: "flex-start",
+    backgroundColor: "#1C1E24",
+    borderWidth: 1,
+    borderColor: "rgba(255,255,255,0.06)",
+  },
+  bubbleText: { color: "#fff", fontSize: 16, lineHeight: 22 },
+  bubbleTime: { color: "#D6DAE3", opacity: 0.7, fontSize: 11, marginTop: 4, alignSelf: "flex-end" },
+
+  composerRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8,
+    paddingHorizontal: 10,
+    paddingVertical: 8,
+    backgroundColor: "#0F1012",
+    borderTopWidth: 1,
+    borderTopColor: "rgba(255,255,255,0.06)",
+  },
+  composerInput: {
+    flex: 1,
+    backgroundColor: "#17181D",
+    borderRadius: 16,
+    paddingHorizontal: 14,
+    paddingVertical: Platform.select({ ios: 10, android: 9, default: 9 }),
+    color: "#FFF",
+    fontSize: 16,
+    borderWidth: 1,
+    borderColor: "rgba(255,255,255,0.08)",
+  },
+  composerSend: { paddingHorizontal: 14, paddingVertical: 10, backgroundColor: "#4B6BFB", borderRadius: 14 },
+  composerSendTxt: { color: "#FFF", fontWeight: "800" },
 });
 
 export default ChatScreen;
