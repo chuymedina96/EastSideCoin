@@ -15,13 +15,12 @@ import {
   Easing,
   Share,
 } from "react-native";
-import AsyncStorage from "@react-native-async-storage/async-storage";
-import axios from "axios";
 import * as Clipboard from "expo-clipboard";
 import QRCode from "react-native-qrcode-svg";
-import { AuthContext } from "../context/AuthProvider";
-import { API_URL } from "../config";
 import { SafeAreaView } from "react-native-safe-area-context";
+import { useFocusEffect } from "@react-navigation/native";
+import { AuthContext } from "../context/AuthProvider";
+import { walletBalance, fetchUserPublicKey } from "../utils/api"; // ✅ api wrapper
 
 const THEME = {
   bg: "#101012",
@@ -51,6 +50,9 @@ const ProfileScreen = () => {
   const [loadingBalance, setLoadingBalance] = useState(true);
   const [showFullAddr, setShowFullAddr] = useState(false);
 
+  // 🔑 live key status (server-refreshed)
+  const [keysReady, setKeysReady] = useState(Boolean(user?.public_key));
+
   const [qrOpen, setQrOpen] = useState(false);
 
   // subtle float accents
@@ -77,46 +79,61 @@ const ProfileScreen = () => {
     return (parts[0]?.[0] || "").toUpperCase() + (parts[1]?.[0] || "").toUpperCase();
   }, [displayName, user?.email]);
 
-  const withAuth = useCallback(async () => {
-    const token = await AsyncStorage.getItem("authToken");
-    return axios.create({
-      baseURL: API_URL, // should include /api
-      headers: { Authorization: `Bearer ${token}` },
-      timeout: 15000,
-    });
-  }, []);
-
   const loadBalance = useCallback(async () => {
     try {
       setLoadingBalance(true);
-      const client = await withAuth();
-      const { data } = await client.get("/wallet/balance/");
+      const data = await walletBalance();
       setAddress(data?.address || user?.wallet_address || "");
-      setBalance(typeof data?.balance === "number" ? data.balance : Number(data?.balance ?? 0));
+      const b = typeof data?.balance === "number" ? data.balance : Number(data?.balance ?? 0);
+      setBalance(Number.isFinite(b) ? b : 0);
     } catch (e) {
-      console.warn("Balance fetch error:", e?.response?.data || e?.message || e);
+      console.warn("Balance fetch error:", e?.data || e?.message || e);
       if (balance == null) setBalance(0);
     } finally {
       setLoadingBalance(false);
     }
-  }, [withAuth, user?.wallet_address, balance]);
+  }, [user?.wallet_address, balance]);
+
+  // 🔑 fetch latest key status from server
+  const refreshKeyStatus = useCallback(async () => {
+    if (!user?.id) return;
+    try {
+      const data = await fetchUserPublicKey(user.id); // expects { public_key: "-----BEGIN..." } or { public_key: null }
+      setKeysReady(Boolean(data?.public_key));
+    } catch (e) {
+      // If server check fails, keep whatever we had (fallback to context snapshot)
+      setKeysReady((prev) => prev || Boolean(user?.public_key));
+      console.warn("Key status check failed:", e?.data || e?.message || e);
+    }
+  }, [user?.id, user?.public_key]);
+
+  // boot
+  useEffect(() => {
+    loadBalance();
+    refreshKeyStatus();
+  }, [loadBalance, refreshKeyStatus]);
+
+  // refresh on screen focus (fixes post-registration stale UI)
+  useFocusEffect(
+    useCallback(() => {
+      refreshKeyStatus();
+      // Optional: also refresh balance when focusing profile
+      // loadBalance();
+    }, [refreshKeyStatus])
+  );
 
   const onRefresh = useCallback(async () => {
     setRefreshing(true);
-    await loadBalance();
+    await Promise.all([loadBalance(), refreshKeyStatus()]);
     setRefreshing(false);
-  }, [loadBalance]);
-
-  useEffect(() => {
-    loadBalance();
-  }, [loadBalance]);
+  }, [loadBalance, refreshKeyStatus]);
 
   const handleCopy = async () => {
     if (!address) return;
     try {
       await Clipboard.setStringAsync(address);
       Alert.alert("Copied", "Wallet address copied to clipboard.");
-    } catch (e) {
+    } catch {
       // noop
     }
   };
@@ -200,10 +217,8 @@ const ProfileScreen = () => {
                   {user?.is_vip ? "VIP" : "Member"}
                 </Text>
               </View>
-              <View style={[styles.badge, user?.public_key ? styles.badgeOk : styles.badgeWarn]}>
-                <Text style={styles.badgeText}>
-                  {user?.public_key ? "Keys: Set" : "Keys: Not Set"}
-                </Text>
+              <View style={[styles.badge, keysReady ? styles.badgeOk : styles.badgeWarn]}>
+                <Text style={styles.badgeText}>{keysReady ? "Keys: Set" : "Keys: Not Set"}</Text>
               </View>
             </View>
           </View>
@@ -243,9 +258,7 @@ const ProfileScreen = () => {
               <Text style={styles.ghostBtnText}>QR</Text>
             </TouchableOpacity>
           </View>
-          <Text style={styles.subtle}>
-            Tip: Long-press the address to toggle full/short view.
-          </Text>
+          <Text style={styles.subtle}>Tip: Long-press the address to toggle full/short view.</Text>
         </View>
 
         {/* Account actions */}
@@ -258,11 +271,7 @@ const ProfileScreen = () => {
             disabled={anyBusy}
             accessibilityLabel="Log out"
           >
-            {isLoggingOut ? (
-              <ActivityIndicator color="#FFF" />
-            ) : (
-              <Text style={styles.primaryBtnText}>Logout</Text>
-            )}
+            {isLoggingOut ? <ActivityIndicator color="#FFF" /> : <Text style={styles.primaryBtnText}>Logout</Text>}
           </TouchableOpacity>
 
           <TouchableOpacity
@@ -271,11 +280,7 @@ const ProfileScreen = () => {
             disabled={anyBusy}
             accessibilityLabel="Delete account"
           >
-            {isDeleting ? (
-              <ActivityIndicator color="#FFF" />
-            ) : (
-              <Text style={styles.primaryBtnText}>Delete Account</Text>
-            )}
+            {isDeleting ? <ActivityIndicator color="#FFF" /> : <Text style={styles.primaryBtnText}>Delete Account</Text>}
           </TouchableOpacity>
 
           <Text style={styles.disclaimer}>
@@ -320,14 +325,7 @@ const styles = StyleSheet.create({
   scrollContent: { padding: 16, paddingBottom: 28 },
 
   // accents
-  accent: {
-    position: "absolute",
-    width: 320,
-    height: 320,
-    borderRadius: 999,
-    opacity: 0.10,
-    zIndex: -1,
-  },
+  accent: { position: "absolute", width: 320, height: 320, borderRadius: 999, opacity: 0.10, zIndex: -1 },
   accentTop: { top: -80, right: -70, backgroundColor: THEME.accentGold },
   accentBottom: { bottom: -100, left: -80, backgroundColor: THEME.accentOrange },
 
@@ -352,7 +350,7 @@ const styles = StyleSheet.create({
   },
   avatarText: { color: THEME.accentGold, fontWeight: "900", fontSize: 22, letterSpacing: 1 },
   name: { color: THEME.text, fontSize: 20, fontWeight: "800" },
-  email: { color: THEME.subtle, marginTop: 2 },
+  email: { color: THEME.subtext, marginTop: 2 },
 
   badgesRow: { flexDirection: "row", gap: 8, marginTop: 8 },
   badge: {
