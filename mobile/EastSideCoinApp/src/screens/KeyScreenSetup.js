@@ -1,19 +1,28 @@
 // screens/KeyScreenSetup.js
-import React, { useState, useEffect, useRef } from "react";
+import React, { useState, useEffect, useRef, useContext } from "react";
 import {
-  View, Text, ActivityIndicator, Alert, ToastAndroid,
-  Animated, StyleSheet, Platform, InteractionManager
+  View,
+  Text,
+  ActivityIndicator,
+  Alert,
+  ToastAndroid,
+  Animated,
+  StyleSheet,
+  Platform,
+  InteractionManager,
 } from "react-native";
 import AsyncStorage from "@react-native-async-storage/async-storage";
-import { resetNavigation } from "../navigation/NavigationService";
 import {
   isKeysReady,
   generateAndUploadKeys,
   loadPrivateKeyForUser,
   loadPublicKeyForUser,
 } from "../utils/keyManager";
+import { AuthContext } from "../context/AuthProvider";
 
 const KeyScreenSetup = () => {
+  const { setKeysReady, refreshUser } = useContext(AuthContext);
+
   const [loading, setLoading] = useState(true);
   const [errorMsg, setErrorMsg] = useState("");
 
@@ -26,7 +35,7 @@ const KeyScreenSetup = () => {
   const pctRef = useRef(0);
   const [pct, setPct] = useState(0);
   const mountedRef = useRef(true);
-  const startedRef = useRef(false); // prevent double runs
+  const startedRef = useRef(false);
 
   const setPctSafe = (v) => {
     if (!mountedRef.current) return;
@@ -35,7 +44,7 @@ const KeyScreenSetup = () => {
   };
 
   const animateTo = (toValue, duration = 220) => {
-    const next = Math.max(pctRef.current, toValue); // never regress
+    const next = Math.max(pctRef.current, toValue);
     Animated.timing(progress, { toValue: next, duration, useNativeDriver: false }).start();
     setPctSafe(next);
   };
@@ -44,8 +53,6 @@ const KeyScreenSetup = () => {
     if (Platform.OS === "android") ToastAndroid.show(msg, ToastAndroid.SHORT);
     else Alert.alert("Info", msg);
   };
-
-  const routeHome = () => resetNavigation("HomeTabs");
 
   const stage = async (nextPct, title, sub, minMs = 240) => {
     if (!mountedRef.current) return;
@@ -57,6 +64,15 @@ const KeyScreenSetup = () => {
     if (elapsed < minMs) await new Promise((r) => setTimeout(r, Math.max(0, minMs - elapsed)));
   };
 
+  // ⬇️ refresh profile first, THEN flip keysReady so navigator sees fresh flags
+  const finishAndFlipTree = async () => {
+    try {
+      await refreshUser();
+    } catch {}
+    setKeysReady(true);
+    // Do not navigate here; AppNavigator remounts to Onboarding/HomeTabs.
+  };
+
   const runGenerate = async (attempt = 1) => {
     if (!mountedRef.current) return;
     if (attempt === 1) setLoading(true);
@@ -65,9 +81,8 @@ const KeyScreenSetup = () => {
       const rawUser = await AsyncStorage.getItem("user");
       const authToken = await AsyncStorage.getItem("authToken");
       const user = rawUser ? JSON.parse(rawUser) : null;
-
       if (!user?.id || !authToken) {
-        resetNavigation("Login");
+        // AppNavigator will swap to Auth tree automatically
         return;
       }
 
@@ -88,7 +103,6 @@ const KeyScreenSetup = () => {
       });
 
       await stage(90, "Verifying setup…", "Finishing sync with your account…");
-
       await loadPrivateKeyForUser(user.id);
       await loadPublicKeyForUser(user.id);
 
@@ -97,18 +111,17 @@ const KeyScreenSetup = () => {
 
       await stage(100, "All set! 🔐", "End-to-end encryption is now enabled.");
       toast("Keys generated on this device.");
-      routeHome();
+
+      await finishAndFlipTree();
     } catch (err) {
       if (!mountedRef.current) return;
       console.error("❌ Key setup failed:", err?.response?.data || err?.message || err);
-
       if (attempt < 2) {
         setErrorMsg("Something went wrong setting up your secure account. Retrying…");
         await new Promise((r) => setTimeout(r, 900));
         setErrorMsg("");
         return runGenerate(attempt + 1);
       }
-
       setErrorMsg("We couldn’t finish setup. Please reopen the app to try again.");
     } finally {
       if (mountedRef.current && attempt === 1) setLoading(false);
@@ -117,43 +130,35 @@ const KeyScreenSetup = () => {
 
   useEffect(() => {
     mountedRef.current = true;
-
     (async () => {
       try {
         const rawUser = await AsyncStorage.getItem("user");
         const user = rawUser ? JSON.parse(rawUser) : null;
         if (!user?.id) {
-          resetNavigation("Login");
           return;
         }
 
         const ready = await isKeysReady(user.id);
         if (ready) {
-          // Keys already there—hydrate legacy slots then go home.
           await loadPrivateKeyForUser(user.id);
           await loadPublicKeyForUser(user.id);
-          routeHome();
+          await finishAndFlipTree();
           return;
         }
 
-        // ✅ Let the screen render FIRST, then kick off heavy work.
         if (!startedRef.current) {
           startedRef.current = true;
           InteractionManager.runAfterInteractions(() => {
-            // small timeout to ensure first paint + 10% shows
             setTimeout(() => runGenerate(1), 0);
           });
         }
       } catch (e) {
-        console.warn("KeyScreenSetup init error:", e?.message || e);
         setErrorMsg("We hit a snag starting your secure setup. Please reopen the app.");
       }
     })();
-
     return () => {
       mountedRef.current = false;
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   return (
@@ -161,8 +166,7 @@ const KeyScreenSetup = () => {
       <View style={styles.card}>
         <Text style={styles.title}>{headline}</Text>
         <Text style={styles.subtitle}>{detail}</Text>
-
-        <View style={styles.progressBar}>
+        <View className="progressBar" style={styles.progressBar}>
           <Animated.View
             style={[
               styles.progressFill,
@@ -176,9 +180,7 @@ const KeyScreenSetup = () => {
           />
         </View>
         <Text style={styles.percent}>{Math.round(pct)}%</Text>
-
         {loading && <ActivityIndicator size="small" color="#FFD700" style={{ marginTop: 12 }} />}
-
         {!!errorMsg && <Text style={styles.error}>{errorMsg}</Text>}
       </View>
     </View>

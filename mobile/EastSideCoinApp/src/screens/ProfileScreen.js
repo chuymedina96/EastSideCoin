@@ -14,13 +14,17 @@ import {
   Animated,
   Easing,
   Share,
+  Image,
+  Platform,
 } from "react-native";
 import * as Clipboard from "expo-clipboard";
 import QRCode from "react-native-qrcode-svg";
 import { SafeAreaView } from "react-native-safe-area-context";
 import { useFocusEffect } from "@react-navigation/native";
 import { AuthContext } from "../context/AuthProvider";
-import { walletBalance, fetchUserPublicKey } from "../utils/api"; // ✅ api wrapper
+import { walletBalance, fetchUserPublicKey, fetchMe } from "../utils/api";
+import { API_URL } from "../config";
+import avatarPlaceholder from "../../assets/avatar-placeholder.png"; // ✅ root-level assets (../../ from src/screens)
 
 const THEME = {
   bg: "#101012",
@@ -35,25 +39,53 @@ const THEME = {
   ok: "#2f8f46",
 };
 
+// Helper: absolute URL + cache-bust
+function resolveAvatarUri(me, fallback) {
+  const raw = me?.avatar_url || fallback || "";
+  if (!raw) return null;
+
+  const lower = raw.toLowerCase();
+  const isAbsolute =
+    lower.startsWith("http://") ||
+    lower.startsWith("https://") ||
+    lower.startsWith("data:") ||
+    lower.startsWith("file:") ||
+    lower.startsWith("content:");
+
+  const base = isAbsolute ? raw : `${API_URL.replace(/\/+$/, "")}/${raw.replace(/^\/+/, "")}`;
+
+  // Use server timestamp if present; fallback to now
+  const ts = me?.avatar_updated_at || me?.updated_at || me?.profile_updated_at || Date.now();
+  const sep = base.includes("?") ? "&" : "?";
+  return `${base}${sep}t=${encodeURIComponent(String(ts))}`;
+}
+
 const trimAddr = (a, len = 10) =>
   a?.length > 2 * len ? `${a.slice(0, len)}…${a.slice(-len)}` : a || "";
 
 const ProfileScreen = () => {
-  const { user, logoutUser, deleteAccountAndLogout } = useContext(AuthContext);
+  const { user: authUser, logoutUser, deleteAccountAndLogout, accessToken } = useContext(AuthContext);
+
+  // server-fresh profile (from /me/)
+  const [me, setMe] = useState(null);
 
   const [isLoggingOut, setIsLoggingOut] = useState(false);
   const [isDeleting, setIsDeleting] = useState(false);
 
   const [balance, setBalance] = useState(null);
-  const [address, setAddress] = useState(user?.wallet_address || "");
+  const [address, setAddress] = useState(authUser?.wallet_address || "");
   const [refreshing, setRefreshing] = useState(false);
   const [loadingBalance, setLoadingBalance] = useState(true);
   const [showFullAddr, setShowFullAddr] = useState(false);
 
   // 🔑 live key status (server-refreshed)
-  const [keysReady, setKeysReady] = useState(Boolean(user?.public_key));
+  const [keysReady, setKeysReady] = useState(Boolean(authUser?.public_key));
 
   const [qrOpen, setQrOpen] = useState(false);
+
+  // avatar states
+  const [avatarError, setAvatarError] = useState(false);
+  const [avatarBust, setAvatarBust] = useState(0); // bump to force reload
 
   // subtle float accents
   const float = useRef(new Animated.Value(0)).current;
@@ -67,84 +99,117 @@ const ProfileScreen = () => {
   }, [float]);
   const floatY = float.interpolate({ inputRange: [0, 1], outputRange: [0, -3] });
 
-  const displayName = useMemo(() => {
-    if (!user) return "";
-    const name = [user.first_name, user.last_name].filter(Boolean).join(" ").trim();
-    return name || user.email || "";
-  }, [user]);
-
-  const initials = useMemo(() => {
-    const parts = displayName.split(" ").filter(Boolean);
-    if (parts.length === 0 && user?.email) return user.email.slice(0, 2).toUpperCase();
-    return (parts[0]?.[0] || "").toUpperCase() + (parts[1]?.[0] || "").toUpperCase();
-  }, [displayName, user?.email]);
+  // --------- data loaders ----------
+  const loadMe = useCallback(async () => {
+    try {
+      const data = await fetchMe(); // { id, email, first_name, last_name, avatar_url, avatar_updated_at, bio, ... }
+      setMe(data);
+      // keep address in sync if server returns wallet
+      if (data?.wallet_address && data.wallet_address !== address) {
+        setAddress(data.wallet_address);
+      }
+      // update keys badge if server exposes public_key in /me/
+      if (typeof data?.public_key !== "undefined") {
+        setKeysReady(Boolean(data.public_key));
+      }
+      // on fresh fetch, reset avatar error and bump cache if server timestamp changed
+      setAvatarError(false);
+      setAvatarBust((b) => b + 1);
+    } catch (e) {
+      console.warn("fetchMe error:", e?.data || e?.message || e);
+      // keep previous me if fails
+    }
+  }, [address]);
 
   const loadBalance = useCallback(async () => {
     try {
       setLoadingBalance(true);
       const data = await walletBalance();
-      setAddress(data?.address || user?.wallet_address || "");
+      setAddress(data?.address || me?.wallet_address || authUser?.wallet_address || "");
       const b = typeof data?.balance === "number" ? data.balance : Number(data?.balance ?? 0);
       setBalance(Number.isFinite(b) ? b : 0);
     } catch (e) {
       console.warn("Balance fetch error:", e?.data || e?.message || e);
-      if (balance == null) setBalance(0);
+      setBalance((prev) => (prev == null ? 0 : prev));
     } finally {
       setLoadingBalance(false);
     }
-  }, [user?.wallet_address, balance]);
+  }, [me?.wallet_address, authUser?.wallet_address]);
 
-  // 🔑 fetch latest key status from server
+  // 🔑 fetch latest key status from server (dedicated)
   const refreshKeyStatus = useCallback(async () => {
-    if (!user?.id) return;
+    const id = me?.id || authUser?.id;
+    if (!id) return;
     try {
-      const data = await fetchUserPublicKey(user.id); // expects { public_key: "-----BEGIN..." } or { public_key: null }
+      const data = await fetchUserPublicKey(id); // { public_key } or { public_key: null }
       setKeysReady(Boolean(data?.public_key));
-    } catch (e) {
-      // If server check fails, keep whatever we had (fallback to context snapshot)
-      setKeysReady((prev) => prev || Boolean(user?.public_key));
-      console.warn("Key status check failed:", e?.data || e?.message || e);
+    } catch {
+      // If endpoint not available for self/non-self, fall back to what we know
+      setKeysReady((prev) => prev || Boolean(me?.public_key || authUser?.public_key));
     }
-  }, [user?.id, user?.public_key]);
+  }, [me?.id, me?.public_key, authUser?.id, authUser?.public_key]);
 
   // boot
   useEffect(() => {
+    loadMe();
     loadBalance();
     refreshKeyStatus();
-  }, [loadBalance, refreshKeyStatus]);
+  }, [loadMe, loadBalance, refreshKeyStatus]);
 
   // refresh on screen focus (fixes post-registration stale UI)
   useFocusEffect(
     useCallback(() => {
+      loadMe();
       refreshKeyStatus();
-      // Optional: also refresh balance when focusing profile
-      // loadBalance();
-    }, [refreshKeyStatus])
+      // optionally: loadBalance();
+    }, [loadMe, refreshKeyStatus])
   );
 
   const onRefresh = useCallback(async () => {
     setRefreshing(true);
-    await Promise.all([loadBalance(), refreshKeyStatus()]);
+    await Promise.all([loadMe(), loadBalance(), refreshKeyStatus()]);
     setRefreshing(false);
-  }, [loadBalance, refreshKeyStatus]);
+  }, [loadMe, loadBalance, refreshKeyStatus]);
 
+  // --------- computed display ----------
+  const profile = me || authUser || {};
+  const displayName = useMemo(() => {
+    const name = [profile.first_name, profile.last_name].filter(Boolean).join(" ").trim();
+    return name || profile.email || "";
+  }, [profile.first_name, profile.last_name, profile.email]);
+
+  const initials = useMemo(() => {
+    const parts = displayName.split(" ").filter(Boolean);
+    if (parts.length === 0 && profile?.email) return profile.email.slice(0, 2).toUpperCase();
+    return (parts[0]?.[0] || "").toUpperCase() + (parts[1]?.[0] || "").toUpperCase();
+  }, [displayName, profile?.email]);
+
+  // Final avatar uri with cache-bust + manual bump
+  const avatarUriBase = resolveAvatarUri(me, authUser?.avatar_url);
+  const avatarUri = avatarUriBase
+    ? `${avatarUriBase}${avatarUriBase.includes("?") ? "&" : "?"}b=${avatarBust}`
+    : null;
+
+  // Optional auth header for protected media endpoints
+  const imageHeaders = useMemo(() => {
+    if (!accessToken) return undefined;
+    return { Authorization: `Bearer ${accessToken}` };
+  }, [accessToken]);
+
+  // --------- actions ----------
   const handleCopy = async () => {
     if (!address) return;
     try {
       await Clipboard.setStringAsync(address);
       Alert.alert("Copied", "Wallet address copied to clipboard.");
-    } catch {
-      // noop
-    }
+    } catch { /* noop */ }
   };
 
   const handleShare = async () => {
     if (!address) return;
     try {
       await Share.share({ message: `My ESC address: ${address}` });
-    } catch {
-      // noop
-    }
+    } catch { /* noop */ }
   };
 
   const handleLogout = async () => {
@@ -186,6 +251,15 @@ const ProfileScreen = () => {
 
   const anyBusy = isLoggingOut || isDeleting;
 
+  const onAvatarError = () => {
+    setAvatarError(true);
+  };
+
+  const reloadAvatar = () => {
+    setAvatarError(false);
+    setAvatarBust((b) => b + 1);
+  };
+
   return (
     <SafeAreaView style={styles.safe}>
       {/* accents */}
@@ -197,34 +271,105 @@ const ProfileScreen = () => {
         refreshControl={<RefreshControl refreshing={refreshing} onRefresh={onRefresh} tintColor={THEME.accentGold} />}
         keyboardShouldPersistTaps="handled"
       >
-        {/* Header / avatar */}
-        <View style={styles.headerCard}>
-          <View style={styles.avatar}>
-            <Text style={styles.avatarText}>{initials}</Text>
-          </View>
-          <View style={{ flex: 1, marginLeft: 12 }}>
-            <Text style={styles.name} numberOfLines={1}>
-              {displayName || "Your Profile"}
-            </Text>
-            {!!user?.email && (
-              <Text style={styles.email} numberOfLines={1}>
-                {user.email}
-              </Text>
+        {/* Big centered avatar */}
+        <View style={styles.avatarSection}>
+          <View style={styles.bigAvatarWrap}>
+            {avatarUri && !avatarError ? (
+              <Image
+                // key ensures React re-renders when cache-busting value changes
+                key={avatarUri}
+                source={{ uri: avatarUri, headers: imageHeaders }}
+                style={styles.bigAvatarImg}
+                resizeMode="cover"
+                onError={onAvatarError}
+                // iOS only default placeholder
+                defaultSource={Platform.OS === "ios" ? avatarPlaceholder : undefined}
+              />
+            ) : (
+              <View style={styles.bigAvatarFallback}>
+                <Text style={styles.bigAvatarText}>{initials}</Text>
+              </View>
             )}
-            <View style={styles.badgesRow}>
-              <View style={[styles.badge, user?.is_vip ? styles.badgeVip : styles.badgeDim]}>
-                <Text style={[styles.badgeText, user?.is_vip ? styles.badgeTextVip : null]}>
-                  {user?.is_vip ? "VIP" : "Member"}
-                </Text>
-              </View>
-              <View style={[styles.badge, keysReady ? styles.badgeOk : styles.badgeWarn]}>
-                <Text style={styles.badgeText}>{keysReady ? "Keys: Set" : "Keys: Not Set"}</Text>
-              </View>
-            </View>
           </View>
+          <Text style={styles.nameCenter} numberOfLines={1}>
+            {displayName || "Your Profile"}
+          </Text>
+          {!!profile?.email && (
+            <Text style={styles.emailCenter} numberOfLines={1}>
+              {profile.email}
+            </Text>
+          )}
+
+          {/* Badges under the name */}
+          <View style={[styles.badgesRow, { justifyContent: "center", marginTop: 10 }]}>
+            <View style={[styles.badge, profile?.is_vip ? styles.badgeVip : styles.badgeDim]}>
+              <Text style={[styles.badgeText, profile?.is_vip ? styles.badgeTextVip : null]}>
+                {profile?.is_vip ? "VIP" : "Member"}
+              </Text>
+            </View>
+            <View style={[styles.badge, keysReady ? styles.badgeOk : styles.badgeWarn]}>
+              <Text style={styles.badgeText}>{keysReady ? "Keys: Set" : "Keys: Not Set"}</Text>
+            </View>
+            {profile?.onboarding_completed ? (
+              <View style={[styles.badge, styles.badgeOk]}>
+                <Text style={styles.badgeText}>Onboarding: Done</Text>
+              </View>
+            ) : null}
+          </View>
+
+          {/* Quick avatar reload */}
+          <TouchableOpacity onPress={reloadAvatar} style={[styles.ghostBtn, { marginTop: 12 }]}>
+            <Text style={styles.ghostBtnText}>Reload Photo</Text>
+          </TouchableOpacity>
         </View>
 
-        {/* Balance */}
+        {/* Profile details */}
+        <View style={styles.card}>
+          <Text style={styles.cardHeader}>Profile</Text>
+
+          {!!profile?.bio && (
+            <>
+              <Text style={styles.fieldLabel}>Bio</Text>
+              <Text style={styles.fieldValue}>{profile.bio}</Text>
+            </>
+          )}
+
+          <View style={styles.grid}>
+            {!!profile?.neighborhood && (
+              <View style={styles.gridItem}>
+                <Text style={styles.fieldLabel}>Neighborhood</Text>
+                <Text style={styles.fieldValue}>{profile.neighborhood}</Text>
+              </View>
+            )}
+            {!!profile?.age && (
+              <View style={styles.gridItem}>
+                <Text style={styles.fieldLabel}>Age</Text>
+                <Text style={styles.fieldValue}>{String(profile.age)}</Text>
+              </View>
+            )}
+          </View>
+
+          <View style={styles.grid}>
+            {!!profile?.languages && (
+              <View style={styles.gridItem}>
+                <Text style={styles.fieldLabel}>Languages</Text>
+                <Text style={styles.fieldValue}>{profile.languages}</Text>
+              </View>
+            )}
+            {!!profile?.skills && (
+              <View style={styles.gridItem}>
+                <Text style={styles.fieldLabel}>Skills</Text>
+                <Text style={styles.fieldValue}>{profile.skills}</Text>
+              </View>
+            )}
+          </View>
+
+          {!profile?.bio && !profile?.neighborhood && !profile?.languages && !profile?.skills && !profile?.age ? (
+            <Text style={styles.subtle}>No profile details yet. Add your info in onboarding or profile edit.</Text>
+          ) : null}
+        </View>
+
+        {/* Wallet */}
         <View style={styles.card}>
           <View style={styles.cardHeaderRow}>
             <Text style={styles.cardHeader}>Wallet</Text>
@@ -320,39 +465,50 @@ const ProfileScreen = () => {
 export default ProfileScreen;
 
 /* ======= styles ======= */
+const BIG_AVATAR = 160;
+
 const styles = StyleSheet.create({
   safe: { flex: 1, backgroundColor: THEME.bg },
-  scrollContent: { padding: 16, paddingBottom: 28 },
+  scrollContent: { padding: 16, paddingBottom: 40 },
 
   // accents
-  accent: { position: "absolute", width: 320, height: 320, borderRadius: 999, opacity: 0.10, zIndex: -1 },
-  accentTop: { top: -80, right: -70, backgroundColor: THEME.accentGold },
-  accentBottom: { bottom: -100, left: -80, backgroundColor: THEME.accentOrange },
+  accent: { position: "absolute", width: 340, height: 340, borderRadius: 999, opacity: 0.10, zIndex: -1 },
+  accentTop: { top: -100, right: -70, backgroundColor: THEME.accentGold },
+  accentBottom: { bottom: -120, left: -80, backgroundColor: THEME.accentOrange },
 
-  headerCard: {
-    flexDirection: "row",
+  // avatar (centered hero)
+  avatarSection: {
     alignItems: "center",
-    backgroundColor: THEME.card,
-    borderColor: THEME.border,
-    borderWidth: 1,
-    borderRadius: 16,
-    padding: 14,
+    justifyContent: "center",
+    marginBottom: 24,
+    marginTop: 12,
   },
-  avatar: {
-    width: 64,
-    height: 64,
-    borderRadius: 999,
+  bigAvatarWrap: {
+    width: BIG_AVATAR,
+    height: BIG_AVATAR,
+    borderRadius: BIG_AVATAR / 2,
+    overflow: "hidden",
+    borderWidth: 3,
+    borderColor: THEME.accentGold,
     backgroundColor: "#23242c",
-    borderWidth: 1,
-    borderColor: THEME.border,
     alignItems: "center",
     justifyContent: "center",
   },
-  avatarText: { color: THEME.accentGold, fontWeight: "900", fontSize: 22, letterSpacing: 1 },
-  name: { color: THEME.text, fontSize: 20, fontWeight: "800" },
-  email: { color: THEME.subtext, marginTop: 2 },
+  bigAvatarImg: {
+    width: "100%",
+    height: "100%",
+  },
+  bigAvatarFallback: {
+    width: "100%",
+    height: "100%",
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  bigAvatarText: { color: THEME.accentGold, fontWeight: "900", fontSize: 42, letterSpacing: 1 },
+  nameCenter: { color: THEME.text, fontSize: 22, fontWeight: "900", marginTop: 12, textAlign: "center" },
+  emailCenter: { color: THEME.subtext, textAlign: "center", marginTop: 4 },
 
-  badgesRow: { flexDirection: "row", gap: 8, marginTop: 8 },
+  badgesRow: { flexDirection: "row", gap: 8, marginTop: 8, flexWrap: "wrap" },
   badge: {
     paddingHorizontal: 10,
     paddingVertical: 6,
@@ -368,6 +524,7 @@ const styles = StyleSheet.create({
   badgeWarn: { borderColor: "#7a4a00", backgroundColor: "#2a1e10" },
   badgeText: { color: THEME.subtext, fontSize: 12, fontWeight: "700" },
 
+  // cards
   card: {
     backgroundColor: THEME.card,
     borderColor: THEME.border,
@@ -393,6 +550,7 @@ const styles = StyleSheet.create({
   },
   smallBtnText: { color: THEME.accentGold, fontWeight: "700" },
 
+  // wallet
   balanceRow: { flexDirection: "row", alignItems: "flex-end", marginTop: 10 },
   balanceNumber: { color: "#fff", fontSize: 34, fontWeight: "900" },
   balanceTicker: { color: THEME.accentGold, fontWeight: "800", marginLeft: 6, marginBottom: 3 },
@@ -402,6 +560,7 @@ const styles = StyleSheet.create({
 
   row: { flexDirection: "row", alignItems: "center", marginTop: 12 },
 
+  // buttons
   ghostBtn: {
     backgroundColor: "#2d2d2f",
     borderColor: "#3a3a3f",
@@ -442,6 +601,13 @@ const styles = StyleSheet.create({
   },
 
   disclaimer: { color: THEME.subtle, fontSize: 12, marginTop: 10 },
+
+  // profile fields
+  fieldLabel: { color: "#b7b7bf", fontSize: 12, marginTop: 10 },
+  fieldValue: { color: THEME.text, fontSize: 14, marginTop: 4 },
+  subtle: { color: THEME.subtle, fontSize: 12, marginTop: 10 },
+  grid: { flexDirection: "row", gap: 12, marginTop: 6 },
+  gridItem: { flex: 1 },
 
   footer: { color: "#7a7a7a", textAlign: "center", marginTop: 14, fontSize: 12 },
 

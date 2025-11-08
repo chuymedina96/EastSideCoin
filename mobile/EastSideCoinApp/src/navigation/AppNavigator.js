@@ -15,6 +15,7 @@ import ChatScreen from "../screens/ChatScreen";
 import ServicesScreen from "../screens/ServicesScreen";
 import ProfileScreen from "../screens/ProfileScreen";
 import KeyScreenSetup from "../screens/KeyScreenSetup";
+import OnboardingScreen from "../screens/OnboardingScreen";
 
 const AuthStack = createNativeStackNavigator();
 const AppStack = createNativeStackNavigator();
@@ -37,7 +38,6 @@ const tabTheme = {
   red: "#E63946",
 };
 
-// ---------------- Tabs (main app) ----------------
 const HomeTabs = () => (
   <Tab.Navigator
     screenOptions={({ route }) => ({
@@ -48,43 +48,21 @@ const HomeTabs = () => (
       tabBarActiveTintColor: tabTheme.red,
       tabBarInactiveTintColor: "gray",
       tabBarHideOnKeyboard: true,
-      tabBarStyle: {
-        backgroundColor: tabTheme.card,
-        borderTopColor: tabTheme.border,
-      },
+      tabBarStyle: { backgroundColor: tabTheme.card, borderTopColor: tabTheme.border },
     })}
   >
-    <Tab.Screen
-      name="Home"
-      component={HomeScreen}
-      options={{ /* keeps global fade on push into HomeTabs */ }}
-    />
-    <Tab.Screen
-      name="Wallet"
-      component={WalletScreen}
-      options={{ /* can also add header if you want */ }}
-    />
-    <Tab.Screen
-      name="Chat"
-      component={ChatScreen}
-      options={{
-        unmountOnBlur: true, // WS safety
-      }}
-    />
+    <Tab.Screen name="Home" component={HomeScreen} />
+    <Tab.Screen name="Wallet" component={WalletScreen} />
+    <Tab.Screen name="Chat" component={ChatScreen} options={{ unmountOnBlur: true }} />
     <Tab.Screen name="Services" component={ServicesScreen} />
     <Tab.Screen name="Profile" component={ProfileScreen} />
   </Tab.Navigator>
 );
 
-// ---------------- Auth (logged out) --------------
 const AuthNavigator = () => (
   <AuthStack.Navigator
     initialRouteName="Landing"
-    screenOptions={{
-      headerShown: false,
-      animation: "fade", // quick, subtle between auth screens
-      contentStyle: { backgroundColor: tabTheme.bg },
-    }}
+    screenOptions={{ headerShown: false, animation: "fade", contentStyle: { backgroundColor: tabTheme.bg } }}
   >
     <AuthStack.Screen name="Landing" component={LandingScreen} />
     <AuthStack.Screen name="Login" component={LoginScreen} />
@@ -92,57 +70,58 @@ const AuthNavigator = () => (
   </AuthStack.Navigator>
 );
 
-// ---------------- App (logged in) ----------------
-const AppNavigatorInner = ({ keysReady }) => (
-  <AppStack.Navigator
-    // fade by default; per-screen overrides below
-    screenOptions={{
-      headerShown: false,
-      animation: "fade",
-      contentStyle: { backgroundColor: tabTheme.bg },
-      gestureEnabled: true,
-      fullScreenGestureEnabled: true,
-    }}
-    initialRouteName={keysReady ? "HomeTabs" : "KeyScreenSetup"}
-    key={keysReady ? "app-home" : "app-keys"} // ensures correct initial route on flip
-  >
-    <AppStack.Screen
-      name="KeyScreenSetup"
-      component={KeyScreenSetup}
-      options={{
-        gestureEnabled: false,          // don’t allow swipe back into auth
-        animation: "slide_from_bottom", // feels like a setup sheet
-      }}
-    />
-    <AppStack.Screen
-      name="HomeTabs"
-      component={HomeTabs}
-      options={{
-        animation: "slide_from_right",  // nice push when leaving setup
-      }}
-    />
-
-    {/*
-      If you later want a modal outside tabs (e.g., QR Scanner, Sheet),
-      add it here with a modal presentation:
-
-      <AppStack.Screen
-        name="QrModal"
-        component={QrModalScreen}
-        options={{
-          headerShown: true,
-          title: "Scan",
-          presentation: "modal",
-          animation: "slide_from_bottom",
-        }}
-      />
-    */}
-  </AppStack.Navigator>
-);
-
+/**
+ * We render distinct trees so the correct initial route is guaranteed.
+ * No imperative resets needed from AuthProvider for normal flows.
+ */
 const AppNavigator = () => {
   const { user, keysReady } = useContext(AuthContext);
-  return user ? <AppNavigatorInner keysReady={!!keysReady} /> : <AuthNavigator />;
+
+  // Logged OUT
+  if (!user) return <AuthNavigator />;
+
+  // Logged IN, but keys not ready → lock to KeyScreenSetup
+  if (!keysReady) {
+    return (
+      <AppStack.Navigator
+        key="app-needs-keys"
+        screenOptions={{ headerShown: false, animation: "fade", contentStyle: { backgroundColor: tabTheme.bg } }}
+        initialRouteName="KeyScreenSetup"
+      >
+        <AppStack.Screen
+          name="KeyScreenSetup"
+          component={KeyScreenSetup}
+          options={{ gestureEnabled: false, animation: "slide_from_bottom" }}
+        />
+      </AppStack.Navigator>
+    );
+  }
+
+  // Logged IN + keys ready → pick Onboarding vs Home
+  const needsOnboarding = user?.onboarding_completed !== true;
+  if (needsOnboarding) {
+    return (
+      <AppStack.Navigator
+        key="app-needs-onboarding"
+        screenOptions={{ headerShown: false, animation: "fade", contentStyle: { backgroundColor: tabTheme.bg } }}
+        initialRouteName="Onboarding"
+      >
+        <AppStack.Screen name="Onboarding" component={OnboardingScreen} options={{ gestureEnabled: false }} />
+        <AppStack.Screen name="HomeTabs" component={HomeTabs} />
+      </AppStack.Navigator>
+    );
+  }
+
+  // Fully ready → straight to HomeTabs
+  return (
+    <AppStack.Navigator
+      key="app-home"
+      screenOptions={{ headerShown: false, animation: "fade", contentStyle: { backgroundColor: tabTheme.bg } }}
+      initialRouteName="HomeTabs"
+    >
+      <AppStack.Screen name="HomeTabs" component={HomeTabs} />
+    </AppStack.Navigator>
+  );
 };
 
 export default AppNavigator;

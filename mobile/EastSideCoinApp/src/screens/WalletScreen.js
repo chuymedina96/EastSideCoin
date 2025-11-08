@@ -18,7 +18,7 @@ import AsyncStorage from "@react-native-async-storage/async-storage";
 import debounce from "lodash.debounce";
 import { SafeAreaView } from "react-native-safe-area-context";
 import { useRoute } from "@react-navigation/native";
-import { api } from "../utils/api"; // ✅ our minimal fetch wrapper (returns JSON directly)
+import { api, listServiceCategories } from "../utils/api"; // ← pulls category list from server
 
 // Flip to false when you wire real send API
 const DEMO_MODE = true;
@@ -32,6 +32,8 @@ const THEME = {
   accentGold: "#FFD700",
   accentOrange: "#FF4500",
 };
+
+const DEFAULT_CATEGORIES = ["Barber", "Lawn Care", "Studio", "Tutoring", "Cleaning", "Other", "General"];
 
 const fmt = (n) =>
   typeof n === "number" ? n.toLocaleString(undefined, { maximumFractionDigits: 6 }) : n;
@@ -50,7 +52,12 @@ const WalletScreen = () => {
   const [toAddress, setToAddress] = useState("");
   const [amount, setAmount] = useState("");
   const [service, setService] = useState(presetNote || ""); // ← pre-fill from navigation
+  const [sendCategory, setSendCategory] = useState("General"); // ← NEW: category tag
   const [sending, setSending] = useState(false);
+
+  // categories data
+  const [categories, setCategories] = useState(DEFAULT_CATEGORIES);
+  const [catHintSeen, setCatHintSeen] = useState(false);
 
   // search neighbors
   const [query, setQuery] = useState("");
@@ -80,7 +87,6 @@ const WalletScreen = () => {
   // ---- load wallet basics ----
   const loadWallet = useCallback(async () => {
     try {
-      // New authed balance endpoint (adjust path if yours differs)
       const data = await api.get(`/wallet/balance/`);
       setWalletAddress(data?.address || data?.wallet_address || "");
       setBalance(Number(data?.balance ?? 0));
@@ -90,19 +96,36 @@ const WalletScreen = () => {
     }
   }, [balance]);
 
+  // ---- load categories (server → fallback) ----
+  const loadCategories = useCallback(async () => {
+    try {
+      const payload = await listServiceCategories();
+      const serverCats = Array.isArray(payload?.results) ? payload.results : Array.isArray(payload) ? payload : [];
+      const cleaned = serverCats
+        .map((c) => (typeof c === "string" ? c : c?.name))
+        .filter(Boolean);
+      const uniq = Array.from(new Set([...cleaned, ...DEFAULT_CATEGORIES]));
+      setCategories(uniq);
+      if (!uniq.includes(sendCategory)) setSendCategory(uniq[0] || "General");
+    } catch {
+      setCategories(DEFAULT_CATEGORIES);
+      if (!DEFAULT_CATEGORIES.includes(sendCategory)) setSendCategory("General");
+    }
+  }, [sendCategory]);
+
   const onRefresh = useCallback(async () => {
     setRefreshing(true);
-    await loadWallet();
+    await Promise.all([loadWallet()]);
     setRefreshing(false);
   }, [loadWallet]);
 
   useEffect(() => {
     (async () => {
       setLoading(true);
-      await loadWallet();
+      await Promise.all([loadWallet(), loadCategories()]);
       setLoading(false);
     })();
-  }, [loadWallet]);
+  }, [loadWallet, loadCategories]);
 
   // ---- validation ----
   const parsedAmt = useMemo(() => {
@@ -116,6 +139,7 @@ const WalletScreen = () => {
     if (typeof balance === "number" && parsedAmt > balance) return false;
     if (toAddress.length < 10) return false; // basic check
     if (!service.trim()) return false;
+    // category optional for send safety; we still allow sending without it
     return true;
   }, [sending, walletAddress, toAddress, parsedAmt, balance, service]);
 
@@ -135,16 +159,13 @@ const WalletScreen = () => {
       try {
         setSearching(true);
 
-        // Preferred endpoint (aligns with Chat/Search)
         let data = await api.get(`/users/search/`, {
           params: { query: term.trim() },
           signal: ctrl.signal,
         });
 
-        // Accept array or {results:[...]}
         let list = Array.isArray(data) ? data : (Array.isArray(data?.results) ? data.results : null);
 
-        // Fallback to legacy alias
         if (!Array.isArray(list)) {
           try {
             data = await api.get(`/search_users/`, {
@@ -181,7 +202,6 @@ const WalletScreen = () => {
 
   useEffect(() => {
     return () => {
-      // cleanup: cancel any in-flight search on unmount
       if (searchAbortRef.current) searchAbortRef.current.abort();
       searchNeighbors.cancel();
     };
@@ -217,17 +237,21 @@ const WalletScreen = () => {
           amount: parsedAmt,
           status: "confirmed",
           service,
+          category: sendCategory, // ← include category in demo tx
           timestamp: new Date().toISOString(),
         };
         setRecent((prev) => [tx, ...prev].slice(0, 10));
         setAmount("");
         setToAddress("");
         setService("");
-        Alert.alert("Sent (Demo)", `Paid ${parsedAmt} ESC to ${trimAddr(query || toAddress, 6)} for “${service}”.`);
+        // keep the selected category for the next send
+        Alert.alert("Sent (Demo)", `Paid ${parsedAmt} ESC to ${trimAddr(query || toAddress, 6)} for “${service}” (${sendCategory}).`);
       } else {
         // TODO: wire your real endpoint
-        // const resp = await api.post('/wallet/send/', { body: { to: toAddress, amount: parsedAmt, note: service } });
-        // use resp to update UI / optimistic confirmation
+        // await api.post('/wallet/send/', {
+        //   body: { to: toAddress, amount: parsedAmt, note: service, category: sendCategory }
+        // });
+        // Optionally reload balance + show confirmation
       }
     } catch (e) {
       console.error("❌ Send Error:", e?.data || e?.message || e);
@@ -282,6 +306,31 @@ const WalletScreen = () => {
     </Pressable>
   );
 
+  const CategoryChips = () => (
+    <>
+      <Text style={[styles.inputLabel, { marginTop: 10 }]}>Category</Text>
+      <Text style={styles.hint}>
+        Tag this payment so both sides see what it was for. <Text style={{ fontStyle: "italic" }}>Swipe to see more →</Text>
+      </Text>
+      <ScrollView horizontal showsHorizontalScrollIndicator={false} onScroll={() => setCatHintSeen(true)}>
+        <View style={styles.chipsRow}>
+          {categories.map((c) => {
+            const active = c === sendCategory;
+            return (
+              <Pressable
+                key={c}
+                onPress={() => setSendCategory(c)}
+                style={[styles.chip, active && styles.chipActive]}
+              >
+                <Text style={[styles.chipText, active && styles.chipTextActive]}>{c}</Text>
+              </Pressable>
+            );
+          })}
+        </View>
+      </ScrollView>
+    </>
+  );
+
   const SendBlock = () => (
     <View style={styles.card}>
       <View style={styles.cardHeaderRow}>
@@ -334,6 +383,9 @@ const WalletScreen = () => {
         keyboardType={Platform.select({ ios: "decimal-pad", android: "decimal-pad", default: "numeric" })}
       />
 
+      {/* NEW: Category selector */}
+      <CategoryChips />
+
       <Text style={[styles.inputLabel, { marginTop: 10 }]}>What’s this payment for?</Text>
       <Text style={styles.hint}>e.g., haircut with Alan, lawn care, studio time</Text>
       <TextInput
@@ -357,7 +409,7 @@ const WalletScreen = () => {
       <Text style={styles.disclaimer}>
         {DEMO_MODE
           ? "Demo mode updates balance locally. Connect real transfers when ready."
-          : "Transfers are final. Double-check the recipient and purpose."}
+          : "Transfers are final. Double-check the recipient, category, and purpose."}
       </Text>
     </View>
   );
@@ -377,6 +429,9 @@ const WalletScreen = () => {
               <Text style={styles.txMeta}>
                 to {trimAddr(tx.to, 8)} • {new Date(tx.timestamp).toLocaleString()}
               </Text>
+              {tx.category ? (
+                <Text style={styles.txCategory}>Category: {tx.category}</Text>
+              ) : null}
               {tx.service ? <Text style={styles.txService}>“{tx.service}”</Text> : null}
             </View>
             <View
@@ -519,6 +574,27 @@ const styles = StyleSheet.create({
   resultMeta: { color: "#a0a0aa", fontSize: 12, marginTop: 2 },
   resultWallet: { color: THEME.accentGold, marginLeft: 10, fontSize: 12, fontWeight: "700" },
 
+  // category chips
+  chipsRow: {
+    flexDirection: "row",
+    gap: 8,
+    paddingVertical: 4,
+  },
+  chip: {
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    borderRadius: 999,
+    borderWidth: 1,
+    borderColor: THEME.border,
+    backgroundColor: "#1f2026",
+  },
+  chipActive: {
+    borderColor: "#22355f",
+    backgroundColor: "#1b2a4b",
+  },
+  chipText: { color: THEME.subtext, fontWeight: "700", fontSize: 12 },
+  chipTextActive: { color: "#cfe0ff", fontWeight: "800" },
+
   feeRow: { flexDirection: "row", justifyContent: "space-between", marginTop: 10 },
   feeText: { color: "#9a9aa1", fontSize: 12 },
   feeTextValue: { color: "#cfcfcf", fontSize: 12 },
@@ -551,6 +627,7 @@ const styles = StyleSheet.create({
   },
   txTitle: { color: THEME.text, fontSize: 14, fontWeight: "700" },
   txMeta: { color: "#a0a0aa", fontSize: 12, marginTop: 2 },
+  txCategory: { color: "#cfe0ff", fontSize: 12, marginTop: 2, fontWeight: "800" },
   txService: { color: "#cfcfcf", fontSize: 12, marginTop: 2, fontStyle: "italic" },
 
   statusPill: {

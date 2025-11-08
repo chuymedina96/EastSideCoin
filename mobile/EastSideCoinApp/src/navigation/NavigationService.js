@@ -1,19 +1,58 @@
 // navigation/NavigationService.js
-import { createNavigationContainerRef, CommonActions } from "@react-navigation/native";
+import { createNavigationContainerRef, CommonActions, StackActions } from "@react-navigation/native";
 
 export const navigationRef = createNavigationContainerRef();
 
-// ---------------- Queue + dedupe ----------------
 const MAX_QUEUE = 20;
 const pendingActions = [];
 let lastActionSig = null;
 let lastActionSigExpiry = 0;
+let _ready = false;
 
-/**
- * Call once at the root:
- * <NavigationContainer ref={navigationRef} onReady={onNavReady}>...</NavigationContainer>
- */
+// ----- Utils -----
+const defer = (ms = 0) => new Promise((r) => setTimeout(r, ms));
+
+function dedupeGuard(signature, cooldownMs = 750) {
+  const now = Date.now();
+  if (lastActionSig === signature && now < lastActionSigExpiry) return true;
+  lastActionSig = signature;
+  lastActionSigExpiry = now + cooldownMs;
+  return false;
+}
+
+function enqueueOrDispatch(action) {
+  const sig = JSON.stringify(action?.payload ?? action);
+  if (dedupeGuard(sig)) return false;
+
+  if (!_ready || !navigationRef.isReady()) {
+    if (pendingActions.length >= MAX_QUEUE) pendingActions.shift();
+    pendingActions.push(action);
+    return false;
+  }
+  navigationRef.dispatch(action);
+  return true;
+}
+
+// ----- Route existence check -----
+function stateHasRoute(state, targetName) {
+  if (!state) return false;
+  const { routes = [] } = state;
+  for (const r of routes) {
+    if (r.name === targetName) return true;
+    if (r.state && stateHasRoute(r.state, targetName)) return true;
+  }
+  return false;
+}
+
+function routeExists(targetName) {
+  if (!_ready || !navigationRef.isReady()) return false;
+  const root = navigationRef.getRootState?.();
+  return stateHasRoute(root, targetName);
+}
+
+// ----- Public API -----
 export function onNavReady() {
+  _ready = true;
   const flush = () => {
     while (pendingActions.length) {
       const act = pendingActions.shift();
@@ -28,84 +67,69 @@ export function onNavReady() {
   else setTimeout(flush, 0);
 }
 
-function dedupeGuard(signature, cooldownMs = 750) {
-  const now = Date.now();
-  if (lastActionSig === signature && now < lastActionSigExpiry) return true; // duplicate → ignore
-  lastActionSig = signature;
-  lastActionSigExpiry = now + cooldownMs;
-  return false;
-}
-
-function enqueueOrDispatch(action) {
-  const sig = JSON.stringify(action?.payload ?? action);
-  if (dedupeGuard(sig)) return false;
-
-  if (!navigationRef.isReady()) {
-    if (pendingActions.length >= MAX_QUEUE) pendingActions.shift(); // drop oldest
-    pendingActions.push(action);
-    return false;
+export async function waitUntilReady(timeoutMs = 3000) {
+  const t0 = Date.now();
+  while (!_ready || !navigationRef.isReady()) {
+    if (Date.now() - t0 > timeoutMs) break;
+    // 1 frame or 16ms
+    await defer(16);
   }
-  navigationRef.dispatch(action);
-  return true;
+  return _ready && navigationRef.isReady();
 }
 
-// --------------- Route existence check ---------------
-function stateHasRoute(state, targetName) {
-  if (!state) return false;
-  const { routes = [] } = state;
-  for (const r of routes) {
-    if (r.name === targetName) return true;
-    if (r.state && stateHasRoute(r.state, targetName)) return true;
-  }
-  return false;
-}
-
-// --------------- Public API ----------------
-/**
- * Safer reset:
- * - Validates route exists in current tree.
- * - Falls back to navigate() if it doesn't (prevents warnings).
- * - Dedupes rapid identical calls.
- */
 export function resetNavigation(routeName, params) {
+  // If ready and target not in tree, fall back to navigate (prevents warnings)
+  if (_ready && navigationRef.isReady() && !routeExists(routeName)) {
+    console.warn(`⚠️ resetNavigation("${routeName}") not in current tree → navigate() fallback`);
+    return navigate(routeName, params);
+  }
+
   const action = CommonActions.reset({
     index: 0,
     routes: [{ name: routeName, params }],
   });
-
-  if (navigationRef.isReady()) {
-    const root = navigationRef.getRootState?.();
-    if (root && !stateHasRoute(root, routeName)) {
-      console.warn(
-        `⚠️ resetNavigation("${routeName}") is not in the mounted navigator tree. Falling back to navigate().`
-      );
-      return navigate(routeName, params);
-    }
-  } else {
-    // Not ready yet — still enqueue the reset; it will run after onNavReady.
-  }
 
   console.log(`🚀 Resetting Navigation to ${routeName}`);
   enqueueOrDispatch(action);
 }
 
 export function navigate(routeName, params = {}) {
+  // If ready and target not in tree, just log + no-op (prevents RN warning spam)
+  if (_ready && navigationRef.isReady() && !routeExists(routeName)) {
+    console.warn(`⚠️ navigate("${routeName}") not in current tree → no-op`);
+    return;
+  }
   const action = CommonActions.navigate({ name: routeName, params });
   console.log(`📡 Navigating to ${routeName}`);
   enqueueOrDispatch(action);
 }
 
+export function push(routeName, params = {}) {
+  // Same protection as navigate
+  if (_ready && navigationRef.isReady() && !routeExists(routeName)) {
+    console.warn(`⚠️ push("${routeName}") not in current tree → no-op`);
+    return;
+  }
+  const action = StackActions.push(routeName, params);
+  enqueueOrDispatch(action);
+}
+
 export function goBack() {
-  if (navigationRef.isReady() && navigationRef.canGoBack()) {
+  if (_ready && navigationRef.isReady() && navigationRef.canGoBack()) {
     navigationRef.goBack();
   }
 }
 
 export function canGoBack() {
-  return navigationRef.isReady() && navigationRef.canGoBack();
+  return _ready && navigationRef.isReady() && navigationRef.canGoBack();
 }
 
-// Opinionated helpers for common flows
-export const resetToAuth     = (params) => resetNavigation("Login", params);        // or "Landing" for your auth entry
+export function getCurrentRoute() {
+  if (!_ready || !navigationRef.isReady()) return null;
+  return navigationRef.getCurrentRoute?.() || null;
+}
+
+// Opinionated helpers
+export const resetToAuth     = (params) => resetNavigation("Login", params);        // or "Landing"
 export const resetToApp      = (params) => resetNavigation("HomeTabs", params);
 export const resetToKeySetup = (params) => resetNavigation("KeyScreenSetup", params);

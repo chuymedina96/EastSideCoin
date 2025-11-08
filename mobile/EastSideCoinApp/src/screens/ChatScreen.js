@@ -5,30 +5,29 @@ import {
   Alert, KeyboardAvoidingView, Platform, RefreshControl, ActivityIndicator,
 } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
-import { useFocusEffect } from "@react-navigation/native";
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import debounce from "lodash.debounce";
+import { Audio } from "expo-av";
 
 import { AuthContext } from "../context/AuthProvider";
 import { WS_URL } from "../config";
 import { encryptAES, encryptRSA, decryptAES, decryptRSA } from "../utils/encryption";
 import { isKeysReady, loadPrivateKeyForUser } from "../utils/keyManager";
 import { createOrGetChatSocket } from "../utils/wsClient";
-import { api, fetchConversation, fetchThreadsIndex as _unused, searchUsersSmart } from "../utils/api"; // use direct returns
+import { api, searchUsersSmart } from "../utils/api";
 
 const THREADS_KEY = "chat_threads_index_v1";
 const MSGS_KEY_PREFIX = "chat_msgs_";
+const FETCH_LIMIT = 5000;
+const CACHE_LIMIT = 20;
 
-// ---------- utils ----------
+// ensure bundler includes the asset
+const INCOMING_SOUND = require("../../assets/incoming.mp3");
+
+/* ---------------- helpers ---------------- */
 const asId = (v) => String(v ?? "");
 const nameOf = (u) => (`${u?.first_name || ""} ${u?.last_name || ""}`.trim() || u?.email || "Neighbor");
-const formatTime = (d) => {
-  const date = typeof d === "string" ? new Date(d) : d;
-  const now = new Date();
-  return date.toDateString() === now.toDateString()
-    ? date.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })
-    : date.toLocaleDateString([], { month: "short", day: "numeric" });
-};
+
 const b64FixPadding = (b64) => {
   if (!b64) return b64;
   const s = String(b64).replace(/\s+/g, "").replace(/-/g, "+").replace(/_/g, "/");
@@ -45,19 +44,17 @@ const normalizeWrapAliases = (m) => {
 
 const pickWrapForMe = (raw, meId) => {
   const m = normalizeWrapAliases(raw);
-  if (m.encrypted_key_for_me) return { which: "for_me", value: m.encrypted_key_for_me };
-
+  if (m.encrypted_key_for_me) return { value: m.encrypted_key_for_me };
   const me = String(meId);
   const sender = String(m.sender ?? m.sender_id);
   const receiver = String(m.receiver ?? m.receiver_id);
-
   if (receiver === me && (m.encrypted_key_for_receiver || m.encrypted_key)) {
-    return { which: "receiver", value: m.encrypted_key_for_receiver || m.encrypted_key };
+    return { value: m.encrypted_key_for_receiver || m.encrypted_key };
   }
   if (sender === me && m.encrypted_key_for_sender) {
-    return { which: "sender", value: m.encrypted_key_for_sender };
+    return { value: m.encrypted_key_for_sender };
   }
-  return { which: "none", value: null };
+  return { value: null };
 };
 
 const decryptServerMessage = (raw, privateKeyPem, meId, otherUser) => {
@@ -67,11 +64,7 @@ const decryptServerMessage = (raw, privateKeyPem, meId, otherUser) => {
     if (!value) return null;
 
     let keyB64;
-    try {
-      keyB64 = decryptRSA(b64FixPadding(value), privateKeyPem);
-    } catch {
-      return null;
-    }
+    try { keyB64 = decryptRSA(b64FixPadding(value), privateKeyPem); } catch { return null; }
 
     const text = decryptAES({
       ciphertextB64: b64FixPadding(m.encrypted_message),
@@ -82,10 +75,8 @@ const decryptServerMessage = (raw, privateKeyPem, meId, otherUser) => {
     if (!text || text === "[Auth Failed]" || text === "[Decryption Failed]") return null;
 
     const isMine = String(m.sender ?? m.sender_id) === String(meId);
-    const createdAt =
-      (m.timestamp ? new Date(m.timestamp) :
-       m.created_at ? new Date(m.created_at) : new Date());
-
+    const createdAt = (m.timestamp ? new Date(m.timestamp) :
+                       m.created_at ? new Date(m.created_at) : new Date());
     return {
       _id: String(m.id || `${Date.now()}_${Math.random()}`),
       text,
@@ -98,51 +89,22 @@ const decryptServerMessage = (raw, privateKeyPem, meId, otherUser) => {
   }
 };
 
-// Sticky-focus search
-const UncontrolledLockedSearch = React.memo(function UncontrolledLockedSearch({
-  placeholder = "🔍 Search neighbors…",
-  initialValue = "",
-  onDebouncedChange,
-  debounceMs = 220,
-  autoFocus = false,
-}) {
-  const inputRef = useRef(null);
-  const lockFocus = useRef(true);
-  const debouncedEmit = useMemo(
-    () => debounce((q) => onDebouncedChange?.(q), debounceMs),
-    [onDebouncedChange, debounceMs]
-  );
-  const onChangeText = useCallback((text) => { debouncedEmit(text); }, [debouncedEmit]);
-  const onBlur = useCallback(() => {
-    if (lockFocus.current && inputRef.current) setTimeout(() => inputRef.current?.focus(), 0);
-  }, []);
-  useEffect(() => {
-    if (autoFocus) setTimeout(() => inputRef.current?.focus(), 0);
-    return () => debouncedEmit.cancel();
-  }, [autoFocus, debouncedEmit]);
-  return (
-    <View pointerEvents="box-none">
-      <TextInput
-        ref={inputRef}
-        defaultValue={initialValue}
-        onChangeText={onChangeText}
-        placeholder={placeholder}
-        placeholderTextColor="#AAA"
-        style={styles.searchInput}
-        autoCorrect={false}
-        autoCapitalize="none"
-        autoComplete="off"
-        returnKeyType="search"
-        blurOnSubmit={false}
-        keyboardAppearance="dark"
-        onBlur={onBlur}
-      />
-    </View>
-  );
-});
+const pruneToCacheLimit = (arr, limit = CACHE_LIMIT) => {
+  if (!Array.isArray(arr) || arr.length <= limit) return arr;
+  const sorted = arr.slice().sort((a, b) => new Date(a.createdAt) - new Date(b.createdAt));
+  return sorted.slice(-limit);
+};
 
-// =============== Component ===============
-const ChatScreen = ({ navigation }) => {
+// tiny guard to avoid noisy state flips
+const setStateIfChanged = (setter, prevRef, nextVal, eq = (a, b) => JSON.stringify(a) === JSON.stringify(b)) => {
+  if (!eq(prevRef.current, nextVal)) {
+    prevRef.current = nextVal;
+    setter(nextVal);
+  }
+};
+
+/* ================== Component ================== */
+const ChatScreen = () => {
   const { user, keysReady, getAccessToken } = useContext(AuthContext);
 
   const userPrefix = user?.id ? `u${user.id}:` : "u?:";
@@ -150,33 +112,164 @@ const ChatScreen = ({ navigation }) => {
   const msgsKey = (otherId) => `${userPrefix}${MSGS_KEY_PREFIX}${asId(otherId)}`;
 
   const [mode, setMode] = useState("threads");
-  const [threads, setThreads] = useState({});
-  const [messages, setMessages] = useState([]);
-  const [selectedUser, setSelectedUser] = useState(null);
-  const selectedUserRef = useRef(null);
+  const [threads, _setThreads] = useState({});
+  const threadsRef = useRef(threads);
+  const setThreads = (val) => setStateIfChanged(_setThreads, threadsRef, val);
+
+  const [messages, _setMessages] = useState([]);
+  const messagesRef = useRef(messages);
+  const setMessages = (val) => setStateIfChanged(_setMessages, messagesRef, val);
+
+  const [selectedUser, _setSelectedUser] = useState(null);
+  const selectedUserRef = useRef(selectedUser);
+  const setSelectedUser = (val) => setStateIfChanged(_setSelectedUser, selectedUserRef, val);
   useEffect(() => { selectedUserRef.current = selectedUser; }, [selectedUser]);
 
-  const [directory, setDirectory] = useState({});
+  const [directory, _setDirectory] = useState({});
+  const directoryRef = useRef(directory);
+  const setDirectory = (val) => setStateIfChanged(_setDirectory, directoryRef, val);
+
   const [effectiveQuery, setEffectiveQuery] = useState("");
   const [searchResults, setSearchResults] = useState([]);
 
-  const [refreshing, setRefreshing] = useState(false);
-  const [readyLocal, setReadyLocal] = useState(keysReady);
-  const effectiveReady = keysReady || readyLocal;
-
-  const [loadingHydrateId, setLoadingHydrateId] = useState(null);
-  const hydrateTimeoutRef = useRef(null);
-
-  const pageRef = useRef({ next: null });
-  const wsSubRef = useRef(null);
-  const pendingClientIdsRef = useRef(new Set());
-
+  // composer + sending state
   const [draft, setDraft] = useState("");
   const [sendInFlight, setSendInFlight] = useState(false);
   const listRef = useRef(null);
-  const isComposingRef = useRef(false);
 
-  // ---- Cache helpers
+  // keys
+  const [readyLocal, setReadyLocal] = useState(keysReady);
+  const effectiveReady = keysReady || readyLocal;
+
+  // WebSocket state (stable, no polling)
+  const wsApiRef = useRef(null);
+  const [wsStatus, _setWsStatus] = useState("disconnected"); // "connecting" | "connected" | "disconnected"
+  const wsStatusRef = useRef(wsStatus);
+  const setWsStatus = (v) => setStateIfChanged(_setWsStatus, wsStatusRef, v);
+
+  const [lastConnectAt, _setLastConnectAt] = useState(null);
+  const lastConnectAtRef = useRef(lastConnectAt);
+  const setLastConnectAt = (v) => setStateIfChanged(_setLastConnectAt, lastConnectAtRef, v);
+
+  const pendingClientIdsRef = useRef(new Set());
+  const sendQueueRef = useRef([]);
+
+  // top spinner
+  const [syncCounter, setSyncCounter] = useState(0);
+  const beginSync = useCallback(() => setSyncCounter((n) => n + 1), []);
+  const endSync = useCallback(() => setSyncCounter((n) => Math.max(0, n - 1)), []);
+  const withTopSpinner = useCallback(async (fn) => {
+    beginSync();
+    try { return await fn(); } finally { endSync(); }
+  }, [beginSync, endSync]);
+
+  // stable callbacks (identities never change)
+  const upsertThread = useRef((prev, neighbor, lastText, when, incrementUnread, opts = {}) => {
+    const id = asId(neighbor?.id);
+    if (!id) return prev || {};
+    const existing = (prev && prev[id]) || {};
+    const name = nameOf(neighbor) || existing.name || "Neighbor";
+    const meta = {
+      ...(existing.meta || {}),
+      first_name: neighbor?.first_name ?? existing?.meta?.first_name,
+      last_name: neighbor?.last_name ?? existing?.meta?.last_name,
+      email: neighbor?.email ?? existing?.meta?.email,
+    };
+    const resetUnread = opts.resetUnread === true;
+    const unreadBase = Number(existing.unread || 0);
+    const unread = resetUnread ? 0 : (incrementUnread ? unreadBase + 1 : unreadBase);
+    const updatedAtISO = (when instanceof Date ? when : new Date()).toISOString();
+
+    return {
+      ...(prev || {}),
+      [id]: {
+        id,
+        name,
+        meta,
+        lastText: lastText || existing.lastText || "",
+        updatedAt: updatedAtISO,
+        unread,
+      },
+    };
+  });
+
+  const mergeUniqueById = useRef((a, b) => {
+    const map = new Map();
+    for (const m of a) map.set(String(m._id), m);
+    for (const m of b) map.set(String(m._id), m);
+    return Array.from(map.values()).sort((x, y) => new Date(x.createdAt) - new Date(y.createdAt));
+  });
+
+  /* -------- search (debounced) -------- */
+  const doSearch = useCallback(async (q) => {
+    try {
+      if (!q || q.trim().length < 2) { setSearchResults([]); return; }
+      const arr = await searchUsersSmart(q.trim());
+      const cleaned = Array.isArray(arr) ? arr.filter(u => u && u.id && String(u.id) !== String(user?.id)) : [];
+      setSearchResults(cleaned);
+      setDirectory({
+        ...directoryRef.current,
+        ...Object.fromEntries(cleaned.map((u) => [asId(u.id), u])),
+      });
+    } catch {
+      setSearchResults([]);
+    }
+  }, [user?.id]);
+
+  const handleDebouncedSearch = useMemo(() => debounce(doSearch, 300), [doSearch]);
+  useEffect(() => () => { try { handleDebouncedSearch.cancel(); } catch {} }, [handleDebouncedSearch]);
+
+  /* -------- sound on incoming -------- */
+  const soundRef = useRef(null);
+  const lastBeepAtRef = useRef(0);
+
+  useEffect(() => {
+    let mounted = true;
+    (async () => {
+      try {
+        await Audio.setAudioModeAsync({
+          allowsRecordingIOS: false,
+          playsInSilentModeIOS: true,
+          staysActiveInBackground: false,
+          shouldDuckAndroid: true,
+          playThroughEarpieceAndroid: false,
+          interruptionModeAndroid: Audio.INTERRUPTION_MODE_ANDROID_DO_NOT_MIX,
+          interruptionModeIOS: Audio.INTERRUPTION_MODE_IOS_DO_NOT_MIX,
+        });
+        const { sound } = await Audio.Sound.createAsync(
+          INCOMING_SOUND,
+          { shouldPlay: false, isLooping: false, volume: 1.0 },
+          null,
+          true
+        );
+        if (!mounted) {
+          try { await sound.unloadAsync(); } catch {}
+          return;
+        }
+        soundRef.current = sound;
+      } catch (e) {
+        console.log("Audio init error:", e?.message);
+      }
+    })();
+    return () => { (async () => { try { await soundRef.current?.unloadAsync(); } catch {} })(); };
+  }, []);
+
+  const playIncoming = useCallback(async () => {
+    try {
+      const now = Date.now();
+      if (now - lastBeepAtRef.current < 250) return; // throttle spammy bursts
+      lastBeepAtRef.current = now;
+      const s = soundRef.current;
+      if (!s) return;
+      // reset to start and play
+      await s.setPositionAsync(0);
+      await s.playAsync();
+    } catch (e) {
+      console.log("playIncoming error:", e?.message);
+    }
+  }, []);
+
+  /* -------- cache helpers -------- */
   const loadCachedThreads = useCallback(async () => {
     try { const raw = await AsyncStorage.getItem(threadsKey); return raw ? JSON.parse(raw) : {}; }
     catch { return {}; }
@@ -192,13 +285,16 @@ const ChatScreen = ({ navigation }) => {
   }, [msgsKey]);
 
   const saveCachedMessages = useCallback(async (otherId, msgs) => {
-    try { await AsyncStorage.setItem(msgsKey(otherId), JSON.stringify(msgs)); } catch {}
+    try {
+      const pruned = pruneToCacheLimit(msgs);
+      await AsyncStorage.setItem(msgsKey(otherId), JSON.stringify(pruned));
+    } catch {}
   }, [msgsKey]);
 
-  // ---- Server-backed threads index
+  /* -------- threads index -------- */
   const fetchThreadsIndex = useCallback(async () => {
     try {
-      const items = await api.get("/conversations/index/"); // <-- returns array
+      const items = await withTopSpinner(() => api.get("/conversations/index/"));
       const arr = Array.isArray(items) ? items : (Array.isArray(items?.results) ? items.results : []);
       const next = {};
       for (const t of arr) {
@@ -214,41 +310,29 @@ const ChatScreen = ({ navigation }) => {
       }
       setThreads(next);
       saveCachedThreads(next);
-      setDirectory((d) => ({ ...d, ...Object.fromEntries(arr.map((u) => [asId(u.id), u])) }));
-    } catch (e) {
-      console.warn("⚠️ fetchThreadsIndex failed:", e?.message || e);
+      setDirectory({ ...directoryRef.current, ...Object.fromEntries(arr.map((u) => [asId(u.id), u])) });
+    } catch {
       const cached = await loadCachedThreads();
       setThreads(cached || {});
     }
-  }, [saveCachedThreads, loadCachedThreads]);
+  }, [saveCachedThreads, loadCachedThreads, withTopSpinner]);
 
   const markThreadRead = useCallback(async (otherId) => {
     if (!otherId) return;
     try { await api.post(`/conversations/mark_read/${otherId}/`); } catch {}
   }, []);
 
-  // ---- Bootstrap
+  // bootstrap threads (once)
   useEffect(() => {
     (async () => {
-      setThreads({});
-      setMessages([]);
-      setSelectedUser(null);
+      const cached = await loadCachedThreads();
+      if (cached && Object.keys(cached).length) setThreads(cached);
       await fetchThreadsIndex();
     })();
-  }, [user?.id, fetchThreadsIndex]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
-  useEffect(() => { saveCachedThreads(threads); }, [threads, saveCachedThreads]);
-
-  useEffect(() => {
-    if (!Array.isArray(searchResults)) return;
-    setDirectory((d) => {
-      const next = { ...d };
-      for (const u of searchResults) if (u?.id) next[asId(u.id)] = u;
-      return next;
-    });
-  }, [searchResults]);
-
-  // Ensure process-wide privateKey is present
+  /* -------- keys mirror -------- */
   useEffect(() => { (async () => {
     if (user?.id) {
       let perUser = await AsyncStorage.getItem(`privateKey_${user.id}`);
@@ -257,341 +341,191 @@ const ChatScreen = ({ navigation }) => {
     }
   })(); }, [user?.id]);
 
-  // Reload index on focus
-  useFocusEffect(useCallback(() => {
-    let mounted = true;
-    (async () => {
-      if (user?.id) {
-        const ok = await isKeysReady(user.id);
-        if (mounted) {
-          setReadyLocal(ok);
-          await fetchThreadsIndex();
-        }
-        if (ok) await loadPrivateKeyForUser(user.id);
+  // refresh keys once
+  useEffect(() => { (async () => {
+    if (!user?.id) return;
+    const ok = await isKeysReady(user.id);
+    setReadyLocal(ok);
+    if (ok) await loadPrivateKeyForUser(user.id);
+  })(); }, [user?.id]);
+
+  /* ================= WS LISTENER (stable, no polling) ================= */
+  const mountedRef = useRef(false);
+  const handlerRef = useRef({
+    onOpen: () => {},
+    onClose: () => {},
+    onError: () => {},
+    onMessage: () => {},
+  });
+
+  // define the stable handlers once (use refs to read latest state)
+  useEffect(() => {
+    handlerRef.current.onOpen = () => {
+      if (!mountedRef.current) return;
+      setWsStatus("connected");
+      setLastConnectAt(Date.now());
+      // flush any queued sends
+      const api = wsApiRef.current;
+      if (!api) return;
+      const q = sendQueueRef.current;
+      while (q.length) {
+        const p = q.shift();
+        try { api.send(p); } catch { break; }
       }
-    })();
-    return () => { mounted = false; };
-  }, [user?.id, fetchThreadsIndex]));
-
-  // ---- Search (HTTP-only)
-  const abortRef = useRef(null);
-  const doRemoteSearch = useCallback(async (query) => {
-    if (abortRef.current) abortRef.current.abort();
-    const ctrl = new AbortController();
-    abortRef.current = ctrl;
-    if (!query || query.length < 2) { setSearchResults([]); setEffectiveQuery(query); return; }
-    try {
-      setEffectiveQuery(query);
-      const data = await searchUsersSmart(query);
-      if (ctrl.signal.aborted) return;
-      setSearchResults(Array.isArray(data) ? data : []);
-    } catch (err) {
-      if (err.name !== "CanceledError" && err.name !== "AbortError") {
-        console.error("❌ Error searching users:", err?.message || err);
-      }
-    }
-  }, []);
-  const debouncedSearchGateway = useRef(debounce((q) => { doRemoteSearch(q); }, 300)).current;
-  const handleDebouncedSearch = useCallback((q) => { debouncedSearchGateway(q); }, [debouncedSearchGateway]);
-
-  // ---- Conversation fetch
-  const fetchConversationPage = useCallback(async (otherId, { page = 1, limit = 50, since = null } = {}) => {
-    const params = { limit, page };
-    if (since) params.since = since;
-    // our api.get returns JSON directly
-    return api.get(`/conversations/${otherId}/`, { params });
-  }, []);
-
-  const clearHydrateBanner = useCallback((oid) => {
-    setLoadingHydrateId((curr) => (curr === oid ? null : curr));
-    if (hydrateTimeoutRef.current) {
-      clearTimeout(hydrateTimeoutRef.current);
-      hydrateTimeoutRef.current = null;
-    }
-  }, []);
-
-  const mergeUniqueById = (a, b) => {
-    const map = new Map();
-    for (const m of a) map.set(String(m._id), m);
-    for (const m of b) map.set(String(m._id), m);
-    return Array.from(map.values()).sort((x, y) => new Date(x.createdAt) - new Date(y.createdAt));
-  };
-
-  const hydrateConversation = useCallback(async (neighbor, { onlyIfNewerThan } = {}) => {
-    if (!neighbor?.id) return;
-    const oid = String(neighbor.id);
-
-    setLoadingHydrateId(oid);
-    if (hydrateTimeoutRef.current) clearTimeout(hydrateTimeoutRef.current);
-    hydrateTimeoutRef.current = setTimeout(() => { clearHydrateBanner(oid); }, 12000);
-
-    try {
-      let privateKeyPem = await AsyncStorage.getItem("privateKey");
-      const myPublicKey = await AsyncStorage.getItem("publicKey");
-      if (!privateKeyPem && user?.id) {
-        privateKeyPem = await AsyncStorage.getItem(`privateKey_${user.id}`);
-        if (privateKeyPem) await AsyncStorage.setItem("privateKey", privateKeyPem);
-      }
-      if (!privateKeyPem) return;
-
-      // sanity check (non-fatal)
+    };
+    handlerRef.current.onClose = () => { if (mountedRef.current) setWsStatus("disconnected"); };
+    handlerRef.current.onError = () => { if (mountedRef.current) setWsStatus("disconnected"); };
+    handlerRef.current.onMessage = async (incomingRaw) => {
+      if (!mountedRef.current) return;
       try {
-        const probe = encryptAES("probe");
-        const wrapped = encryptRSA(probe.keyB64, myPublicKey);
-        const unwrapped = decryptRSA(wrapped, privateKeyPem);
-        if (b64FixPadding(unwrapped) !== b64FixPadding(probe.keyB64)) {
-          console.warn("⚠️ Local keypair mismatch — decrypt may fail.");
+        const incoming = normalizeWrapAliases(incomingRaw);
+        const senderId   = incoming.sender ?? incoming.sender_id ?? incoming.from_user;
+        const receiverId = incoming.receiver ?? incoming.receiver_id ?? incoming.to_user;
+        if (senderId == null || receiverId == null) return;
+
+        const myIdStr = String(user.id);
+        const otherId = String(senderId) === myIdStr ? String(receiverId) : String(senderId);
+
+        if (!directoryRef.current[asId(otherId)]) {
+          setDirectory({ ...directoryRef.current, [asId(otherId)]: { id: otherId } });
         }
-      } catch {}
 
-      const apiResp = await fetchConversationPage(neighbor.id, {
-        page: 1,
-        limit: 50,
-        since: onlyIfNewerThan || undefined,
-      });
+        const clientTmpId = incoming.client_tmp_id || incoming.client_id || incoming.tmp_id;
+        if (String(senderId) === myIdStr && clientTmpId && pendingClientIdsRef.current.has(clientTmpId)) {
+          pendingClientIdsRef.current.delete(clientTmpId);
+          return; // echo of optimistic send
+        }
 
-      const rows = Array.isArray(apiResp?.results) ? apiResp.results : (Array.isArray(apiResp) ? apiResp : []);
-      const decrypted = rows
-        .map(m => decryptServerMessage(m, privateKeyPem, user.id, neighbor))
-        .filter(Boolean)
-        .map(m => ({ ...m, _id: String(m._id), user: { ...m.user, _id: String(m.user._id) } }))
-        .sort((a,b) => new Date(a.createdAt) - new Date(b.createdAt));
+        // Update thread preview/unread even if convo not open
+        const tNext = upsertThread.current(
+          threadsRef.current,
+          { id: otherId },
+          "New message",
+          new Date(),
+          !(selectedUserRef.current && String(selectedUserRef.current.id) === otherId)
+        );
+        setThreads(tNext);
+        saveCachedThreads(tNext);
 
-      if (decrypted.length > 0) {
-        setMessages(prev => {
-          const merged = mergeUniqueById(prev, decrypted);
-          saveCachedMessages(neighbor.id, merged);
-          return merged;
+        const activeSelected = selectedUserRef.current;
+        if (!activeSelected || String(activeSelected.id) !== otherId) {
+          // not in this convo, still beep
+          if (wsStatusRef.current === "connected") await playIncoming();
+          return;
+        }
+
+        let privateKeyPem = await AsyncStorage.getItem("privateKey");
+        if (!privateKeyPem && user?.id) {
+          privateKeyPem = await AsyncStorage.getItem(`privateKey_${user.id}`);
+          if (privateKeyPem) await AsyncStorage.setItem("privateKey", privateKeyPem);
+        }
+        if (!privateKeyPem) return;
+
+        const { value: wrap } = pickWrapForMe(incoming, user.id);
+        if (!wrap) return;
+
+        let keyB64;
+        try { keyB64 = decryptRSA(b64FixPadding(wrap), privateKeyPem); } catch { return; }
+
+        const decryptedText = decryptAES({
+          ciphertextB64: b64FixPadding(incoming.encrypted_message),
+          ivB64: b64FixPadding(incoming.iv),
+          macB64: b64FixPadding(incoming.mac),
+          keyB64: b64FixPadding(keyB64),
         });
+
+        const mine = String(senderId) === myIdStr;
+        const newMsg = {
+          _id: String(incoming.id || `${Date.now()}_${Math.random()}`),
+          text: decryptedText || "Encrypted Message",
+          createdAt: incoming.timestamp ? new Date(incoming.timestamp)
+            : (incoming.created_at ? new Date(incoming.created_at) : new Date()),
+          user: { _id: mine ? String(user.id) : String(activeSelected.id), name: mine ? "You" : nameOf(activeSelected) },
+        };
+
+        const merged = mergeUniqueById.current(messagesRef.current, [newMsg]);
+        const pruned = pruneToCacheLimit(merged);
+        setMessages(pruned);
+        if (activeSelected?.id) saveCachedMessages(activeSelected.id, pruned);
+
+        const tNext2 = upsertThread.current(
+          threadsRef.current,
+          { id: activeSelected.id, ...activeSelected },
+          decryptedText,
+          newMsg.createdAt,
+          false,
+          { resetUnread: true }
+        );
+        setThreads(tNext2);
+        saveCachedThreads(tNext2);
+
+        if (!mine && wsStatusRef.current === "connected") await playIncoming();
+      } catch (e) {
+        console.error("onMessage error:", e);
       }
+    };
+  }, [user?.id, playIncoming, saveCachedThreads, saveCachedMessages]);
 
-      pageRef.current = { next: apiResp?.next_page || null };
-    } catch (e) {
-      console.log("❌ hydrate error", e?.message);
-    } finally {
-      clearHydrateBanner(oid);
-    }
-  }, [fetchConversationPage, user?.id, saveCachedMessages, clearHydrateBanner]);
-
-  // ---- WebSocket subscribe (mount once per user)
+  // connect once per user.id (no polling, no repeated subscribes)
   useEffect(() => {
     if (!user?.id) return;
-    let unsub = null;
+    mountedRef.current = true;
 
+    // ensure keys loaded for decrypt
     (async () => {
-      await loadPrivateKeyForUser(user.id);
-
-      if (wsSubRef.current?.unsubscribe) {
-        try { wsSubRef.current.unsubscribe(); } catch {}
-        wsSubRef.current = null;
-      }
-
-      const sub = createOrGetChatSocket({
-        token: () => getAccessToken(), // always fresh
-        baseUrl: WS_URL,   // e.g., "ws://192.168.1.131:8000"
-        path: "/ws/chat/",
-        userId: user.id,
-        prefer: "query",
-        onMessage: async (incomingRaw) => {
-          try {
-            const incoming = normalizeWrapAliases(incomingRaw);
-            const senderId   = incoming.sender ?? incoming.sender_id ?? incoming.from_user;
-            const receiverId = incoming.receiver ?? incoming.receiver_id ?? incoming.to_user;
-            if (senderId == null || receiverId == null) return;
-
-            const myIdStr = String(user.id);
-            const otherId = String(senderId) === myIdStr ? String(receiverId) : String(senderId);
-
-            setDirectory((d) => d[asId(otherId)] ? d : { ...d, [asId(otherId)]: { id: otherId } });
-
-            const clientTmpId = incoming.client_tmp_id || incoming.client_id || incoming.tmp_id;
-            if (String(senderId) === myIdStr && clientTmpId && pendingClientIdsRef.current.has(clientTmpId)) {
-              pendingClientIdsRef.current.delete(clientTmpId);
-              return;
-            }
-
-            const isTyping = isComposingRef.current === true;
-            setThreads((t) => {
-              const prev = t[asId(otherId)];
-              const isIncoming = String(senderId) !== myIdStr;
-              const shouldCountUnread =
-                isIncoming && (!selectedUserRef.current || String(selectedUserRef.current.id) !== otherId) && !isTyping;
-              const next = upsertThread(
-                t,
-                { id: otherId, ...(prev?.meta || {}) },
-                "New message",
-                new Date(),
-                shouldCountUnread
-              );
-              saveCachedThreads(next);
-              return next;
-            });
-
-            // Only append to open conversation
-            const activeSelected = selectedUserRef.current;
-            if (!activeSelected || String(activeSelected.id) !== otherId) return;
-
-            let privateKeyPem = await AsyncStorage.getItem("privateKey");
-            if (!privateKeyPem && user?.id) {
-              privateKeyPem = await AsyncStorage.getItem(`privateKey_${user.id}`);
-              if (privateKeyPem) await AsyncStorage.setItem("privateKey", privateKeyPem);
-            }
-            if (!privateKeyPem) return;
-
-            const { value: wrap } = pickWrapForMe(incoming, user.id);
-            if (!wrap) return;
-
-            let keyB64;
-            try { keyB64 = decryptRSA(b64FixPadding(wrap), privateKeyPem); } catch { return; }
-
-            const decryptedText = decryptAES({
-              ciphertextB64: b64FixPadding(incoming.encrypted_message),
-              ivB64: b64FixPadding(incoming.iv),
-              macB64: b64FixPadding(incoming.mac),
-              keyB64: b64FixPadding(keyB64),
-            });
-
-            const isMine = String(senderId) === myIdStr;
-            const newMsg = {
-              _id: String(incoming.id || `${Date.now()}_${Math.random()}`),
-              text: decryptedText || "🔒 Encrypted Message",
-              createdAt: incoming.timestamp ? new Date(incoming.timestamp)
-                : (incoming.created_at ? new Date(incoming.created_at) : new Date()),
-              user: { _id: isMine ? String(user.id) : String(activeSelected.id), name: isMine ? "You" : nameOf(activeSelected) },
-            };
-
-            setMessages((prev) => {
-              const merged = mergeUniqueById(prev, [newMsg]);
-              if (activeSelected?.id) saveCachedMessages(activeSelected.id, merged);
-              return merged;
-            });
-
-            setThreads((t) => {
-              const next = upsertThread(
-                t,
-                { id: activeSelected.id, ...activeSelected },
-                decryptedText,
-                newMsg.createdAt,
-                false,
-                { resetUnread: true }
-              );
-              saveCachedThreads(next);
-              return next;
-            });
-          } catch (e) {
-            console.error("❌ onMessage handler error:", e);
-          }
-        },
-      });
-
-      wsSubRef.current = sub;
-      unsub = () => { try { sub.unsubscribe?.(); } catch {} wsSubRef.current = null; };
+      const ok = await isKeysReady(user.id);
+      if (ok) await loadPrivateKeyForUser(user.id);
     })();
 
-    return () => { if (unsub) unsub(); };
-    // ⚠️ keep deps minimal so typing/searching doesn't close WS
-  }, [user?.id, getAccessToken]);
-
-  // ---- Thread helpers
-  const upsertThread = (threads, otherUser, lastText, at, countUnread, opts = {}) => {
-    const key = asId(otherUser.id);
-    const prev = threads[key] || {
-      id: key,
-      name: nameOf(otherUser),
-      meta: {
-        first_name: otherUser.first_name,
-        last_name: otherUser.last_name,
-        email: otherUser.email,
-      },
-      lastText: "",
-      updatedAt: new Date().toISOString(),
-      unread: 0,
-    };
-    const nextName = nameOf({ ...prev.meta, ...otherUser }) || prev.name;
-    return {
-      ...threads,
-      [key]: {
-        ...prev,
-        name: nextName,
-        meta: {
-          first_name: (otherUser.first_name ?? prev.meta?.first_name),
-          last_name: (otherUser.last_name ?? prev.meta?.last_name),
-          email: (otherUser.email ?? prev.meta?.email),
-        },
-        lastText: typeof lastText === "string" ? lastText : prev.lastText,
-        updatedAt: (at || new Date()).toISOString(),
-        unread: opts.resetUnread ? 0 : Math.max(0, (prev.unread || 0) + (countUnread ? 1 : 0)),
-      },
-    };
-  };
-
-  // ---- actions
-  const openConversation = (neighbor) => {
-    if (!neighbor?.id) return;
-    const known = directory[asId(neighbor.id)] || neighbor;
-
-    setSelectedUser(known);
-    setMode("conversation");
-
-    (async () => {
-      const cached = await loadCachedMessages(known.id);
-      const normalized = (cached || []).map(m => ({
-        ...m,
-        _id: String(m._id),
-        user: { ...m.user, _id: String(m.user?._id) },
-        createdAt: new Date(m.createdAt),
-      })).sort((a,b) => new Date(a.createdAt) - new Date(b.createdAt));
-      setMessages(normalized);
-
-      const lastCachedAt = normalized.length
-        ? new Date(normalized[normalized.length - 1].createdAt).toISOString()
-        : null;
-      const threadMeta = threads[asId(known.id)];
-      const threadUpdatedAt = threadMeta?.updatedAt ? new Date(threadMeta.updatedAt).toISOString() : null;
-
-      const shouldHydrate =
-        !lastCachedAt ||
-        (threadUpdatedAt && threadUpdatedAt > lastCachedAt) ||
-        (threadMeta?.unread > 0);
-
-      if (shouldHydrate) {
-        hydrateConversation(known, { onlyIfNewerThan: lastCachedAt || undefined });
-      }
-    })();
-
-    setThreads((t) => {
-      const next = upsertThread(t, known, "", new Date(), false, { resetUnread: true });
-      saveCachedThreads(next);
-      return next;
+    const api = createOrGetChatSocket({
+      token: () => getAccessToken(),
+      baseUrl: WS_URL,
+      path: "/chat/",
+      userId: user.id,
+      prefer: "query",
+      onOpen: (...args) => handlerRef.current.onOpen(...args),
+      onClose: (...args) => handlerRef.current.onClose(...args),
+      onError: (...args) => handlerRef.current.onError(...args),
+      onMessage: (...args) => handlerRef.current.onMessage(...args),
     });
-    setEffectiveQuery("");
-    setSearchResults([]);
-    markThreadRead(known.id);
-  };
 
-  const backToThreads = () => {
-    setMode("threads");
-    if (selectedUser?.id) {
-      setThreads((t) => {
-        const next = upsertThread(t, selectedUser, "", new Date(), false, { resetUnread: true });
-        saveCachedThreads(next);
-        return next;
-      });
-      markThreadRead(selectedUser.id);
+    wsApiRef.current = api;
+    setWsStatus("connecting");
+    (async () => { try { await api?.ready?.(); setWsStatus("connected"); setLastConnectAt(Date.now()); } catch { setWsStatus("disconnected"); } })();
+
+    return () => {
+      mountedRef.current = false;
+      try { wsApiRef.current?.unsubscribe?.(); } catch {}
+      wsApiRef.current = null;
+      // do NOT destroy the socket here; AuthProvider keeps it alive
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [user?.id]);
+
+  /* -------- send helpers -------- */
+  const safeSendOverWs = useCallback(async (payload) => {
+    const api = wsApiRef.current;
+    if (!api || !api.socket?.ready) {
+      sendQueueRef.current.push(payload);
+      return false;
     }
-    setSelectedUser(null);
-    setMessages([]);
-    fetchThreadsIndex();
-  };
+    try {
+      api.send(payload);
+      return true;
+    } catch {
+      sendQueueRef.current.push(payload);
+      return false;
+    }
+  }, []);
 
-  const sendMessage = async (messageVal) => {
+  const sendMessage = useCallback(async (messageVal) => {
     if (sendInFlight) return;
     const messageText = typeof messageVal === "string" ? messageVal : (messageVal?.text ?? "");
     const text = messageText.trim();
     if (!text) return;
 
-    const sub = wsSubRef.current;
-    if (!selectedUser || !sub) { Alert.alert("Not connected", "Chat connection not ready yet."); return; }
+    const target = selectedUserRef.current;
+    if (!target) { Alert.alert("Not connected", "Select a conversation first."); return; }
 
     const privateKey = await AsyncStorage.getItem("privateKey");
     const myPublicKey = await AsyncStorage.getItem("publicKey");
@@ -600,24 +534,19 @@ const ChatScreen = ({ navigation }) => {
       return;
     }
 
-    // Ensure socket is ready
-    if (!sub.socket?.ready) {
-      try { await sub.ready(); } catch { Alert.alert("WebSocket not connected. Try again."); return; }
-    }
-
     try {
       setSendInFlight(true);
 
-      let recipientPub = await AsyncStorage.getItem(`publicKey_${selectedUser.id}`);
+      let recipientPub = await AsyncStorage.getItem(`publicKey_${target.id}`);
       if (!recipientPub) {
-        const resp = await api.get(`/users/${selectedUser.id}/public_key/`);
+        const resp = await api.get(`/users/${target.id}/public_key/`);
         if (!resp?.public_key) {
           Alert.alert("Encryption Error", "Public key not found for this user.");
           setSendInFlight(false);
           return;
         }
         recipientPub = resp.public_key;
-        await AsyncStorage.setItem(`publicKey_${selectedUser.id}`, recipientPub);
+        await AsyncStorage.setItem(`publicKey_${target.id}`, recipientPub);
       }
 
       const bundle = encryptAES(text);
@@ -633,63 +562,235 @@ const ChatScreen = ({ navigation }) => {
         createdAt: now,
         user: { _id: String(user.id), name: "You" },
       };
-      setMessages((prev) => {
-        const merged = mergeUniqueById(prev, [optimistic]);
-        if (selectedUser?.id) saveCachedMessages(selectedUser.id, merged);
-        return merged;
-      });
-      setThreads((t) => {
-        const next = upsertThread(t, selectedUser, text, now, false);
-        saveCachedThreads(next);
-        return next;
-      });
-      setDraft("");
 
-      if (!isComposingRef.current) {
-        requestAnimationFrame(() => listRef.current?.scrollToOffset({ offset: 0, animated: true }));
-      }
+      const merged = mergeUniqueById.current(messagesRef.current, [optimistic]);
+      const pruned = pruneToCacheLimit(merged);
+      setMessages(pruned);
+      if (target?.id) saveCachedMessages(target.id, pruned);
 
-      sub.send({
-        receiver_id: selectedUser.id,
+      const tNext = upsertThread.current(threadsRef.current, target, text, now, false);
+      setThreads(tNext);
+      saveCachedThreads(tNext);
+
+      requestAnimationFrame(() => listRef.current?.scrollToOffset({ offset: 0, animated: true }));
+
+      const payload = {
+        receiver_id: target.id,
         encrypted_message: bundle.ciphertextB64,
         encrypted_key_for_receiver,
         encrypted_key_for_sender,
         iv: bundle.ivB64,
         mac: bundle.macB64,
         client_tmp_id: optimisticId,
-      });
+      };
+
+      await safeSendOverWs(payload);
+      setDraft("");
     } catch (error) {
-      console.error("❌ Error sending message:", error);
+      console.error("send error:", error);
       Alert.alert("Send Error", "Failed to send message.");
     } finally {
-      setTimeout(() => setSendInFlight(false), 200);
+      setTimeout(() => setSendInFlight(false), 120);
     }
-  };
+  }, [saveCachedMessages, saveCachedThreads, safeSendOverWs, user?.id]);
 
-  const onRefresh = useCallback(() => {
-    setRefreshing(true);
-    fetchThreadsIndex().finally(() => setRefreshing(false));
-  }, [fetchThreadsIndex]);
-
+  const onRefresh = useCallback(() => { fetchThreadsIndex(); }, [fetchThreadsIndex]);
   const messagesForUI = useMemo(() => messages.slice().reverse(), [messages]);
 
-  // ---------- UI ----------
-  const ThreadsList = () => {
-    const items = Object.values(threads || {}).sort((a, b) => new Date(b.updatedAt) - new Date(a.updatedAt));
+  /* -------- conversation helpers -------- */
+  const getAllConversation = useCallback(async (otherId) => {
+    let page = 1;
+    const limit = FETCH_LIMIT;
+    let allRows = [];
+    while (true) {
+      const params = { page, limit };
+      const payload = await api.get(`/conversations/${otherId}/`, { params });
+      const rows = Array.isArray(payload?.results) ? payload.results : (Array.isArray(payload) ? payload : []);
+      allRows = allRows.concat(rows || []);
+      if (!rows?.length || rows.length < limit) break;
+      page += 1;
+      if (page > 50) break;
+    }
+    return allRows;
+  }, []);
+
+  const initialLoad = useCallback(async (neighbor) => {
+    if (!neighbor?.id) return;
+    try {
+      let privateKeyPem = await AsyncStorage.getItem("privateKey");
+      if (!privateKeyPem && user?.id) {
+        privateKeyPem = await AsyncStorage.getItem(`privateKey_${user.id}`);
+        if (privateKeyPem) await AsyncStorage.setItem("privateKey", privateKeyPem);
+      }
+      if (!privateKeyPem) return;
+
+      const rows = await withTopSpinner(() => getAllConversation(neighbor.id));
+      const decrypted = rows
+        .map((m) => decryptServerMessage(m, privateKeyPem, user.id, neighbor))
+        .filter(Boolean)
+        .map((m) => ({ ...m, _id: String(m._id), user: { ...m.user, _id: String(m.user._id) } }))
+        .sort((a, b) => new Date(a.createdAt) - new Date(b.createdAt));
+
+      const pruned = pruneToCacheLimit(decrypted);
+      setMessages(pruned);
+      await saveCachedMessages(neighbor.id, pruned);
+    } catch (e) {
+      console.log("initialLoad error", e?.message);
+    }
+  }, [getAllConversation, user?.id, saveCachedMessages, withTopSpinner]);
+
+  const openConversation = useCallback((neighbor) => {
+    if (!neighbor?.id) return;
+    const known = directoryRef.current[asId(neighbor.id)] || neighbor;
+
+    setSelectedUser(known);
+    if (mode !== "conversation") setMode("conversation");
+
+    (async () => {
+      const cached = await loadCachedMessages(known.id);
+      const normalized = (cached || []).map((m) => ({
+        ...m,
+        _id: String(m._id),
+        user: { ...m.user, _id: String(m.user?._id) },
+        createdAt: new Date(m.createdAt),
+      })).sort((a, b) => new Date(a.createdAt) - new Date(b.createdAt));
+
+      setMessages(normalized);
+
+      const ok = await isKeysReady(user.id);
+      if (ok) {
+        if (normalized.length === 0) await initialLoad(known);
+      }
+    })();
+
+    const tNext = upsertThread.current(threadsRef.current, known, "", new Date(), false, { resetUnread: true });
+    setThreads(tNext);
+    saveCachedThreads(tNext);
+
+    setEffectiveQuery("");
+    setSearchResults([]);
+    markThreadRead(known.id);
+  }, [mode, loadCachedMessages, initialLoad, markThreadRead, saveCachedThreads, user?.id]);
+
+  const backToThreads = useCallback(() => {
+    setMode("threads");
+    const sel = selectedUserRef.current;
+    if (sel?.id) {
+      const tNext = upsertThread.current(threadsRef.current, sel, "", new Date(), false, { resetUnread: true });
+      setThreads(tNext);
+      saveCachedThreads(tNext);
+      markThreadRead(sel.id);
+    }
+    setSelectedUser(null);
+    setMessages([]);
+    fetchThreadsIndex();
+  }, [fetchThreadsIndex, markThreadRead, saveCachedThreads]);
+
+  /* ---------------- UI ---------------- */
+  const TopSyncBar = () =>
+    syncCounter > 0 ? (
+      <View style={styles.syncBar}>
+        <ActivityIndicator size="small" />
+        <Text style={styles.syncText}>Syncing...</Text>
+      </View>
+    ) : null;
+
+  const StatusPill = React.memo(() => {
+    const age = lastConnectAtRef.current ? Math.max(0, Math.floor((Date.now() - lastConnectAtRef.current) / 1000)) : null;
+    const text =
+      wsStatusRef.current === "connected"
+        ? `Connected${age != null ? ` · ${age}s` : ""}`
+        : wsStatusRef.current === "connecting"
+        ? "Connecting…"
+        : "Disconnected";
+
+    return (
+      <View style={styles.wsRow}>
+        <View style={[
+          styles.dot,
+          wsStatusRef.current === "connected" ? styles.dotOk :
+          wsStatusRef.current === "connecting" ? styles.dotWarn : styles.dotBad
+        ]} />
+        <Text style={styles.wsText}>{text}</Text>
+        {wsStatusRef.current !== "connected" && (
+          <TouchableOpacity
+            onPress={async () => {
+              setWsStatus("connecting");
+              try { await wsApiRef.current?.ready?.(); setWsStatus("connected"); setLastConnectAt(Date.now()); }
+              catch { setWsStatus("disconnected"); }
+            }}
+            style={styles.retryBtn}
+            activeOpacity={0.85}
+          >
+            <Text style={styles.retryTxt}>Retry</Text>
+          </TouchableOpacity>
+        )}
+      </View>
+    );
+  });
+
+  const ThreadsList = React.memo(() => {
+    const items = useMemo(
+      () => Object.values(threadsRef.current || {}).sort((a, b) => new Date(b.updatedAt) - new Date(a.updatedAt)),
+      [threads]
+    );
+
+    const onTapThread = useCallback((item) => {
+      openConversation({
+        id: item.id,
+        first_name: item.meta?.first_name,
+        last_name: item.meta?.last_name,
+        email: item.meta?.email,
+      });
+    }, [openConversation]);
+
+    const renderItem = useCallback(({ item }) => {
+      return (
+        <TouchableOpacity style={styles.threadItem} onPress={() => onTapThread(item)} activeOpacity={0.85}>
+          <View style={styles.avatar}>
+            <Text style={styles.avatarTxt}>{item.name?.[0]?.toUpperCase() || "N"}</Text>
+          </View>
+          <View style={styles.threadTextCol}>
+            <View style={styles.threadTopRow}>
+              <Text numberOfLines={1} style={styles.threadName}>{item.name}</Text>
+              <Text style={styles.threadTime}>
+                {new Date(item.updatedAt).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })}
+              </Text>
+            </View>
+            <View style={styles.threadBottomRow}>
+              <Text numberOfLines={1} style={styles.threadPreview}>{item.lastText || "Start the conversation"}</Text>
+              {item.unread > 0 && (<View style={styles.unreadBadge}><Text style={styles.unreadTxt}>{item.unread}</Text></View>)}
+            </View>
+          </View>
+        </TouchableOpacity>
+      );
+    }, [onTapThread]);
+
     return (
       <View style={{ flex: 1 }}>
+        <TopSyncBar />
+        <StatusPill />
+
         <Text style={styles.sectionTitle}>Start new</Text>
-        <UncontrolledLockedSearch initialValue={effectiveQuery} onDebouncedChange={handleDebouncedSearch} />
+        <TextInput
+          value={effectiveQuery}
+          onChangeText={(t) => { setEffectiveQuery(t); handleDebouncedSearch(t); }}
+          placeholder="Search neighbors…"
+          placeholderTextColor="#AAA"
+          style={styles.searchInput}
+          autoCorrect={false}
+          autoCapitalize="none"
+          returnKeyType="search"
+        />
         {effectiveQuery.length >= 2 && (
           <View style={{ maxHeight: 260 }}>
             <FlatList
               data={searchResults}
               keyExtractor={(u) => asId(u.id)}
               keyboardShouldPersistTaps="always"
-              keyboardDismissMode="none"
               removeClippedSubviews={false}
               renderItem={({ item }) => (
-                <TouchableOpacity style={styles.userItem} onPress={() => openConversation(item)}>
+                <TouchableOpacity style={styles.userItem} onPress={() => openConversation(item)} activeOpacity={0.85}>
                   <Text style={styles.userText}>{item.first_name} {item.last_name}</Text>
                 </TouchableOpacity>
               )}
@@ -703,69 +804,31 @@ const ChatScreen = ({ navigation }) => {
           data={items}
           keyExtractor={(t) => String(t.id)}
           keyboardShouldPersistTaps="always"
-          keyboardDismissMode="none"
           removeClippedSubviews={false}
           contentContainerStyle={{ paddingBottom: 12 }}
-          refreshControl={<RefreshControl refreshing={refreshing} onRefresh={onRefresh} />}
-          renderItem={({ item }) => (
-            <TouchableOpacity
-              style={styles.threadItem}
-              onPress={() => openConversation({
-                id: item.id,
-                first_name: item.meta?.first_name,
-                last_name: item.meta?.last_name,
-                email: item.meta?.email,
-              })}
-            >
-              <View style={styles.avatar}><Text style={styles.avatarTxt}>{item.name?.[0]?.toUpperCase() || "N"}</Text></View>
-              <View style={styles.threadTextCol}>
-                <View style={styles.threadTopRow}>
-                  <Text numberOfLines={1} style={styles.threadName}>{item.name}</Text>
-                  <Text style={styles.threadTime}>{formatTime(item.updatedAt)}</Text>
-                </View>
-                <View style={styles.threadBottomRow}>
-                  <Text numberOfLines={1} style={styles.threadPreview}>{item.lastText || "Start the conversation"}</Text>
-                  {item.unread > 0 && (<View style={styles.unreadBadge}><Text style={styles.unreadTxt}>{item.unread}</Text></View>)}
-                </View>
-              </View>
-            </TouchableOpacity>
-          )}
+          refreshControl={<RefreshControl refreshing={false} onRefresh={onRefresh} />}
+          renderItem={renderItem}
           ListEmptyComponent={<Text style={{ color: "#888", textAlign: "center", marginTop: 20 }}>No conversations yet. Start one above.</Text>}
         />
       </View>
     );
-  };
+  });
 
   const Conversation = React.memo(function ConversationInner() {
-    if (!effectiveReady) {
-      return (
-        <View style={{ padding: 20, alignItems: "center" }}>
-          <ActivityIndicator size="large" />
-          <Text style={{ color: "#FFF", marginTop: 10, textAlign: "center" }}>
-            Setting up your encryption keys… You can browse services while we finish.
-          </Text>
-          <TouchableOpacity style={[styles.backButton, { marginTop: 16 }]} onPress={() => navigation.navigate("Services")}>
-            <Text style={styles.backText}>Go to Services</Text>
-          </TouchableOpacity>
-        </View>
-      );
-    }
-    const loadingBanner = loadingHydrateId && String(selectedUser?.id) === String(loadingHydrateId);
-
     return (
       <>
+        <TopSyncBar />
+        <StatusPill />
+
         <View style={styles.convHeader}>
-          <TouchableOpacity onPress={backToThreads} style={styles.backButton}><Text style={styles.backText}>←</Text></TouchableOpacity>
-          <Text style={styles.headerName} numberOfLines={1}>{nameOf(selectedUser)}</Text>
+          <TouchableOpacity onPress={backToThreads} style={styles.backButton} activeOpacity={0.85}>
+            <Text style={styles.backText}>←</Text>
+          </TouchableOpacity>
+          <View style={{ flexDirection: "column", alignItems: "center", flex: 1, justifyContent: "center" }}>
+            <Text style={styles.headerName} numberOfLines={1}>{nameOf(selectedUser)}</Text>
+          </View>
           <View style={{ width: 36 }} />
         </View>
-
-        {loadingBanner && (
-          <View style={styles.loadingBanner}>
-            <ActivityIndicator size="small" />
-            <Text style={styles.loadingBannerText}> Loading messages…</Text>
-          </View>
-        )}
 
         <View style={{ flex: 1 }}>
           <FlatList
@@ -776,9 +839,13 @@ const ChatScreen = ({ navigation }) => {
             data={messagesForUI}
             keyExtractor={(m) => String(m._id)}
             keyboardShouldPersistTaps="always"
-            keyboardDismissMode="interactive"
             removeClippedSubviews={false}
-            maintainVisibleContentPosition={{ minIndexForVisible: 0 }}
+            initialNumToRender={24}
+            maxToRenderPerBatch={24}
+            windowSize={12}
+            decelerationRate="fast"
+            scrollEventThrottle={16}
+            overScrollMode="never"
             renderItem={({ item }) => {
               const mine = String(item.user?._id) === String(user.id);
               return (
@@ -790,7 +857,6 @@ const ChatScreen = ({ navigation }) => {
                 </View>
               );
             }}
-            refreshControl={<RefreshControl refreshing={refreshing} onRefresh={onRefresh} />}
           />
 
           {Platform.OS === "ios" ? (
@@ -800,7 +866,7 @@ const ChatScreen = ({ navigation }) => {
                 setDraft={setDraft}
                 sendMessage={sendMessage}
                 sendInFlight={sendInFlight}
-                isComposingRef={isComposingRef}
+                canType={!!effectiveReady}
               />
             </KeyboardAvoidingView>
           ) : (
@@ -809,7 +875,7 @@ const ChatScreen = ({ navigation }) => {
               setDraft={setDraft}
               sendMessage={sendMessage}
               sendInFlight={sendInFlight}
-              isComposingRef={isComposingRef}
+              canType={!!effectiveReady}
             />
           )}
         </View>
@@ -824,55 +890,85 @@ const ChatScreen = ({ navigation }) => {
   );
 };
 
-// ----- Composer -----
-const Composer = ({ draft, setDraft, sendMessage, sendInFlight, isComposingRef }) => {
+/* ---------------- Composer ---------------- */
+const Composer = React.memo(({ draft, setDraft, sendMessage, sendInFlight, canType }) => {
+  const disabled = !canType;
+  const onPressSend = useCallback(() => {
+    if (disabled || sendInFlight) return;
+    const t = (draft || "").trim();
+    if (!t) return;
+    setDraft("");
+    sendMessage(t);
+  }, [disabled, draft, sendInFlight, sendMessage, setDraft]);
+
   return (
     <View style={styles.composerRow}>
       <TextInput
         value={draft}
-        onChangeText={(t) => { isComposingRef.current = true; setDraft(t); }}
-        placeholder="Type a message…"
+        onChangeText={setDraft}
+        placeholder={disabled ? "Setting up encryption keys..." : "Type a message…"}
         placeholderTextColor="#AAA"
-        style={styles.composerInput}
+        style={[styles.composerInput, (disabled || sendInFlight) && { opacity: 0.6 }]}
+        editable={!disabled && !sendInFlight}
         autoCorrect={false}
         autoCapitalize="none"
         blurOnSubmit={false}
         autoFocus={false}
-        importantForAutofill="no"
-        textContentType="none"
-        enablesReturnKeyAutomatically
         returnKeyType="send"
-        scrollEnabled={false}
-        onFocus={() => { isComposingRef.current = true; }}
-        onBlur={() => { setTimeout(() => { isComposingRef.current = false; }, 50); }}
-        onSubmitEditing={() => {
-          const t = (draft || "").trim();
-          if (!t) return;
-          setDraft("");
-          isComposingRef.current = false;
-          sendMessage(t);
-        }}
+        keyboardAppearance="dark"
+        keyboardDismissMode="none"
+        keyboardShouldPersistTaps="always"
+        onSubmitEditing={onPressSend}
       />
       <TouchableOpacity
-        style={styles.composerSend}
-        onPress={() => {
-          const t = (draft||"").trim();
-          if (!t) return;
-          setDraft("");
-          isComposingRef.current = false;
-          sendMessage(t);
-        }}
-        disabled={sendInFlight}
+        style={[styles.composerSend, (disabled || sendInFlight) && { opacity: 0.6 }]}
+        onPress={onPressSend}
+        activeOpacity={0.85}
+        disabled={sendInFlight || disabled}
       >
         <Text style={styles.composerSendTxt}>{sendInFlight ? "…" : "Send"}</Text>
       </TouchableOpacity>
     </View>
   );
-};
+});
 
-// ---------- styles ----------
+/* ---------------- styles ---------------- */
 const styles = StyleSheet.create({
   safeContainer: { flex: 1, backgroundColor: "#0F1012" },
+
+  // Top sync bar
+  syncBar: {
+    height: 32,
+    backgroundColor: "#11141a",
+    borderBottomWidth: StyleSheet.hairlineWidth,
+    borderBottomColor: "rgba(255,255,255,0.08)",
+    paddingHorizontal: 12,
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8,
+  },
+  syncText: { color: "#9fb3c8", fontSize: 12 },
+
+  // Compact status pill
+  wsRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    marginHorizontal: 12,
+    marginTop: 8,
+    paddingHorizontal: 10,
+    paddingVertical: 8,
+    borderRadius: 12,
+    backgroundColor: "#14161C",
+    borderWidth: 1,
+    borderColor: "rgba(255,255,255,0.06)",
+  },
+  dot: { width: 8, height: 8, borderRadius: 4, backgroundColor: "#888", marginRight: 8 },
+  dotOk: { backgroundColor: "#4CAF50" },
+  dotWarn: { backgroundColor: "#FFC107" },
+  dotBad: { backgroundColor: "#E57373" },
+  wsText: { color: "#9BA3AE", fontSize: 12, flex: 1 },
+  retryBtn: { paddingHorizontal: 10, paddingVertical: 6, backgroundColor: "#2A66FF", borderRadius: 8 },
+  retryTxt: { color: "#fff", fontWeight: "800", fontSize: 12 },
 
   // Header
   convHeader: {
@@ -883,32 +979,33 @@ const styles = StyleSheet.create({
     paddingBottom: 4,
     borderBottomWidth: 1,
     borderBottomColor: "rgba(255,255,255,0.06)",
+    backgroundColor: "#0F1012",
   },
-  headerName: { color: "#FFF", fontSize: 18, fontWeight: "800", flex: 1, textAlign: "center" },
+  headerName: { color: "#FFF", fontSize: 18, fontWeight: "800", textAlign: "center" },
 
-  backButton: { paddingHorizontal: 10, paddingVertical: 6, backgroundColor: "#1C1E24", borderRadius: 8 },
+  backButton: { paddingHorizontal: 12, paddingVertical: 8, backgroundColor: "#1C1E24", borderRadius: 10 },
   backText: { color: "#FFD700", fontSize: 16 },
-
-  loadingBanner: { flexDirection: "row", alignItems: "center", alignSelf: "center", marginVertical: 6 },
-  loadingBannerText: { color: "#BDBDBD", marginLeft: 8 },
 
   sectionTitle: { color: "#AEB3BB", fontSize: 13, marginTop: 10, marginBottom: 6, paddingHorizontal: 12 },
 
   threadItem: {
     flexDirection: "row", alignItems: "center",
-    paddingVertical: 10, paddingHorizontal: 12, backgroundColor: "#17181D",
-    borderRadius: 12, marginBottom: 8, marginHorizontal: 12,
+    paddingVertical: 12, paddingHorizontal: 14, backgroundColor: "#17181D",
+    borderRadius: 14, marginBottom: 10, marginHorizontal: 12,
     borderWidth: 1, borderColor: "rgba(255,255,255,0.06)",
   },
-  avatar: { width: 42, height: 42, borderRadius: 21, backgroundColor: "#242733", alignItems: "center", justifyContent: "center", marginRight: 10 },
+  avatar: {
+    width: 44, height: 44, borderRadius: 22, backgroundColor: "#242733",
+    alignItems: "center", justifyContent: "center", marginRight: 12,
+  },
   avatarTxt: { color: "#FFD700", fontWeight: "900", fontSize: 16 },
   threadTextCol: { flex: 1 },
   threadTopRow: { flexDirection: "row", alignItems: "center", justifyContent: "space-between" },
   threadName: { color: "#FFF", fontSize: 15, fontWeight: "800", flex: 1, marginRight: 8 },
   threadTime: { color: "#8A8F98", fontSize: 12 },
-  threadBottomRow: { flexDirection: "row", alignItems: "center", justifyContent: "space-between", marginTop: 2 },
+  threadBottomRow: { flexDirection: "row", alignItems: "center", justifyContent: "space-between", marginTop: 3 },
   threadPreview: { color: "#C0C5CF", fontSize: 13, flex: 1, marginRight: 8 },
-  unreadBadge: { minWidth: 20, paddingHorizontal: 6, height: 20, borderRadius: 10, backgroundColor: "#E63946", alignItems: "center", justifyContent: "center" },
+  unreadBadge: { minWidth: 22, paddingHorizontal: 7, height: 20, borderRadius: 10, backgroundColor: "#E63946", alignItems: "center", justifyContent: "center" },
   unreadTxt: { color: "#FFF", fontWeight: "800", fontSize: 12 },
 
   searchInput: {
@@ -917,8 +1014,7 @@ const styles = StyleSheet.create({
     color: "#FFF",
     borderRadius: 12,
     marginHorizontal: 12,
-    borderWidth: 1,
-    borderColor: "rgba(255,255,255,0.06)",
+    borderWidth: 1, borderColor: "rgba(255,255,255,0.06)",
   },
   userItem: { padding: 12, backgroundColor: "#17181D", borderRadius: 12, marginBottom: 8, marginHorizontal: 12, borderWidth: 1, borderColor: "rgba(255,255,255,0.06)" },
   userText: { color: "#FFF", fontSize: 15, fontWeight: "600" },
@@ -934,16 +1030,8 @@ const styles = StyleSheet.create({
     borderRadius: 16,
     marginHorizontal: 6,
   },
-  bubbleMine: {
-    alignSelf: "flex-end",
-    backgroundColor: "#3E4A76",
-  },
-  bubbleTheirs: {
-    alignSelf: "flex-start",
-    backgroundColor: "#1C1E24",
-    borderWidth: 1,
-    borderColor: "rgba(255,255,255,0.06)",
-  },
+  bubbleMine: { alignSelf: "flex-end", backgroundColor: "#3E4A76" },
+  bubbleTheirs: { alignSelf: "flex-start", backgroundColor: "#1C1E24", borderWidth: 1, borderColor: "rgba(255,255,255,0.06)" },
   bubbleText: { color: "#fff", fontSize: 16, lineHeight: 22 },
   bubbleTime: { color: "#D6DAE3", opacity: 0.7, fontSize: 11, marginTop: 4, alignSelf: "flex-end" },
 
@@ -968,7 +1056,7 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderColor: "rgba(255,255,255,0.08)",
   },
-  composerSend: { paddingHorizontal: 14, paddingVertical: 10, backgroundColor: "#4B6BFB", borderRadius: 14 },
+  composerSend: { paddingHorizontal: 16, paddingVertical: 11, backgroundColor: "#4B6BFB", borderRadius: 14 },
   composerSendTxt: { color: "#FFF", fontWeight: "800" },
 });
 
