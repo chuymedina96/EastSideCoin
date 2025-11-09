@@ -16,6 +16,7 @@ import {
   KeyboardAvoidingView,
   ScrollView,
   Alert,
+  Image,
 } from "react-native";
 import { SafeAreaView, useSafeAreaInsets } from "react-native-safe-area-context";
 import debounce from "lodash.debounce";
@@ -32,6 +33,11 @@ import {
   completeBooking,
   bookService,
 } from "../utils/api";
+import { API_URL } from "../config";
+import avatarPlaceholder from "../../assets/avatar-placeholder.png"; // ✅ same placeholder used in ProfileScreen
+
+// NOTE: Removed import { Audio } from "expo-av"; to avoid the "interruptionModeIOS" error.
+// If you need Audio elsewhere, configure it there with valid props.
 
 const THEME = {
   bg: "#101012",
@@ -62,6 +68,27 @@ const toArray = (data) => {
   return [];
 };
 
+// ---- Avatar URI helper (same logic as ProfileScreen) ----
+function resolveAvatarUri(userLike, fallback) {
+  const raw = userLike?.avatar_url || fallback || "";
+  if (!raw) return null;
+  const lower = String(raw).toLowerCase();
+  const isAbsolute =
+    lower.startsWith("http://") ||
+    lower.startsWith("https://") ||
+    lower.startsWith("data:") ||
+    lower.startsWith("file:") ||
+    lower.startsWith("content:");
+  const base = isAbsolute ? raw : `${API_URL.replace(/\/+$/, "")}/${String(raw).replace(/^\/+/, "")}`;
+  const ts =
+    userLike?.avatar_updated_at ||
+    userLike?.updated_at ||
+    userLike?.profile_updated_at ||
+    Date.now();
+  const sep = base.includes("?") ? "&" : "?";
+  return `${base}${sep}t=${encodeURIComponent(String(ts))}`;
+}
+
 const isoDay = (d) => {
   const dd = new Date(d);
   dd.setHours(0, 0, 0, 0);
@@ -73,8 +100,14 @@ const endOfMonthISO = (date) => isoDay(new Date(date.getFullYear(), date.getMont
 /* ======================== MAIN ======================== */
 const ServicesScreen = ({ navigation, route }) => {
   const insets = useSafeAreaInsets();
-  const { user } = useContext(AuthContext);
+  const { user, accessToken } = useContext(AuthContext);
   const meId = user?.id ?? route?.params?.meId ?? 0;
+
+  // Optional auth header for protected media endpoints
+  const imageHeaders = useMemo(() => {
+    if (!accessToken) return undefined;
+    return { Authorization: `Bearer ${accessToken}` };
+  }, [accessToken]);
 
   // -------- UI/Query State --------
   const [tab, setTab] = useState(Tabs.Browse);
@@ -222,188 +255,6 @@ const ServicesScreen = ({ navigation, route }) => {
     doFetchBrowse(query, cat);
   };
 
-  const reloadBookings = useCallback(
-    async (force = false) => {
-      if (tab !== Tabs.Bookings && !force) return;
-      await fetchBookings(1, true);
-    },
-    [tab] // fetchBookings is ref-proxied below
-  );
-
-  const onRefresh = useCallback(async () => {
-    setRefreshing(true);
-    await Promise.all([
-      loadBrowse(),
-      loadMine(),
-      tab === Tabs.Bookings ? reloadBookings(true) : Promise.resolve(),
-      tab === Tabs.Bookings ? refreshMonthAvailability(monthCursor) : Promise.resolve(),
-    ]);
-    setRefreshing(false);
-  }, [loadBrowse, loadMine, tab, reloadBookings, refreshMonthAvailability, monthCursor]);
-
-  // ----- CREATE -----
-  const openCreate = () => {
-    setCTitle("");
-    setCDesc("");
-    setCPrice("");
-    setCCategory(categories.find((c) => c !== "All") || "Other");
-    setCreateError("");
-    setCatHintSeen(false);
-    setCreateOpen(true);
-  };
-  const closeCreate = () => {
-    if (creating) return;
-    setCreateOpen(false);
-  };
-  const validateCreate = () => {
-    if (!cTitle.trim()) return "Please add a title.";
-    if (!cDesc.trim()) return "Please add a short description.";
-    const price = Number(cPrice);
-    if (!Number.isFinite(price) || price < 0) return "Enter a valid non-negative price.";
-    if (!cCategory || cCategory === "All") return "Select a category.";
-    return null;
-  };
-  const handleCreate = async () => {
-    const err = validateCreate();
-    if (err) {
-      setCreateError(err);
-      return;
-    }
-    try {
-      setCreating(true);
-      setCreateError("");
-
-      const payload = {
-        title: cTitle.trim(),
-        description: cDesc.trim(),
-        price: Number(cPrice),
-        category: cCategory,
-      };
-
-      const created = await createService(payload);
-
-      const normalized = {
-        id: created?.id ?? `${Date.now()}`,
-        ...payload,
-        user: created?.user || created?.owner || null,
-      };
-      setMine((cur) => [normalized, ...cur]);
-
-      const matchesCat = category === "All" || cCategory.toLowerCase() === category.toLowerCase();
-      const qLower = query.trim().toLowerCase();
-      const matchesQuery =
-        !qLower ||
-        payload.title.toLowerCase().includes(qLower) ||
-        payload.description.toLowerCase().includes(qLower);
-      if (matchesCat && matchesQuery) setBrowse((cur) => [normalized, ...cur]);
-
-      setCreateOpen(false);
-    } catch (e) {
-      setCreateError(e?.data?.error || "Could not create service right now.");
-    } finally {
-      setCreating(false);
-    }
-  };
-
-  // ----- EDIT -----
-  const openEdit = (svc) => {
-    setEditId(svc.id);
-    setETitle(svc.title || "");
-    setEDesc(svc.description || "");
-    setEPrice(String(svc.price ?? ""));
-    setECategory(svc.category || "Other");
-    setEditError("");
-    setEditOpen(true);
-  };
-  const closeEdit = () => {
-    if (savingEdit) return;
-    setEditOpen(false);
-  };
-  const validateEdit = () => {
-    if (!eTitle.trim()) return "Please add a title.";
-    if (!eDesc.trim()) return "Please add a short description.";
-    const price = Number(ePrice);
-    if (!Number.isFinite(price) || price < 0) return "Enter a valid non-negative price.";
-    if (!eCategory || eCategory === "All") return "Select a category.";
-    return null;
-  };
-  const handleSaveEdit = async () => {
-    const err = validateEdit();
-    if (err) {
-      setEditError(err);
-      return;
-    }
-    try {
-      setSavingEdit(true);
-      setEditError("");
-
-      const payload = {
-        title: eTitle.trim(),
-        description: eDesc.trim(),
-        price: Number(ePrice),
-        category: eCategory,
-      };
-
-      // Try PATCH (standard), fallback to PUT or PATCH-with-body wrapper
-      let updated;
-      try {
-        updated = await api.patch(`/services/${editId}/`, payload);
-      } catch {
-        try {
-          updated = await api.put(`/services/${editId}/`, payload);
-        } catch {
-          updated = await api.patch(`/services/${editId}/`, { body: payload });
-        }
-      }
-
-      const normalized = {
-        id: updated?.id ?? editId,
-        ...payload,
-        user: updated?.user || updated?.owner || null,
-      };
-
-      setMine((cur) => cur.map((s) => (String(s.id) === String(editId) ? { ...s, ...normalized } : s)));
-      setBrowse((cur) => cur.map((s) => (String(s.id) === String(editId) ? { ...s, ...normalized } : s)));
-
-      setEditOpen(false);
-    } catch (e) {
-      setEditError(e?.data?.error || "Could not save changes right now.");
-    } finally {
-      setSavingEdit(false);
-    }
-  };
-  const confirmDelete = (svc) => {
-    Alert.alert("Delete Service", `Delete “${svc.title}”?`, [
-      { text: "Cancel", style: "cancel" },
-      { text: "Delete", style: "destructive", onPress: () => handleDelete(svc) },
-    ]);
-  };
-  const handleDelete = async (svc) => {
-    try {
-      setMine((cur) => cur.filter((s) => String(s.id) !== String(svc.id)));
-      setBrowse((cur) => cur.filter((s) => String(s.id) !== String(svc.id)));
-      try {
-        await api.delete(`/services/${svc.id}/`);
-      } catch {
-        await onRefresh();
-      }
-    } catch {}
-  };
-
-  // --- Category scroller helpers (in create modal) ---
-  const onCatScroll = (e) => {
-    const {
-      contentOffset: { x },
-      contentSize: { width: contentW },
-      layoutMeasurement: { width: layoutW },
-    } = e.nativeEvent;
-    setCatCanLeft(x > 2);
-    setCatCanRight(x + layoutW < contentW - 2);
-    if (!catHintSeen && x > 4) setCatHintSeen(true);
-  };
-  const scrollCatsToStart = () => catScrollRef.current?.scrollTo({ x: 0, animated: true });
-  const scrollCatsToEnd = () => catScrollRef.current?.scrollToEnd({ animated: true });
-
   /* =================== BOOKINGS PANE =================== */
   // filters
   const [bkSegment, setBkSegment] = useState(Segments[0]);
@@ -482,33 +333,30 @@ const ServicesScreen = ({ navigation, route }) => {
   );
 
   // month availability loader for Bookings pane month calendar
-  const refreshMonthAvailability = useCallback(
-    async (cursorDate) => {
-      const startISO = startOfMonthISO(cursorDate);
-      const endISO = endOfMonthISO(cursorDate);
-      try {
-        const params = {
-          role: "all",
-          from: `${startISO}T00:00:00`,
-          to: `${endISO}T23:59:59`,
-          limit: 500,
-          page: 1,
-        };
-        const res = await api.get("/bookings/", { params });
-        const list = Array.isArray(res?.results) ? res.results : Array.isArray(res) ? res : [];
-        const map = {};
-        for (const b of list) {
-          const day = (b?.start_at || "").slice(0, 10);
-          if (!day) continue;
-          map[day] = (map[day] || 0) + 1;
-        }
-        setBkMonthAvailability(map);
-      } catch {
-        setBkMonthAvailability({});
+  const refreshMonthAvailability = useCallback(async (cursorDate) => {
+    const startISO = startOfMonthISO(cursorDate);
+    const endISO = endOfMonthISO(cursorDate);
+    try {
+      const params = {
+        role: "all",
+        from: `${startISO}T00:00:00`,
+        to: `${endISO}T23:59:59`,
+        limit: 500,
+        page: 1,
+      };
+      const res = await api.get("/bookings/", { params });
+      const list = Array.isArray(res?.results) ? res.results : Array.isArray(res) ? res : [];
+      const map = {};
+      for (const b of list) {
+        const day = (b?.start_at || "").slice(0, 10);
+        if (!day) continue;
+        map[day] = (map[day] || 0) + 1;
       }
-    },
-    []
-  );
+      setBkMonthAvailability(map);
+    } catch {
+      setBkMonthAvailability({});
+    }
+  }, []);
 
   // connect reload ref to latest fetchBookings
   const fetchBookingsRef = useRef(fetchBookings);
@@ -517,6 +365,13 @@ const ServicesScreen = ({ navigation, route }) => {
   }, [fetchBookings]);
   const fetchBookingsProxy = (...args) => fetchBookingsRef.current(...args);
 
+  // load when entering Bookings or filters change
+  const [monthCursor, setMonthCursor] = useState(() => {
+    const d = new Date();
+    d.setDate(1);
+    d.setHours(0, 0, 0, 0);
+    return d;
+  });
   useEffect(() => {
     if (tab === Tabs.Bookings) {
       fetchBookingsProxy(1, true);
@@ -525,12 +380,25 @@ const ServicesScreen = ({ navigation, route }) => {
     return () => {
       if (bkAbortRef.current) bkAbortRef.current.abort();
     };
-  }, [tab, serverRole, serverStatus, bkSegment, bkDayISO, refreshMonthAvailability]); // Month refresh handled separately
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tab, serverRole, serverStatus, bkSegment, bkDayISO, refreshMonthAvailability]);
 
   const bkLoadMore = useCallback(async () => {
     if (!bkNextPage || bkLoading) return;
     await fetchBookingsProxy(bkPage + 1, false);
   }, [bkNextPage, bkLoading, bkPage]);
+
+  // ----- PULL TO REFRESH (services + bookings + month dots) -----
+  const onRefresh = useCallback(async () => {
+    setRefreshing(true);
+    await Promise.all([
+      loadBrowse(),
+      loadMine(),
+      tab === Tabs.Bookings ? fetchBookingsProxy(1, true) : Promise.resolve(),
+      tab === Tabs.Bookings ? refreshMonthAvailability(monthCursor) : Promise.resolve(),
+    ]);
+    setRefreshing(false);
+  }, [loadBrowse, loadMine, tab, refreshMonthAvailability, monthCursor]);
 
   const fmtTime = (iso) => {
     try {
@@ -609,7 +477,6 @@ const ServicesScreen = ({ navigation, route }) => {
       });
       setBkItems(next);
       await call();
-      // keep availability fresh
       refreshMonthAvailability(monthCursor);
     } catch (e) {
       setBkItems(previous);
@@ -653,6 +520,7 @@ const ServicesScreen = ({ navigation, route }) => {
         ? `${targetUser?.first_name || ""} ${targetUser?.last_name || ""}`.trim()
         : targetUser?.email || "Neighbor";
 
+    const avatarUri = resolveAvatarUri(targetUser);
     return (
       <Pressable style={({ pressed }) => [styles.card, pressed && { opacity: 0.97 }]} onPress={() => openDetail(item)}>
         <View style={styles.cardTopRow}>
@@ -664,9 +532,20 @@ const ServicesScreen = ({ navigation, route }) => {
           </Text>
         </View>
 
-        <Text style={styles.owner} numberOfLines={1}>
-          with {targetName} • <Text style={styles.categoryText}>{item.service?.category || "Other"}</Text>
-        </Text>
+        <Pressable
+          style={styles.ownerRow}
+          onPress={() => openProviderProfile(targetUser?.id)}
+        >
+          <Image
+            source={avatarUri ? { uri: avatarUri, headers: imageHeaders } : avatarPlaceholder}
+            style={styles.avatarSm}
+            resizeMode="cover"
+          />
+          <Text style={styles.owner} numberOfLines={1}>
+            with <Text style={styles.ownerLink}>{targetName}</Text> •{" "}
+            <Text style={styles.categoryText}>{item.service?.category || "Other"}</Text>
+          </Text>
+        </Pressable>
 
         <Text style={[styles.desc, { marginTop: 6 }]}>
           {fmtTime(item.start_at)} → {fmtTimeOnly(item.end_at)}
@@ -773,12 +652,6 @@ const ServicesScreen = ({ navigation, route }) => {
   );
 
   // Bookings filter month calendar
-  const [monthCursor, setMonthCursor] = useState(() => {
-    const d = new Date();
-    d.setDate(1);
-    d.setHours(0, 0, 0, 0);
-    return d;
-  });
   const monthInfo = useMemo(() => buildMonthInfo(monthCursor), [buildMonthInfo, monthCursor]);
 
   const gotoPrevMonth = () => {
@@ -1120,29 +993,59 @@ const ServicesScreen = ({ navigation, route }) => {
 
   /* =================== SERVICES UI PIECES =================== */
 
-  // robust chat navigation (handles nested stacks)
+  // robust chat navigation (targets the "Chat" tab)
   const navigateToChat = useCallback(
-    (toUserEmail) => {
+    (toUser) => {
+      const toUserEmail = typeof toUser === "string" ? toUser : (toUser?.email || "");
+      const params = toUserEmail ? { toUserEmail } : { toUserId: toUser?.id };
+
+      // Primary: tab name is "Chat"
       try {
-        navigation?.navigate?.("ChatScreen", { toUserEmail });
+        navigation?.navigate?.("Chat", params);
+        return;
+      } catch {}
+
+      // Fallbacks for nested setups you might add later
+      try {
+        navigation?.navigate?.("Messages", { screen: "Chat", params });
         return;
       } catch {}
       try {
-        navigation?.navigate?.("Messages", { screen: "ChatScreen", params: { toUserEmail } });
+        navigation?.navigate?.("ChatStack", { screen: "Chat", params });
         return;
       } catch {}
       try {
-        navigation?.navigate?.("ChatStack", { screen: "ChatScreen", params: { toUserEmail } });
+        navigation?.push?.("Chat", params);
+        return;
+      } catch {}
+
+      Alert.alert(
+        "Messaging not available",
+        "Couldn’t find a 'Chat' route in the current navigator. Make sure it's registered as a tab/screen."
+      );
+    },
+    [navigation]
+  );
+
+  // navigate to someone’s profile (poster)
+  const openProviderProfile = useCallback(
+    (userId) => {
+      if (!userId) return;
+      // Primary: your AppNavigator has "UserProfile" registered
+      try {
+        navigation?.navigate?.("UserProfile", { userId });
+        return;
+      } catch {}
+      // Other possible names, if you change later:
+      try {
+        navigation?.navigate?.("ProfileView", { userId });
         return;
       } catch {}
       try {
-        navigation?.push?.("ChatScreen", { toUserEmail });
-      } catch {
-        Alert.alert(
-          "Messaging not available",
-          "Couldn’t find ChatScreen in the current navigator. Make sure it's registered or adjust the route names in ServicesScreen."
-        );
-      }
+        navigation?.navigate?.("Profile", { screen: "UserProfile", params: { userId } });
+        return;
+      } catch {}
+      Alert.alert("Profile", "Couldn’t open the user’s profile. Add a 'UserProfile' route to your navigator.");
     },
     [navigation]
   );
@@ -1170,7 +1073,7 @@ const ServicesScreen = ({ navigation, route }) => {
       })}
       <View style={{ flex: 1 }} />
       {tab !== Tabs.Bookings && (
-        <Pressable onPress={openCreate} style={({ pressed }) => [styles.createBtn, pressed && { transform: [{ scale: 0.98 }] }]}>
+        <Pressable onPress={() => setCreateOpen(true)} style={({ pressed }) => [styles.createBtn, pressed && { transform: [{ scale: 0.98 }] }]}>
           <Text style={styles.createBtnText}>+ New</Text>
         </Pressable>
       )}
@@ -1238,10 +1141,11 @@ const ServicesScreen = ({ navigation, route }) => {
   };
 
   const ServiceCard = ({ item }) => {
-    const owner =
+    const ownerName =
       item.user?.first_name || item.user?.last_name
         ? `${item.user?.first_name || ""} ${item.user?.last_name || ""}`.trim()
         : item.user?.email || "Neighbor";
+    const avatarUri = resolveAvatarUri(item.user);
 
     const priceNum = Number(item.price);
     const priceLabel = Number.isFinite(priceNum)
@@ -1276,9 +1180,18 @@ const ServicesScreen = ({ navigation, route }) => {
           </View>
         </View>
 
-        <Text style={styles.owner} numberOfLines={1}>
-          by {owner} • <Text style={styles.categoryText}>{item.category || "Other"}</Text>
-        </Text>
+        <Pressable style={styles.ownerRow} onPress={() => openProviderProfile(item?.user?.id)}>
+          <Image
+            source={avatarUri ? { uri: avatarUri, headers: imageHeaders } : avatarPlaceholder}
+            style={styles.avatarSm}
+            resizeMode="cover"
+          />
+          <Text style={styles.owner} numberOfLines={1}>
+            by <Text style={styles.ownerLink}>{ownerName}</Text> •{" "}
+            <Text style={styles.categoryText}>{item.category || "Other"}</Text>
+          </Text>
+        </Pressable>
+
         <Text style={styles.desc} numberOfLines={3}>
           {item.description}
         </Text>
@@ -1288,15 +1201,16 @@ const ServicesScreen = ({ navigation, route }) => {
             <>
               <Pressable
                 style={({ pressed }) => [styles.primaryBtn, pressed && { transform: [{ scale: 0.98 }] }]}
-                onPress={() => navigateToChat(item.user?.email)}
+                onPress={() => navigateToChat(item.user)}
               >
                 <Text style={styles.primaryBtnText}>Message</Text>
               </Pressable>
+              {/* ⬇️ Pay removed; show explicit Book CTA instead */}
               <Pressable
                 style={({ pressed }) => [styles.secondaryBtn, pressed && { opacity: 0.9 }]}
-                onPress={() => navigation?.navigate?.("Wallet", { presetNote: `Service: ${item.title}` })}
+                onPress={() => openBook(item)}
               >
-                <Text style={styles.secondaryBtnText}>Pay</Text>
+                <Text style={styles.secondaryBtnText}>Book</Text>
               </Pressable>
             </>
           )}
@@ -1396,6 +1310,155 @@ const ServicesScreen = ({ navigation, route }) => {
       ))}
     </View>
   );
+
+  // ----- CREATE -----
+  const openCreate = () => {
+    setCTitle("");
+    setCDesc("");
+    setCPrice("");
+    setCCategory(categories.find((c) => c !== "All") || "Other");
+    setCreateError("");
+    setCatHintSeen(false);
+    setCreateOpen(true);
+  };
+  const closeCreate = () => {
+    if (creating) return;
+    setCreateOpen(false);
+  };
+  const validateCreate = () => {
+    if (!cTitle.trim()) return "Please add a title.";
+    if (!cDesc.trim()) return "Please add a short description.";
+    const price = Number(cPrice);
+    if (!Number.isFinite(price) || price < 0) return "Enter a valid non-negative price.";
+    if (!cCategory || cCategory === "All") return "Select a category.";
+    return null;
+  };
+  const handleCreate = async () => {
+    const err = validateCreate();
+    if (err) {
+      setCreateError(err);
+      return;
+    }
+    try {
+      setCreating(true);
+      setCreateError("");
+
+      const payload = {
+        title: cTitle.trim(),
+        description: cDesc.trim(),
+        price: Number(cPrice),
+        category: cCategory,
+      };
+
+      const created = await createService(payload);
+
+      const normalized = {
+        id: created?.id ?? `${Date.now()}`,
+        ...payload,
+        user: created?.user || created?.owner || null,
+      };
+      setMine((cur) => [normalized, ...cur]);
+
+      const matchesCat = category === "All" || cCategory.toLowerCase() === category.toLowerCase();
+      const qLower = query.trim().toLowerCase();
+      const matchesQuery =
+        !qLower ||
+        payload.title.toLowerCase().includes(qLower) ||
+        payload.description.toLowerCase().includes(qLower);
+      if (matchesCat && matchesQuery) setBrowse((cur) => [normalized, ...cur]);
+
+      setCreateOpen(false);
+    } catch (e) {
+      setCreateError(e?.data?.error || "Could not create service right now.");
+    } finally {
+      setCreating(false);
+    }
+  };
+
+  // ----- EDIT -----
+  const openEdit = (svc) => {
+    setEditId(svc.id);
+    setETitle(svc.title || "");
+    setEDesc(svc.description || "");
+    setEPrice(String(svc.price ?? ""));
+    setECategory(svc.category || "Other");
+    setEditError("");
+    setEditOpen(true);
+  };
+  const closeEdit = () => {
+    if (savingEdit) return;
+    setEditOpen(false);
+  };
+  const validateEdit = () => {
+    if (!eTitle.trim()) return "Please add a title.";
+    if (!eDesc.trim()) return "Please add a short description.";
+    const price = Number(ePrice);
+    if (!Number.isFinite(price) || price < 0) return "Enter a valid non-negative price.";
+    if (!eCategory || eCategory === "All") return "Select a category.";
+    return null;
+  };
+  const handleSaveEdit = async () => {
+    const err = validateEdit();
+    if (err) {
+      setEditError(err);
+      return;
+    }
+    try {
+      setSavingEdit(true);
+      setEditError("");
+
+      const payload = {
+        title: eTitle.trim(),
+        description: eDesc.trim(),
+        price: Number(ePrice),
+        category: eCategory,
+      };
+
+      // Try PATCH (standard), fallback to PUT or PATCH-with-body wrapper
+      let updated;
+      try {
+        updated = await api.patch(`/services/${editId}/`, payload);
+      } catch {
+        try {
+          updated = await api.put(`/services/${editId}/`, payload);
+        } catch {
+          updated = await api.patch(`/services/${editId}/`, { body: payload });
+        }
+      }
+
+      const normalized = {
+        id: updated?.id ?? editId,
+        ...payload,
+        user: updated?.user || updated?.owner || null,
+      };
+
+      setMine((cur) => cur.map((s) => (String(s.id) === String(editId) ? { ...s, ...normalized } : s)));
+      setBrowse((cur) => cur.map((s) => (String(s.id) === String(editId) ? { ...s, ...normalized } : s)));
+
+      setEditOpen(false);
+    } catch (e) {
+      setEditError(e?.data?.error || "Could not save changes right now.");
+    } finally {
+      setSavingEdit(false);
+    }
+  };
+  const confirmDelete = (svc) => {
+    Alert.alert("Delete Service", `Delete “${svc.title}”?`, [
+      { text: "Cancel", style: "cancel" },
+      { text: "Delete", style: "destructive", onPress: () => handleDelete(svc) },
+    ]);
+  };
+  const handleDelete = async (svc) => {
+    try {
+      setMine((cur) => cur.filter((s) => String(s.id) !== String(svc.id)));
+      setBrowse((cur) => cur.filter((s) => String(s.id) !== String(svc.id)));
+      try {
+        await api.delete(`/services/${svc.id}/`);
+      } catch {
+        await onRefresh();
+      }
+    } catch {}
+  };
 
   return (
     <SafeAreaView style={styles.safe}>
@@ -1500,12 +1563,12 @@ const ServicesScreen = ({ navigation, route }) => {
                   {/* Category scroller */}
                   <View style={styles.catScrollerBox}>
                     {catCanLeft && (
-                      <Pressable onPress={scrollCatsToStart} style={[styles.chev, styles.chevLeft]}>
+                      <Pressable onPress={() => catScrollRef.current?.scrollTo({ x: 0, animated: true })} style={[styles.chev, styles.chevLeft]}>
                         <Text style={styles.chevText}>‹</Text>
                       </Pressable>
                     )}
                     {catCanRight && (
-                      <Pressable onPress={scrollCatsToEnd} style={[styles.chev, styles.chevRight]}>
+                      <Pressable onPress={() => catScrollRef.current?.scrollToEnd({ animated: true })} style={[styles.chev, styles.chevRight]}>
                         <Text style={styles.chevText}>›</Text>
                       </Pressable>
                     )}
@@ -1516,7 +1579,16 @@ const ServicesScreen = ({ navigation, route }) => {
                       ref={catScrollRef}
                       horizontal
                       showsHorizontalScrollIndicator={false}
-                      onScroll={onCatScroll}
+                      onScroll={(e) => {
+                        const {
+                          contentOffset: { x },
+                          contentSize: { width: contentW },
+                          layoutMeasurement: { width: layoutW },
+                        } = e.nativeEvent;
+                        setCatCanLeft(x > 2);
+                        setCatCanRight(x + layoutW < contentW - 2);
+                        if (!catHintSeen && x > 4) setCatHintSeen(true);
+                      }}
                       scrollEventThrottle={16}
                       keyboardShouldPersistTaps="handled"
                     >
@@ -1682,7 +1754,7 @@ const ServicesScreen = ({ navigation, route }) => {
         </KeyboardAvoidingView>
       </Modal>
 
-      {/* Service Detail Modal (Tap -> Modal; Book / Message / Pay) */}
+      {/* Service Detail Modal (Tap -> Modal; Book / Message / View Profile) */}
       <Modal visible={svcDetailOpen} transparent animationType="fade" onRequestClose={closeServiceDetail}>
         <KeyboardAvoidingView
           behavior={Platform.select({ ios: "padding", android: undefined })}
@@ -1692,13 +1764,39 @@ const ServicesScreen = ({ navigation, route }) => {
             <Text style={styles.modalTitle}>{svcDetailItem?.title || "Service"}</Text>
             {svcDetailItem ? (
               <>
-                <Text style={styles.desc}>{svcDetailItem?.description || "—"}</Text>
-                <Text style={[styles.owner, { marginTop: 8 }]}>
-                  Category: <Text style={styles.categoryText}>{svcDetailItem?.category || "Other"}</Text>
+                {/* Owner row with avatar + profile link */}
+                <Pressable
+                  style={[styles.ownerRow, { marginTop: 2 }]}
+                  onPress={() => openProviderProfile(svcDetailItem?.user?.id)}
+                >
+                  <Image
+                    source={
+                      resolveAvatarUri(svcDetailItem?.user)
+                        ? { uri: resolveAvatarUri(svcDetailItem?.user), headers: imageHeaders }
+                        : avatarPlaceholder
+                    }
+                    style={styles.avatarSm}
+                    resizeMode="cover"
+                  />
+                  <Text style={styles.owner} numberOfLines={1}>
+                    by{" "}
+                    <Text style={styles.ownerLink}>
+                      {(svcDetailItem?.user?.first_name || svcDetailItem?.user?.last_name
+                        ? `${svcDetailItem?.user?.first_name || ""} ${svcDetailItem?.user?.last_name || ""}`.trim()
+                        : svcDetailItem?.user?.email) || "Neighbor"}
+                    </Text>
+                    {"  "}
+                    • <Text style={styles.categoryText}>{svcDetailItem?.category || "Other"}</Text>
+                  </Text>
+                </Pressable>
+
+                <Text style={[styles.desc, { marginTop: 8 }]}>
+                  {svcDetailItem?.description || "—"}
                 </Text>
-                <Text style={[styles.price, { marginTop: 6 }]}>
+                <Text style={[styles.price, { marginTop: 8 }]}>
                   {Number(svcDetailItem?.price || 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })} ESC
                 </Text>
+
                 <View style={[styles.row, { gap: 8, marginTop: 14, flexWrap: "wrap" }]}>
                   {String(svcDetailItem?.user?.id) !== String(meId) && (
                     <>
@@ -1715,7 +1813,7 @@ const ServicesScreen = ({ navigation, route }) => {
                         style={styles.secondaryBtn}
                         onPress={() => {
                           closeServiceDetail();
-                          navigateToChat(svcDetailItem?.user?.email);
+                          navigateToChat(svcDetailItem?.user);
                         }}
                       >
                         <Text style={styles.secondaryBtnText}>Message</Text>
@@ -1724,10 +1822,10 @@ const ServicesScreen = ({ navigation, route }) => {
                         style={styles.secondaryBtn}
                         onPress={() => {
                           closeServiceDetail();
-                          navigation?.navigate?.("Wallet", { presetNote: `Service: ${svcDetailItem?.title}` });
+                          openProviderProfile(svcDetailItem?.user?.id);
                         }}
                       >
-                        <Text style={styles.secondaryBtnText}>Pay</Text>
+                        <Text style={styles.secondaryBtnText}>View Profile</Text>
                       </Pressable>
                     </>
                   )}
@@ -1848,7 +1946,16 @@ const ServicesScreen = ({ navigation, route }) => {
                   <Text style={styles.detailLabel}>Client:</Text> {detailBk?.client?.email || "—"}
                 </Text>
                 <Text style={styles.detailRow}>
-                  <Text style={styles.detailLabel}>Provider:</Text> {detailBk?.provider?.email || "—"}
+                  <Text style={styles.detailLabel}>Provider:</Text>{" "}
+                  <Text
+                    style={styles.ownerLink}
+                    onPress={() => {
+                      closeDetail();
+                      openProviderProfile(detailBk?.provider?.id);
+                    }}
+                  >
+                    {detailBk?.provider?.email || "—"}
+                  </Text>
                 </Text>
                 {detailBk?.note ? (
                   <View style={{ marginTop: 8 }}>
@@ -1892,6 +1999,8 @@ const ServicesScreen = ({ navigation, route }) => {
 export default ServicesScreen;
 
 /* ======= styles ======= */
+const AVATAR_SM = 28;
+
 const styles = StyleSheet.create({
   safe: { flex: 1, backgroundColor: THEME.bg },
   listContent: { paddingHorizontal: 16, paddingBottom: 28 },
@@ -2001,7 +2110,18 @@ const styles = StyleSheet.create({
   },
   editPillText: { color: "#cfe0ff", fontWeight: "800", fontSize: 12 },
 
-  owner: { color: "#b7b7bf", fontSize: 12, marginTop: 6 },
+  ownerRow: { flexDirection: "row", alignItems: "center", gap: 8, marginTop: 8 },
+  avatarSm: {
+    width: AVATAR_SM,
+    height: AVATAR_SM,
+    borderRadius: AVATAR_SM / 2,
+    borderWidth: 1,
+    borderColor: "#2d2d33",
+    backgroundColor: "#23242c",
+  },
+  owner: { color: "#b7b7bf", fontSize: 12, flexShrink: 1 },
+  ownerLink: { color: "#cfe0ff", fontWeight: "800" },
+
   categoryText: { color: "#cfe0ff", fontWeight: "700" },
   desc: { color: THEME.subtext, marginTop: 8, lineHeight: 18 },
 

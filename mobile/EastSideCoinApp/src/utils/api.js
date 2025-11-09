@@ -215,7 +215,7 @@ export async function deleteAvatar() {
    👥 USERS
    - Primary search:  /users/search/?query=...
    - Back-compat:     /search_users/?q=...
-   - NOTE: public key endpoint was removed server-side.
+   - Public key fetching now supported via batch or single routes.
    ======================================================= */
 
 export async function searchUsers(query, { signal } = {}) {
@@ -237,10 +237,27 @@ export async function searchUsersSmart(query, { signal } = {}) {
   }
 }
 
+/** Batch public-key lookup: GET /users/public_keys/?ids=1,2,3 -> { "1":"KEY", "2":null } */
+export async function fetchPublicKeysBatch(ids /* number[] */) {
+  const idsParam = (ids || []).map(String).join(",");
+  if (!idsParam) return {};
+  return api.get("/users/public_keys/", { params: { ids: idsParam } });
+}
+
+/** Single public-key lookup: GET /users/<id>/public_key/ -> { id, public_key } */
+export async function fetchUserPublicKeyById(userId) {
+  try {
+    return await api.get(`/users/${userId}/public_key/`);
+  } catch {
+    return { public_key: null };
+  }
+}
+
 /**
- * Safer replacement now that /users/<id>/public_key/ is gone.
- * - If userId matches /me/, derive public_key from /me/.
- * - Else return { public_key: null } without throwing.
+ * Public-key resolver:
+ * 1) If userId === me.id -> return /me/ public_key
+ * 2) Try batch endpoint for that id
+ * 3) Fallback to single endpoint
  */
 export async function fetchUserPublicKey(userId) {
   try {
@@ -251,7 +268,19 @@ export async function fetchUserPublicKey(userId) {
   } catch {
     /* ignore */
   }
-  // No server route anymore; avoid 404 noise.
+  try {
+    const map = await fetchPublicKeysBatch([userId]);
+    const k = map?.[String(userId)] || null;
+    if (k) return { public_key: k };
+  } catch {
+    /* ignore */
+  }
+  try {
+    const res = await fetchUserPublicKeyById(userId);
+    if (res?.public_key) return { public_key: res.public_key };
+  } catch {
+    /* ignore */
+  }
   return { public_key: null };
 }
 

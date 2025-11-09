@@ -2,7 +2,7 @@
 import React, { useState, useEffect, useContext, useCallback, useRef, useMemo } from "react";
 import {
   View, Text, TextInput, TouchableOpacity, FlatList, StyleSheet,
-  Alert, KeyboardAvoidingView, Platform, RefreshControl, ActivityIndicator,
+  Alert, KeyboardAvoidingView, Platform, RefreshControl, ActivityIndicator, Image,
 } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 import AsyncStorage from "@react-native-async-storage/async-storage";
@@ -14,7 +14,14 @@ import { WS_URL } from "../config";
 import { encryptAES, encryptRSA, decryptAES, decryptRSA } from "../utils/encryption";
 import { isKeysReady, loadPrivateKeyForUser } from "../utils/keyManager";
 import { createOrGetChatSocket } from "../utils/wsClient";
-import { api, searchUsersSmart } from "../utils/api";
+
+// ⭐ NEW: pull helpers that can return public keys even if not in index
+import {
+  api,
+  searchUsersSmart,
+  fetchUserPublicKey as apiFetchUserPublicKey, // single/batch/me-aware
+  fetchMe as apiFetchMe, // ensure my own public key in storage
+} from "../utils/api";
 
 const THREADS_KEY = "chat_threads_index_v1";
 const MSGS_KEY_PREFIX = "chat_msgs_";
@@ -103,6 +110,25 @@ const setStateIfChanged = (setter, prevRef, nextVal, eq = (a, b) => JSON.stringi
   }
 };
 
+/* ------ Avatar helpers (NEW) ------ */
+const Avatar = React.memo(({ uri, name, size = 44 }) => {
+  const fallback = (name?.[0] || "N").toUpperCase();
+  if (uri && typeof uri === "string") {
+    return (
+      <Image
+        source={{ uri }}
+        style={[styles.avatarImg, { width: size, height: size, borderRadius: size / 2 }]}
+        resizeMode="cover"
+      />
+    );
+  }
+  return (
+    <View style={[styles.avatar, { width: size, height: size, borderRadius: size / 2 }]}>
+      <Text style={styles.avatarTxt}>{fallback}</Text>
+    </View>
+  );
+});
+
 /* ================== Component ================== */
 const ChatScreen = () => {
   const { user, keysReady, getAccessToken } = useContext(AuthContext);
@@ -163,6 +189,37 @@ const ChatScreen = () => {
     try { return await fn(); } finally { endSync(); }
   }, [beginSync, endSync]);
 
+  // ---------- cache any public_key we see ----------
+  const maybeCachePubKey = useCallback(async (uOrIdWithKey) => {
+    try {
+      const id = uOrIdWithKey?.id ?? uOrIdWithKey?.user_id ?? uOrIdWithKey?.uid;
+      const pub = uOrIdWithKey?.public_key;
+      if (!id || !pub || typeof pub !== "string" || !pub.includes("BEGIN PUBLIC KEY")) return;
+      await AsyncStorage.setItem(`publicKey_${id}`, pub);
+    } catch {}
+  }, []);
+
+  const cachePubKeysFromArray = useCallback(async (arr) => {
+    if (!Array.isArray(arr)) return;
+    for (const u of arr) await maybeCachePubKey(u);
+  }, [maybeCachePubKey]);
+
+  // ensure my own public key is in AsyncStorage (some flows only put it in /me/)
+  const ensureMyPublicKey = useCallback(async () => {
+    try {
+      const local = await AsyncStorage.getItem("publicKey");
+      if (local && local.includes("BEGIN PUBLIC KEY")) return local;
+      const me = await apiFetchMe().catch(() => null);
+      const k = me?.public_key;
+      if (k && k.includes("BEGIN PUBLIC KEY")) {
+        await AsyncStorage.setItem("publicKey", k);
+        if (user?.id) await AsyncStorage.setItem(`publicKey_${user.id}`, k);
+        return k;
+      }
+    } catch {}
+    return null;
+  }, [user?.id]);
+
   // stable callbacks (identities never change)
   const upsertThread = useRef((prev, neighbor, lastText, when, incrementUnread, opts = {}) => {
     const id = asId(neighbor?.id);
@@ -174,7 +231,11 @@ const ChatScreen = () => {
       first_name: neighbor?.first_name ?? existing?.meta?.first_name,
       last_name: neighbor?.last_name ?? existing?.meta?.last_name,
       email: neighbor?.email ?? existing?.meta?.email,
+      public_key: neighbor?.public_key ?? existing?.meta?.public_key,
+      avatar_url: neighbor?.avatar_url ?? existing?.meta?.avatar_url, // ⭐ NEW
     };
+    if (meta.public_key) { maybeCachePubKey({ id, public_key: meta.public_key }); }
+
     const resetUnread = opts.resetUnread === true;
     const unreadBase = Number(existing.unread || 0);
     const unread = resetUnread ? 0 : (incrementUnread ? unreadBase + 1 : unreadBase);
@@ -207,6 +268,9 @@ const ChatScreen = () => {
       const arr = await searchUsersSmart(q.trim());
       const cleaned = Array.isArray(arr) ? arr.filter(u => u && u.id && String(u.id) !== String(user?.id)) : [];
       setSearchResults(cleaned);
+
+      // cache keys + merge into directory
+      await cachePubKeysFromArray(cleaned);
       setDirectory({
         ...directoryRef.current,
         ...Object.fromEntries(cleaned.map((u) => [asId(u.id), u])),
@@ -214,7 +278,7 @@ const ChatScreen = () => {
     } catch {
       setSearchResults([]);
     }
-  }, [user?.id]);
+  }, [user?.id, cachePubKeysFromArray]);
 
   const handleDebouncedSearch = useMemo(() => debounce(doSearch, 300), [doSearch]);
   useEffect(() => () => { try { handleDebouncedSearch.cancel(); } catch {} }, [handleDebouncedSearch]);
@@ -261,7 +325,6 @@ const ChatScreen = () => {
       lastBeepAtRef.current = now;
       const s = soundRef.current;
       if (!s) return;
-      // reset to start and play
       await s.setPositionAsync(0);
       await s.playAsync();
     } catch (e) {
@@ -299,10 +362,17 @@ const ChatScreen = () => {
       const next = {};
       for (const t of arr) {
         const id = asId(t.id);
+        if (t.public_key) { await maybeCachePubKey({ id, public_key: t.public_key }); }
         next[id] = {
           id,
           name: nameOf(t),
-          meta: { first_name: t.first_name, last_name: t.last_name, email: t.email },
+          meta: {
+            first_name: t.first_name,
+            last_name: t.last_name,
+            email: t.email,
+            public_key: t.public_key,
+            avatar_url: t.avatar_url || null, // ⭐ NEW: carry avatar from API
+          },
           lastText: t.lastText || "",
           updatedAt: t.updatedAt || new Date().toISOString(),
           unread: t.unread || 0,
@@ -310,12 +380,20 @@ const ChatScreen = () => {
       }
       setThreads(next);
       saveCachedThreads(next);
-      setDirectory({ ...directoryRef.current, ...Object.fromEntries(arr.map((u) => [asId(u.id), u])) });
+      await cachePubKeysFromArray(arr);
+
+      // Also reflect into directory so UI/Header can read avatar_url quickly
+      const dirEntries = {};
+      for (const t of arr) {
+        const id = asId(t.id);
+        dirEntries[id] = { ...(directoryRef.current[id] || {}), ...t };
+      }
+      setDirectory({ ...directoryRef.current, ...dirEntries });
     } catch {
       const cached = await loadCachedThreads();
       setThreads(cached || {});
     }
-  }, [saveCachedThreads, loadCachedThreads, withTopSpinner]);
+  }, [saveCachedThreads, loadCachedThreads, withTopSpinner, cachePubKeysFromArray, maybeCachePubKey]);
 
   const markThreadRead = useCallback(async (otherId) => {
     if (!otherId) return;
@@ -328,6 +406,7 @@ const ChatScreen = () => {
       const cached = await loadCachedThreads();
       if (cached && Object.keys(cached).length) setThreads(cached);
       await fetchThreadsIndex();
+      await ensureMyPublicKey(); // ⭐ make sure my own pubkey is stored
     })();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -338,8 +417,9 @@ const ChatScreen = () => {
       let perUser = await AsyncStorage.getItem(`privateKey_${user.id}`);
       if (!perUser) perUser = await AsyncStorage.getItem("privateKey");
       if (perUser) await AsyncStorage.setItem("privateKey", perUser);
+      await ensureMyPublicKey(); // refresh copy under both names
     }
-  })(); }, [user?.id]);
+  })(); }, [user?.id, ensureMyPublicKey]);
 
   // refresh keys once
   useEffect(() => { (async () => {
@@ -364,7 +444,6 @@ const ChatScreen = () => {
       if (!mountedRef.current) return;
       setWsStatus("connected");
       setLastConnectAt(Date.now());
-      // flush any queued sends
       const api = wsApiRef.current;
       if (!api) return;
       const q = sendQueueRef.current;
@@ -399,7 +478,7 @@ const ChatScreen = () => {
         // Update thread preview/unread even if convo not open
         const tNext = upsertThread.current(
           threadsRef.current,
-          { id: otherId },
+          { id: otherId, avatar_url: directoryRef.current[asId(otherId)]?.avatar_url }, // ⭐ keep avatar
           "New message",
           new Date(),
           !(selectedUserRef.current && String(selectedUserRef.current.id) === otherId)
@@ -409,7 +488,6 @@ const ChatScreen = () => {
 
         const activeSelected = selectedUserRef.current;
         if (!activeSelected || String(activeSelected.id) !== otherId) {
-          // not in this convo, still beep
           if (wsStatusRef.current === "connected") await playIncoming();
           return;
         }
@@ -466,18 +544,17 @@ const ChatScreen = () => {
     };
   }, [user?.id, playIncoming, saveCachedThreads, saveCachedMessages]);
 
-  // connect once per user.id (no polling, no repeated subscribes)
+  // connect once per user.id
   useEffect(() => {
     if (!user?.id) return;
     mountedRef.current = true;
 
-    // ensure keys loaded for decrypt
     (async () => {
       const ok = await isKeysReady(user.id);
       if (ok) await loadPrivateKeyForUser(user.id);
     })();
 
-    const api = createOrGetChatSocket({
+    const apiSock = createOrGetChatSocket({
       token: () => getAccessToken(),
       baseUrl: WS_URL,
       path: "/chat/",
@@ -489,28 +566,101 @@ const ChatScreen = () => {
       onMessage: (...args) => handlerRef.current.onMessage(...args),
     });
 
-    wsApiRef.current = api;
+    wsApiRef.current = apiSock;
     setWsStatus("connecting");
-    (async () => { try { await api?.ready?.(); setWsStatus("connected"); setLastConnectAt(Date.now()); } catch { setWsStatus("disconnected"); } })();
+    (async () => { try { await apiSock?.ready?.(); setWsStatus("connected"); setLastConnectAt(Date.now()); } catch { setWsStatus("disconnected"); } })();
 
     return () => {
       mountedRef.current = false;
       try { wsApiRef.current?.unsubscribe?.(); } catch {}
       wsApiRef.current = null;
-      // do NOT destroy the socket here; AuthProvider keeps it alive
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [user?.id]);
 
+  /* -------- recipient resolution (HARDENED) -------- */
+
+  // Try to populate directory entry with full profile (including public_key) if backend exposes it.
+  const fetchUserProfileSoft = useCallback(async (uid) => {
+    try {
+      const profile = await api.get(`/users/${uid}/`); // if exists
+      if (profile?.id) {
+        const merged = { ...(directoryRef.current[asId(uid)] || {}), ...profile };
+        setDirectory({ ...directoryRef.current, [asId(uid)]: merged });
+        await maybeCachePubKey({ id: uid, public_key: merged.public_key });
+        return merged;
+      }
+    } catch {}
+    return null;
+  }, [setDirectory, maybeCachePubKey]);
+
+  /**
+   * Resolve recipient public key robustly:
+   * 1) AsyncStorage("publicKey_<uid>")
+   * 2) directoryRef.current[uid].public_key
+   * 3) apiFetchUserPublicKey(uid)  ⟶ cache + return (⭐ new)
+   * 4) /users/<uid>/ (if available) ⟶ cache + return
+   * 5) searchUsersSmart(uid/email)  ⟶ cache + return
+   */
+  const resolveRecipientPublicKey = useCallback(async (uid) => {
+    if (!uid) return null;
+
+    // 1) cache
+    const cached = await AsyncStorage.getItem(`publicKey_${uid}`);
+    if (cached && cached.includes("BEGIN PUBLIC KEY")) return cached;
+
+    // 2) in-memory directory
+    const fromDir = directoryRef.current[asId(uid)];
+    if (fromDir?.public_key && fromDir.public_key.includes("BEGIN PUBLIC KEY")) {
+      await maybeCachePubKey({ id: uid, public_key: fromDir.public_key });
+      return fromDir.public_key;
+    }
+
+    // 3) direct api public-key helper (handles me/batch/single)
+    try {
+      const res = await apiFetchUserPublicKey(uid);
+      const k = res?.public_key;
+      if (k && k.includes("BEGIN PUBLIC KEY")) {
+        await AsyncStorage.setItem(`publicKey_${uid}`, k);
+        // merge a minimal directory entry so future reads are instant
+        setDirectory({ ...directoryRef.current, [asId(uid)]: { ...(fromDir || { id: uid }), public_key: k } });
+        return k;
+      }
+    } catch {}
+
+    // 4) attempt to fetch profile
+    const prof = await fetchUserProfileSoft(uid);
+    if (prof?.public_key && prof.public_key.includes("BEGIN PUBLIC KEY")) {
+      return prof.public_key;
+    }
+
+    // 5) search fallback (id/email/name)
+    const probes = [String(uid), fromDir?.email].filter(Boolean);
+    for (const q of new Set(probes)) {
+      try {
+        const results = await searchUsersSmart(q);
+        const match = Array.isArray(results) ? results.find(r => String(r.id) === String(uid)) : null;
+        if (match?.public_key && match.public_key.includes("BEGIN PUBLIC KEY")) {
+          await maybeCachePubKey({ id: uid, public_key: match.public_key });
+          setDirectory({ ...directoryRef.current, [asId(uid)]: { ...(fromDir || { id: uid }), ...match } });
+          return match.public_key;
+        }
+        await cachePubKeysFromArray(results);
+      } catch {}
+    }
+
+    return null;
+  }, [maybeCachePubKey, cachePubKeysFromArray, setDirectory, fetchUserProfileSoft]);
+
   /* -------- send helpers -------- */
   const safeSendOverWs = useCallback(async (payload) => {
-    const api = wsApiRef.current;
-    if (!api || !api.socket?.ready) {
+    const apiWS = wsApiRef.current;
+    if (!apiWS || !apiWS.socket?.ready) {
       sendQueueRef.current.push(payload);
       return false;
     }
     try {
-      api.send(payload);
+      apiWS.send(payload);
       return true;
     } catch {
       sendQueueRef.current.push(payload);
@@ -527,8 +677,10 @@ const ChatScreen = () => {
     const target = selectedUserRef.current;
     if (!target) { Alert.alert("Not connected", "Select a conversation first."); return; }
 
-    const privateKey = await AsyncStorage.getItem("privateKey");
-    const myPublicKey = await AsyncStorage.getItem("publicKey");
+    // Ensure my own key is present (some devices miss it on first boot)
+    const myPublicKey = (await ensureMyPublicKey()) || (await AsyncStorage.getItem("publicKey"));
+    const privateKey = await AsyncStorage.getItem("privateKey") || (user?.id ? await AsyncStorage.getItem(`privateKey_${user.id}`) : null);
+
     if (!privateKey || !myPublicKey) {
       Alert.alert("Encryption Setup", "Your device keys are still generating. Try again in a moment.");
       return;
@@ -537,16 +689,17 @@ const ChatScreen = () => {
     try {
       setSendInFlight(true);
 
-      let recipientPub = await AsyncStorage.getItem(`publicKey_${target.id}`);
+      // ⭐ Critical fix: try robust resolver path for recipient
+      let recipientPub = await resolveRecipientPublicKey(target.id);
       if (!recipientPub) {
-        const resp = await api.get(`/users/${target.id}/public_key/`);
-        if (!resp?.public_key) {
-          Alert.alert("Encryption Error", "Public key not found for this user.");
-          setSendInFlight(false);
-          return;
-        }
-        recipientPub = resp.public_key;
-        await AsyncStorage.setItem(`publicKey_${target.id}`, recipientPub);
+        // last-ditch: try reloading profile THEN resolver again
+        await fetchUserProfileSoft(target.id);
+        recipientPub = await resolveRecipientPublicKey(target.id);
+      }
+      if (!recipientPub) {
+        Alert.alert("Encryption Error", "Couldn’t find the recipient’s public key.");
+        setSendInFlight(false);
+        return;
       }
 
       const bundle = encryptAES(text);
@@ -592,7 +745,7 @@ const ChatScreen = () => {
     } finally {
       setTimeout(() => setSendInFlight(false), 120);
     }
-  }, [saveCachedMessages, saveCachedThreads, safeSendOverWs, user?.id]);
+  }, [saveCachedMessages, saveCachedThreads, safeSendOverWs, user?.id, resolveRecipientPublicKey, ensureMyPublicKey, fetchUserProfileSoft]);
 
   const onRefresh = useCallback(() => { fetchThreadsIndex(); }, [fetchThreadsIndex]);
   const messagesForUI = useMemo(() => messages.slice().reverse(), [messages]);
@@ -641,12 +794,18 @@ const ChatScreen = () => {
 
   const openConversation = useCallback((neighbor) => {
     if (!neighbor?.id) return;
-    const known = directoryRef.current[asId(neighbor.id)] || neighbor;
+    const known = {
+      ...(directoryRef.current[asId(neighbor.id)] || {}),
+      ...neighbor,
+    };
 
     setSelectedUser(known);
     if (mode !== "conversation") setMode("conversation");
 
     (async () => {
+      // ⭐ Eagerly try to fetch/capture recipient public key to avoid send-time failures
+      await resolveRecipientPublicKey(known.id);
+
       const cached = await loadCachedMessages(known.id);
       const normalized = (cached || []).map((m) => ({
         ...m,
@@ -663,14 +822,21 @@ const ChatScreen = () => {
       }
     })();
 
-    const tNext = upsertThread.current(threadsRef.current, known, "", new Date(), false, { resetUnread: true });
+    const tNext = upsertThread.current(
+      threadsRef.current,
+      known,
+      "",
+      new Date(),
+      false,
+      { resetUnread: true }
+    );
     setThreads(tNext);
     saveCachedThreads(tNext);
 
     setEffectiveQuery("");
     setSearchResults([]);
     markThreadRead(known.id);
-  }, [mode, loadCachedMessages, initialLoad, markThreadRead, saveCachedThreads, user?.id]);
+  }, [mode, loadCachedMessages, initialLoad, markThreadRead, saveCachedThreads, user?.id, resolveRecipientPublicKey]);
 
   const backToThreads = useCallback(() => {
     setMode("threads");
@@ -741,15 +907,16 @@ const ChatScreen = () => {
         first_name: item.meta?.first_name,
         last_name: item.meta?.last_name,
         email: item.meta?.email,
+        public_key: item.meta?.public_key,
+        avatar_url: item.meta?.avatar_url || null, // ⭐ pass avatar to conversation
       });
     }, [openConversation]);
 
     const renderItem = useCallback(({ item }) => {
+      const avatarUrl = item.meta?.avatar_url || null;
       return (
         <TouchableOpacity style={styles.threadItem} onPress={() => onTapThread(item)} activeOpacity={0.85}>
-          <View style={styles.avatar}>
-            <Text style={styles.avatarTxt}>{item.name?.[0]?.toUpperCase() || "N"}</Text>
-          </View>
+          <Avatar uri={avatarUrl} name={item.name} size={44} />
           <View style={styles.threadTextCol}>
             <View style={styles.threadTopRow}>
               <Text numberOfLines={1} style={styles.threadName}>{item.name}</Text>
@@ -791,7 +958,10 @@ const ChatScreen = () => {
               removeClippedSubviews={false}
               renderItem={({ item }) => (
                 <TouchableOpacity style={styles.userItem} onPress={() => openConversation(item)} activeOpacity={0.85}>
-                  <Text style={styles.userText}>{item.first_name} {item.last_name}</Text>
+                  <View style={styles.userRow}>
+                    <Avatar uri={item.avatar_url} name={nameOf(item)} size={36} />
+                    <Text style={styles.userText}>{item.first_name} {item.last_name}</Text>
+                  </View>
                 </TouchableOpacity>
               )}
               ListEmptyComponent={<Text style={{ color: "#888", textAlign: "center", marginTop: 12 }}>No matches.</Text>}
@@ -815,6 +985,11 @@ const ChatScreen = () => {
   });
 
   const Conversation = React.memo(function ConversationInner() {
+    const headerAvatar = selectedUser?.avatar_url
+      || threadsRef.current[asId(selectedUser?.id)]?.meta?.avatar_url
+      || directoryRef.current[asId(selectedUser?.id)]?.avatar_url
+      || null;
+
     return (
       <>
         <TopSyncBar />
@@ -824,9 +999,12 @@ const ChatScreen = () => {
           <TouchableOpacity onPress={backToThreads} style={styles.backButton} activeOpacity={0.85}>
             <Text style={styles.backText}>←</Text>
           </TouchableOpacity>
-          <View style={{ flexDirection: "column", alignItems: "center", flex: 1, justifyContent: "center" }}>
+
+          <View style={styles.headerCenter}>
+            <Avatar uri={headerAvatar} name={nameOf(selectedUser)} size={28} />
             <Text style={styles.headerName} numberOfLines={1}>{nameOf(selectedUser)}</Text>
           </View>
+
           <View style={{ width: 36 }} />
         </View>
 
@@ -981,6 +1159,13 @@ const styles = StyleSheet.create({
     borderBottomColor: "rgba(255,255,255,0.06)",
     backgroundColor: "#0F1012",
   },
+  headerCenter: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 10,
+    flex: 1,
+    justifyContent: "center",
+  },
   headerName: { color: "#FFF", fontSize: 18, fontWeight: "800", textAlign: "center" },
 
   backButton: { paddingHorizontal: 12, paddingVertical: 8, backgroundColor: "#1C1E24", borderRadius: 10 },
@@ -997,6 +1182,12 @@ const styles = StyleSheet.create({
   avatar: {
     width: 44, height: 44, borderRadius: 22, backgroundColor: "#242733",
     alignItems: "center", justifyContent: "center", marginRight: 12,
+  },
+  avatarImg: {
+    backgroundColor: "#242733",
+    marginRight: 12,
+    borderWidth: 1,
+    borderColor: "rgba(255,255,255,0.06)",
   },
   avatarTxt: { color: "#FFD700", fontWeight: "900", fontSize: 16 },
   threadTextCol: { flex: 1 },
@@ -1017,6 +1208,7 @@ const styles = StyleSheet.create({
     borderWidth: 1, borderColor: "rgba(255,255,255,0.06)",
   },
   userItem: { padding: 12, backgroundColor: "#17181D", borderRadius: 12, marginBottom: 8, marginHorizontal: 12, borderWidth: 1, borderColor: "rgba(255,255,255,0.06)" },
+  userRow: { flexDirection: "row", alignItems: "center", gap: 10 },
   userText: { color: "#FFF", fontSize: 15, fontWeight: "600" },
 
   messagesList: { flex: 1, backgroundColor: "#0F1012" },

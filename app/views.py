@@ -3,6 +3,11 @@ from django.utils.dateparse import parse_datetime
 from django.core.paginator import Paginator, EmptyPage
 from django.db.models import Q, Max, Count
 from django.utils import timezone
+from django.contrib.auth.hashers import make_password, check_password
+from django.contrib.auth import get_user_model
+from django.conf import settings
+from django.core.files.images import get_image_dimensions
+from django.core.files.uploadedfile import InMemoryUploadedFile, TemporaryUploadedFile
 
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.permissions import AllowAny, IsAuthenticated
@@ -11,12 +16,10 @@ from rest_framework import status
 
 from rest_framework_simplejwt.tokens import RefreshToken
 from rest_framework_simplejwt.exceptions import InvalidToken, TokenError
-from rest_framework_simplejwt.tokens import AccessToken
 
-from django.contrib.auth.hashers import make_password, check_password
-from django.contrib.auth import get_user_model
+from decimal import Decimal, InvalidOperation
 
-from .models import ChatMessage  # adjust if needed
+from .models import ChatMessage, Service, Booking, Transaction  # noqa: F401
 
 User = get_user_model()
 
@@ -24,7 +27,17 @@ User = get_user_model()
 # ---------------------------
 # Utilities
 # ---------------------------
-def _serialize_user(u: User):
+def _avatar_url(u: User, request=None):
+    if getattr(u, "avatar", None):
+        try:
+            url = u.avatar.url
+        except Exception:
+            url = f"{getattr(settings, 'MEDIA_URL', '/media/')}{u.avatar.name}"
+        return request.build_absolute_uri(url) if request else url
+    return None
+
+
+def _serialize_user(u: User, request=None):
     return {
         "id": u.id,
         "email": u.email,
@@ -33,21 +46,41 @@ def _serialize_user(u: User):
     }
 
 
-def _serialize_user_with_wallet(u: User):
+def _serialize_user_with_wallet(u: User, request=None):
     return {
         "id": u.id,
         "email": u.email,
         "first_name": u.first_name,
         "last_name": u.last_name,
         "wallet_address": getattr(u, "wallet_address", None),
+        "avatar_url": _avatar_url(u, request),
+        "has_public_key": bool(getattr(u, "public_key", None)),
+    }
+
+
+def _serialize_me(u: User, request=None):
+    return {
+        "id": u.id,
+        "email": u.email,
+        "first_name": u.first_name,
+        "last_name": u.last_name,
+        "wallet_address": getattr(u, "wallet_address", None),
+        "public_key": getattr(u, "public_key", None),
+        "has_public_key": bool(getattr(u, "public_key", None)),  # ✅ quick boolean for client
+        "avatar_url": _avatar_url(u, request),
+        "esc_balance": float(getattr(u, "esc_balance", 0.0)),
+        "is_vip": bool(getattr(u, "is_vip", False)),
+        "bio": getattr(u, "bio", "") or "",
+        "education": getattr(u, "education", "") or "",
+        "age": getattr(u, "age", None),
+        "neighborhood": getattr(u, "neighborhood", "") or "",
+        "skills": getattr(u, "skills", "") or "",
+        "languages": getattr(u, "languages", "") or "",
+        "onboarding_completed": bool(getattr(u, "onboarding_completed", False)),
     }
 
 
 def _serialize_message_for_requester(m: ChatMessage, requester_id: int):
-    """
-    Mobile client expects these fields. Expose both REST names and WS-style aliases
-    so the app can hydrate regardless of naming differences.
-    """
     ts = m.timestamp or timezone.now()
     return {
         "id": str(m.id),
@@ -79,7 +112,7 @@ def _tzsafe_parse(dt_str):
 
 
 # ===========================
-# Auth / Keys
+# 🔐 Auth / Keys
 # ===========================
 @api_view(["POST"])
 @permission_classes([AllowAny])
@@ -171,9 +204,9 @@ def login_user(request):
                 "refresh": str(refresh),
                 "exp": int(access["exp"]),
                 "user": {
-                    **_serialize_user(user),
-                    "wallet_address": user.wallet_address,
-                    "public_key": user.public_key,
+                    **_serialize_user_with_wallet(user, request),
+                    "public_key": getattr(user, "public_key", None),
+                    "has_public_key": bool(getattr(user, "public_key", None)),  # mirror /me/
                 },
             },
             status=status.HTTP_200_OK,
@@ -187,7 +220,7 @@ def login_user(request):
 @permission_classes([AllowAny])
 def refresh_token_view(request):
     """
-    POST /api/refresh/
+    POST /refresh/
     Body: { "refresh": "<refresh-token>" }
     Returns: { "access": "<new-access>", "exp": <unix-seconds> }
     """
@@ -231,7 +264,7 @@ def logout_user(request):
 @permission_classes([IsAuthenticated])
 def delete_account(request):
     """
-    DELETE /api/delete_account/
+    DELETE /delete_account/
     Optional body: { "refresh": "<refresh_token_string>" }
     """
     try:
@@ -244,7 +277,6 @@ def delete_account(request):
             except Exception:
                 pass
 
-        # Delete all messages involving the user
         ChatMessage.objects.filter(Q(sender=user) | Q(receiver=user)).delete()
         user.delete()
 
@@ -254,49 +286,153 @@ def delete_account(request):
 
 
 # ===========================
-# Users / Search
+# 👤 Me / Profile / Avatar
+# ===========================
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def me_profile(request):
+    """GET /me/ — current user profile (includes avatar_url, wallet, etc.)"""
+    return Response(_serialize_me(request.user, request), status=200)
+
+
+@api_view(["GET", "PATCH"])
+@permission_classes([IsAuthenticated])
+def me_detail_update(request):
+    """
+    GET  /me/ or /users/me/           -> profile payload (same as me_profile)
+    PATCH /me/update/ or /users/me/   -> partial update of profile fields
+       Body can include any subset of:
+        - neighborhood (str)
+        - skills (str)
+        - languages (str)
+        - bio (str)
+        - age (int or null)
+        - onboarding_completed (bool)
+    """
+    me = request.user
+
+    if request.method == "GET":
+        return Response(_serialize_me(me, request), status=200)
+
+    # PATCH
+    data = request.data or {}
+    if "body" in data and isinstance(data["body"], dict):
+        data = data["body"]
+
+    fields = {}
+    if "neighborhood" in data:
+        fields["neighborhood"] = (data.get("neighborhood") or "").strip()
+    if "skills" in data:
+        fields["skills"] = (data.get("skills") or "").strip()
+    if "languages" in data:
+        fields["languages"] = (data.get("languages") or "").strip()
+    if "bio" in data:
+        fields["bio"] = (data.get("bio") or "").strip()
+    if "age" in data:
+        age_val = data.get("age")
+        try:
+            fields["age"] = int(age_val) if age_val is not None else None
+        except (ValueError, TypeError):
+            return Response({"error": "age must be an integer"}, status=400)
+    if "onboarding_completed" in data:
+        fields["onboarding_completed"] = bool(data.get("onboarding_completed"))
+
+    if not fields:
+        return Response({"error": "No updatable fields supplied"}, status=400)
+
+    for k, v in fields.items():
+        setattr(me, k, v)
+    me.save(update_fields=list(fields.keys()))
+
+    return Response(_serialize_me(me, request), status=200)
+
+
+@api_view(["POST", "DELETE"])
+@permission_classes([IsAuthenticated])
+def profile_avatar(request):
+    """
+    POST /profile/avatar/  (multipart/form-data, field 'avatar')
+    DELETE /profile/avatar/
+    """
+    me = request.user
+
+    if request.method == "DELETE":
+        if getattr(me, "avatar", None):
+            me.avatar.delete(save=False)
+            me.avatar = None
+        me.save(update_fields=["avatar"])
+        return Response({"avatar_url": None}, status=200)
+
+    file = request.FILES.get("avatar")
+    if not file:
+        return Response({"error": "No file uploaded (use 'avatar' field)."}, status=400)
+
+    allowed = {"image/jpeg", "image/png", "image/webp", "image/gif"}
+    content_type = getattr(file, "content_type", "").lower()
+    if content_type not in allowed:
+        return Response({"error": "Unsupported image type. Use JPEG/PNG/WebP/GIF."}, status=400)
+
+    max_bytes = 5 * 1024 * 1024  # 5MB
+    if file.size > max_bytes:
+        return Response({"error": "File too large (max 5MB)."}, status=400)
+
+    try:
+        if isinstance(file, (InMemoryUploadedFile, TemporaryUploadedFile)):
+            width, height = get_image_dimensions(file)
+            if not width or not height:
+                return Response({"error": "Invalid image."}, status=400)
+            if width > 6000 or height > 6000:
+                return Response({"error": "Image too large in dimensions (max 6000x6000)."}, status=400)
+    except Exception:
+        pass
+
+    if getattr(me, "avatar", None):
+        me.avatar.delete(save=False)
+    me.avatar = file
+    me.save(update_fields=["avatar"])
+
+    return Response({"avatar_url": _avatar_url(me, request)}, status=200)
+
+
+# ===========================
+# 👥 Users / Search (no per-ID public_key endpoint anymore)
 # ===========================
 @api_view(["GET"])
 @permission_classes([IsAuthenticated])
 def search_users(request):
-    # accept both ?q= and ?query=
     raw = request.GET.get("q") or request.GET.get("query") or ""
     query = raw.strip()
     print(f"🚀 Searching Users: '{query}'")
     if not query:
         return Response([], status=status.HTTP_200_OK)
 
-    # Tokenize so "alan major" matches first + last
     tokens = [t for t in query.split() if t]
     qs = User.objects.exclude(id=request.user.id)
 
     for t in tokens:
         qs = qs.filter(
-            Q(first_name__icontains=t) |
-            Q(last_name__icontains=t)  |
-            Q(email__icontains=t)      |
-            Q(wallet_address__icontains=t)
+            Q(first_name__icontains=t)
+            | Q(last_name__icontains=t)
+            | Q(email__icontains=t)
+            | Q(wallet_address__icontains=t)
         )
 
     users = qs.only("id", "first_name", "last_name", "email", "wallet_address")[:25]
-    return Response([_serialize_user_with_wallet(u) for u in users], status=status.HTTP_200_OK)
+    return Response([_serialize_user_with_wallet(u, request) for u in users], status=status.HTTP_200_OK)
 
 
 # ===========================
-# Threads (Server-backed)
+# 💬 Threads (Server-backed)
 # ===========================
 @api_view(["GET"])
 @permission_classes([IsAuthenticated])
 def conversations_index(request):
     """
-    GET /api/conversations/index/
-    Returns the canonical list of conversation partners for the authed user,
-    with latest message timestamp and unread count (server-owned).
+    GET /conversations/index/
     """
     me = request.user
     try:
         base = ChatMessage.objects.filter(Q(sender=me) | Q(receiver=me))
-
         latest_rows = base.values("sender_id", "receiver_id").annotate(last_ts=Max("timestamp"))
 
         partner_latest = {}
@@ -332,6 +468,8 @@ def conversations_index(request):
                 "updatedAt": (partner_latest.get(u.id) or timezone.now()).isoformat(),
                 "unread": unread_map.get(u.id, 0),
                 "lastText": "",
+                "avatar_url": _avatar_url(u, request),
+                "has_public_key": bool(getattr(u, "public_key", None)),  # ✅ add this line
             })
 
         items.sort(key=lambda x: x["updatedAt"], reverse=True)
@@ -345,15 +483,12 @@ def conversations_index(request):
 @permission_classes([IsAuthenticated])
 def mark_thread_read(request, other_id: int):
     """
-    POST /api/conversations/mark_read/<other_id>/
-    Marks messages from other_id -> me as read.
+    POST /conversations/mark_read/<other_id>/
     """
     me = request.user
     try:
         updated = ChatMessage.objects.filter(
-            sender_id=other_id,
-            receiver=me,
-            is_read=False
+            sender_id=other_id, receiver=me, is_read=False
         ).update(is_read=True)
         return Response({"updated": updated}, status=status.HTTP_200_OK)
     except Exception as e:
@@ -362,7 +497,7 @@ def mark_thread_read(request, other_id: int):
 
 
 # ===========================
-# Messages / Conversations
+# 💌 Messages / Conversations
 # ===========================
 @api_view(["GET"])
 @permission_classes([IsAuthenticated])
@@ -385,13 +520,12 @@ def get_messages(request):
 @permission_classes([IsAuthenticated])
 def my_threads(request):
     """
-    (Legacy) Returns a list of peers with latest timestamp and a ciphertext preview.
-    Kept for backward compatibility; prefer conversations_index.
+    (Legacy) Returns peers with latest timestamp and a ciphertext preview.
+    Prefer conversations_index.
     """
     print("🚀 My Threads API Hit!")
     try:
         me = request.user
-
         peer_pairs = ChatMessage.objects.filter(
             Q(sender=me) | Q(receiver=me)
         ).values_list("sender_id", "receiver_id", "id", "timestamp", "encrypted_message")
@@ -430,7 +564,7 @@ def my_threads(request):
 @permission_classes([IsAuthenticated])
 def get_conversation(request, other_id: int):
     """
-    GET /api/conversations/<other_id>/?limit=50&page=1&before=...&after=...
+    GET /conversations/<other_id>/?limit=50&page=1&before=...&after=...
     Returns encrypted messages BETWEEN the authed user and other_id.
     Sorted ASC (oldest -> newest).
     """
@@ -455,7 +589,7 @@ def get_conversation(request, other_id: int):
         if before:
             qs = qs.filter(timestamp__lt=before)
 
-        qs = qs.order_by("timestamp", "id")  # ASC for UI; id tiebreaker
+        qs = qs.order_by("timestamp", "id")
 
         paginator = Paginator(qs, limit)
         try:
@@ -473,11 +607,11 @@ def get_conversation(request, other_id: int):
         prev_page = page - 1 if page_obj.has_previous() else None
 
         return Response({
-                "results": items,
-                "next_page": next_page,
-                "prev_page": prev_page,
-                "count": paginator.count,
-            }, status=status.HTTP_200_OK)
+            "results": items,
+            "next_page": next_page,
+            "prev_page": prev_page,
+            "count": paginator.count,
+        }, status=status.HTTP_200_OK)
     except Exception as e:
         print("❌ get_conversation error:", e)
         return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
@@ -515,9 +649,7 @@ def mark_messages_read_batch(request):
         return Response({"error": "ids must be a non-empty list"}, status=status.HTTP_400_BAD_REQUEST)
     try:
         updated = ChatMessage.objects.filter(
-            id__in=ids,
-            receiver=request.user,
-            is_read=False
+            id__in=ids, receiver=request.user, is_read=False
         ).update(is_read=True)
         return Response({"updated": updated}, status=status.HTTP_200_OK)
     except Exception as e:
@@ -584,19 +716,18 @@ def send_message(request):
 
 
 # ===========================
-# Wallet
+# 💰 Wallet
 # ===========================
 @api_view(["GET"])
 @permission_classes([IsAuthenticated])
 def wallet_balance(request):
     """
-    GET /api/wallet/balance/
-    Returns authed user's wallet address and balance.
+    GET /wallet/balance/
     """
     me = request.user
     return Response({
         "address": me.wallet_address,
-        "balance": float(me.esc_balance),
+        "balance": float(getattr(me, "esc_balance", 0.0)),
         "pending": False,
     }, status=status.HTTP_200_OK)
 
@@ -605,27 +736,478 @@ def wallet_balance(request):
 @permission_classes([IsAuthenticated])
 def check_balance(request, wallet_address):
     """
-    GET /api/check_balance/<wallet_address>/
-    Useful for admin/debug; client typically uses wallet_balance.
+    GET /check_balance/<wallet_address>/
     """
     try:
         print(f"🚀 Checking wallet balance for: {wallet_address}")
         user = User.objects.filter(wallet_address=wallet_address).first()
         if not user:
             return Response({"error": "Wallet not found"}, status=status.HTTP_404_NOT_FOUND)
-        return Response({"wallet": wallet_address, "balance": float(user.esc_balance)}, status=status.HTTP_200_OK)
+        return Response({"wallet": wallet_address, "balance": float(getattr(user, "esc_balance", 0.0))}, status=status.HTTP_200_OK)
     except Exception as e:
         print(f"❌ ERROR Fetching Balance: {e}")
         return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 
+# ===========================
+# 🧰 Services
+# ===========================
+def _serialize_service(s: Service):
+    u = s.user
+    return {
+        "id": s.id,
+        "title": s.title,
+        "description": s.description,
+        "price": float(s.price),
+        "category": s.category or "Other",
+        "created_at": (s.created_at or timezone.now()).isoformat(),
+        "user": {
+            "id": u.id,
+            "email": u.email,
+            "first_name": u.first_name,
+            "last_name": u.last_name,
+            "wallet_address": getattr(u, "wallet_address", None),
+            "avatar_url": _avatar_url(u),
+        },
+    }
+
+
 @api_view(["GET"])
 @permission_classes([IsAuthenticated])
-def get_user_public_key(request, user_id):
+def services_categories(request):
     try:
-        user = User.objects.get(id=user_id)
-        if not user.public_key:
-            return Response({"error": "Public key not available."}, status=status.HTTP_404_NOT_FOUND)
-        return Response({"public_key": user.public_key}, status=status.HTTP_200_OK)
+        cats = (
+            Service.objects.exclude(category__isnull=True)
+            .exclude(category__exact="")
+            .values_list("category", flat=True)
+            .distinct()
+        )
+        normalized = sorted({(c or "Other").strip()[:100] for c in cats})
+        return Response(normalized, status=200)
+    except Exception as e:
+        print("❌ services_categories error:", e)
+        return Response({"error": str(e)}, status=500)
+
+
+@api_view(["GET", "POST"])
+@permission_classes([IsAuthenticated])
+def services_list_create(request):
+    """
+    GET /services/?q=<text>&category=<name>&limit=50&page=1
+    POST /services/  { title, description, price, category }
+    """
+    if request.method == "GET":
+        q = (request.GET.get("q") or "").strip()
+        category = (request.GET.get("category") or "").strip()
+        limit = max(1, min(int(request.GET.get("limit", 50)), 200))
+        page = int(request.GET.get("page", 1))
+
+        qs = Service.objects.select_related("user").all()
+        if category and category.lower() != "all":
+            qs = qs.filter(category__iexact=category)
+        if q:
+            qs = qs.filter(
+                Q(title__icontains=q)
+                | Q(description__icontains=q)
+                | Q(user__first_name__icontains=q)
+                | Q(user__last_name__icontains=q)
+                | Q(user__email__icontains=q)
+            ).distinct()
+
+        paginator = Paginator(qs.order_by("-created_at", "-id"), limit)
+        try:
+            page_obj = paginator.page(page)
+        except EmptyPage:
+            return Response({"results": [], "next_page": None, "prev_page": None, "count": 0}, status=200)
+
+        items = [_serialize_service(s) for s in page_obj.object_list]
+        return Response({
+            "results": items,
+            "next_page": page + 1 if page_obj.has_next() else None,
+            "prev_page": page - 1 if page_obj.has_previous() else None,
+            "count": paginator.count,
+        }, status=200)
+
+    # POST (create)
+    data = request.data
+    title = (data.get("title") or "").strip()
+    description = (data.get("description") or "").strip()
+    category = (data.get("category") or "Other").strip()
+    price_raw = data.get("price")
+
+    if not title or not description or price_raw in (None, ""):
+        return Response({"error": "title, description, and price are required"}, status=400)
+
+    try:
+        price = Decimal(str(price_raw))
+        if price < 0:
+            raise InvalidOperation()
+    except (InvalidOperation, ValueError, TypeError):
+        return Response({"error": "price must be a non-negative number"}, status=400)
+
+    s = Service.objects.create(
+        user=request.user,
+        title=title[:255],
+        description=description,
+        price=price,
+        category=category[:100] if category else "Other",
+    )
+    return Response(_serialize_service(s), status=201)
+
+
+@api_view(["GET", "PATCH", "PUT", "DELETE"])
+@permission_classes([IsAuthenticated])
+def services_detail(request, service_id: int):
+    """
+    GET /services/<id>/
+    PATCH /services/<id>/
+    PUT /services/<id>/
+    DELETE /services/<id>/
+    """
+    try:
+        s = Service.objects.select_related("user").get(id=service_id)
+    except Service.DoesNotExist:
+        return Response({"error": "Service not found"}, status=404)
+
+    if request.method == "GET":
+        return Response(_serialize_service(s), status=200)
+
+    if s.user_id != request.user.id:
+        return Response({"error": "Not allowed"}, status=403)
+
+    if request.method == "DELETE":
+        s.delete()
+        return Response(status=204)
+
+    data = request.data or {}
+    if "title" in data:
+        s.title = (data.get("title") or s.title or "").strip()[:255]
+    if "description" in data:
+        s.description = (data.get("description") or s.description or "")
+    if "category" in data:
+        s.category = (data.get("category") or s.category or "Other").strip()[:100]
+    if "price" in data:
+        try:
+            p = Decimal(str(data.get("price")))
+            if p < 0:
+                raise InvalidOperation()
+            s.price = p
+        except (InvalidOperation, ValueError, TypeError):
+            return Response({"error": "price must be a non-negative number"}, status=400)
+
+    s.save()
+    return Response(_serialize_service(s), status=200)
+
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def my_services(request):
+    """
+    GET /services/mine/
+    """
+    qs = Service.objects.filter(user=request.user).select_related("user").order_by("-created_at", "-id")
+    return Response([_serialize_service(s) for s in qs], status=200)
+
+
+# ===========================
+# 📅 Bookings
+# ===========================
+def _serialize_booking(b: Booking):
+    return {
+        "id": b.id,
+        "service": {
+            "id": b.service_id,
+            "title": b.service.title,
+            "price": float(b.service.price),
+            "category": b.service.category,
+        },
+        "provider": _serialize_user(b.provider),
+        "client": _serialize_user(b.client),
+        "start_at": b.start_at.isoformat(),
+        "end_at": b.end_at.isoformat(),
+        "status": b.status,
+        "price_snapshot": float(b.price_snapshot) if b.price_snapshot is not None else None,
+        "currency": b.currency,
+        "transaction_id": b.transaction_id,
+        "notes": b.notes or "",
+        "note": b.notes or "",  # alias for UI compatibility
+        "created_at": b.created_at.isoformat(),
+        "updated_at": b.updated_at.isoformat(),
+        "cancelled_at": b.cancelled_at.isoformat() if b.cancelled_at else None,
+        "completed_at": b.completed_at.isoformat() if b.completed_at else None,
+    }
+
+
+def _provider_has_conflict(provider_id: int, start_at, end_at, exclude_id=None):
+    qs = Booking.objects.filter(
+        provider_id=provider_id,
+        status__in=[Booking.Status.CONFIRMED, Booking.Status.PENDING],
+    )
+    if exclude_id:
+        qs = qs.exclude(id=exclude_id)
+    return qs.filter(start_at__lt=end_at, end_at__gt=start_at).exists()
+
+
+@api_view(["POST", "GET"])
+@permission_classes([IsAuthenticated])
+def bookings_list_create(request):
+    """
+    POST /bookings/
+      { service_id, start_at, end_at, note?/notes? }
+    GET /bookings/?role=client|provider|all&status=&from=&to=&limit=&page=
+    """
+    if request.method == "POST":
+        data = request.data or {}
+        service_id = data.get("service_id")
+        start_at = _tzsafe_parse(data.get("start_at"))
+        end_at = _tzsafe_parse(data.get("end_at"))
+        notes = (data.get("note") or data.get("notes") or "").strip()[:500]
+
+        if not all([service_id, start_at, end_at]):
+            return Response({"error": "service_id, start_at, end_at are required"}, status=400)
+        if end_at <= start_at:
+            return Response({"error": "end_at must be after start_at"}, status=400)
+
+        try:
+            service = Service.objects.select_related("user").get(id=service_id)
+        except Service.DoesNotExist:
+            return Response({"error": "Service not found"}, status=404)
+
+        provider = service.user
+        client = request.user
+        if provider.id == client.id:
+            return Response({"error": "You cannot book your own service"}, status=400)
+
+        if _provider_has_conflict(provider.id, start_at, end_at):
+            return Response({"error": "Time window conflicts with an existing booking"}, status=409)
+
+        b = Booking.objects.create(
+            service=service,
+            provider=provider,
+            client=client,
+            start_at=start_at,
+            end_at=end_at,
+            status=Booking.Status.PENDING,
+            price_snapshot=service.price,
+            currency="ESC",
+            notes=notes,
+        )
+        return Response(_serialize_booking(b), status=201)
+
+    # GET (list)
+    role = (request.GET.get("role") or "all").lower()
+    status_filter = (request.GET.get("status") or "").strip().lower()
+    t_from = _tzsafe_parse(request.GET.get("from"))
+    t_to = _tzsafe_parse(request.GET.get("to"))
+    limit = max(1, min(int(request.GET.get("limit", 50)), 200))
+    page = int(request.GET.get("page", 1))
+
+    qs = Booking.objects.select_related("service", "provider", "client")
+
+    if role == "client":
+        qs = qs.filter(client=request.user)
+    elif role == "provider":
+        qs = qs.filter(provider=request.user)
+    else:
+        qs = qs.filter(Q(client=request.user) | Q(provider=request.user))
+
+    if status_filter:
+        qs = qs.filter(status=status_filter)
+
+    if t_from:
+        qs = qs.filter(end_at__gte=t_from)
+    if t_to:
+        qs = qs.filter(start_at__lte=t_to)
+
+    qs = qs.order_by("-start_at", "-id")
+
+    paginator = Paginator(qs, limit)
+    try:
+        page_obj = paginator.page(page)
+    except EmptyPage:
+        return Response({"results": [], "next_page": None, "prev_page": None, "count": 0}, status=200)
+
+    items = [_serialize_booking(b) for b in page_obj.object_list]
+    return Response({
+        "results": items,
+        "next_page": page + 1 if page_obj.has_next() else None,
+        "prev_page": page - 1 if page_obj.has_previous() else None,
+        "count": paginator.count,
+    }, status=200)
+
+
+def _mutate_booking(me: User, b: Booking, action: str, new_notes: str):
+    now = timezone.now()
+
+    if new_notes:
+        b.notes = (new_notes if not b.notes else (b.notes + "\n" + new_notes))[:2000]
+
+    action = (action or "").lower().strip()
+    if action == "confirm":
+        if me.id != b.provider_id:
+            return {"error": "Only provider can confirm"}, 403
+        if b.status != Booking.Status.PENDING:
+            return {"error": f"Cannot confirm from status {b.status}"}, 400
+        if _provider_has_conflict(b.provider_id, b.start_at, b.end_at, exclude_id=b.id):
+            return {"error": "Time window conflicts with another booking"}, 409
+        b.mark_confirmed()
+        b.save()
+        return _serialize_booking(b), 200
+
+    if action == "reject":
+        if me.id != b.provider_id:
+            return {"error": "Only provider can reject"}, 403
+        if b.status != Booking.Status.PENDING:
+            return {"error": f"Cannot reject from status {b.status}"}, 400
+        b.status = Booking.Status.REJECTED
+        b.updated_at = now
+        b.save(update_fields=["status", "updated_at", "notes"])
+        return _serialize_booking(b), 200
+
+    if action == "cancel":
+        if me.id not in (b.client_id, b.provider_id):
+            return {"error": "Only client or provider can cancel"}, 403
+        if b.status not in [Booking.Status.PENDING, Booking.Status.CONFIRMED]:
+            return {"error": f"Cannot cancel from status {b.status}"}, 400
+        b.mark_cancelled()
+        b.save()
+        return _serialize_booking(b), 200
+
+    if action == "complete":
+        if me.id != b.provider_id:
+            return {"error": "Only provider can complete"}, 403
+        if b.status != Booking.Status.CONFIRMED:
+            return {"error": f"Cannot complete from status {b.status}"}, 400
+        b.mark_completed()
+        b.save()
+        return _serialize_booking(b), 200
+
+    return {"error": "Unsupported action"}, 400
+
+
+@api_view(["GET", "PATCH"])
+@permission_classes([IsAuthenticated])
+def bookings_detail(request, booking_id: int):
+    """
+    GET /bookings/<id>/
+    PATCH /bookings/<id>/ { action: confirm|reject|cancel|complete, note?/notes? }
+    """
+    try:
+        b = Booking.objects.select_related("service", "provider", "client").get(id=booking_id)
+    except Booking.DoesNotExist:
+        return Response({"error": "Booking not found"}, status=404)
+
+    me = request.user
+    if request.method == "GET":
+        if me.id not in (b.client_id, b.provider_id):
+            return Response({"error": "Not allowed"}, status=403)
+        return Response(_serialize_booking(b), status=200)
+
+    data = request.data or {}
+    action = (data.get("action") or "").strip().lower()
+    if not action:
+        return Response({"error": "action is required"}, status=400)
+
+    new_notes = (data.get("note") or data.get("notes") or "").strip()
+    payload, code = _mutate_booking(me, b, action, new_notes)
+    return Response(payload, status=code)
+
+
+@api_view(["POST"])
+@permission_classes([IsAuthenticated])
+def bookings_confirm(request, booking_id: int):
+    try:
+        b = Booking.objects.select_related("service", "provider", "client").get(id=booking_id)
+    except Booking.DoesNotExist:
+        return Response({"error": "Booking not found"}, status=404)
+    payload, code = _mutate_booking(
+        request.user, b, "confirm", (request.data.get("note") or request.data.get("notes") or "").strip()
+    )
+    return Response(payload, status=code)
+
+
+@api_view(["POST"])
+@permission_classes([IsAuthenticated])
+def bookings_reject(request, booking_id: int):
+    try:
+        b = Booking.objects.select_related("service", "provider", "client").get(id=booking_id)
+    except Booking.DoesNotExist:
+        return Response({"error": "Booking not found"}, status=404)
+    payload, code = _mutate_booking(
+        request.user, b, "reject", (request.data.get("note") or request.data.get("notes") or "").strip()
+    )
+    return Response(payload, status=code)
+
+
+@api_view(["POST"])
+@permission_classes([IsAuthenticated])
+def bookings_cancel(request, booking_id: int):
+    try:
+        b = Booking.objects.select_related("service", "provider", "client").get(id=booking_id)
+    except Booking.DoesNotExist:
+        return Response({"error": "Booking not found"}, status=404)
+    payload, code = _mutate_booking(
+        request.user, b, "cancel", (request.data.get("note") or request.data.get("notes") or "").strip()
+    )
+    return Response(payload, status=code)
+
+
+@api_view(["POST"])
+@permission_classes([IsAuthenticated])
+def bookings_complete(request, booking_id: int):
+    try:
+        b = Booking.objects.select_related("service", "provider", "client").get(id=booking_id)
+    except Booking.DoesNotExist:
+        return Response({"error": "Booking not found"}, status=404)
+    payload, code = _mutate_booking(
+        request.user, b, "complete", (request.data.get("note") or request.data.get("notes") or "").strip()
+    )
+    return Response(payload, status=code)
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def boot_status(request):
+    u = request.user
+    # normalize presence fields from your existing model
+    data = {
+        "onboarding_completed": bool(getattr(u, "onboarding_completed", False)),
+        "has_public_key": bool(getattr(u, "public_key", None)),
+        "avatar_set": bool(getattr(u, "avatar_url", None)),
+        "wallet_address": getattr(u, "wallet_address", None) or "",
+        "id": u.id,
+        "email": u.email,
+    }
+    return Response(data, status=200)
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def users_public_keys(request):
+    """
+    GET /users/public_keys/?ids=1,2,3
+    -> { "1":"-----BEGIN...","2":null,"3":"-----BEGIN..." }
+    """
+    ids_param = request.query_params.get("ids", "")
+    try:
+        ids = [int(x) for x in ids_param.split(",") if x.strip().isdigit()]
+    except Exception:
+        ids = []
+
+    if not ids:
+        return Response({})
+
+    rows = User.objects.filter(id__in=ids).values("id", "public_key")
+    out = {str(r["id"]): r["public_key"] for r in rows}
+    return Response(out, status=200)
+
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def user_public_key(request, user_id: int):
+    """
+    GET /users/<id>/public_key/ -> { id, public_key }
+    """
+    try:
+        u = User.objects.only("id", "public_key").get(id=user_id)
     except User.DoesNotExist:
-        return Response({"error": "User not found."}, status=status.HTTP_404_NOT_FOUND)
+        return Response({"error": "User not found"}, status=404)
+    return Response({"id": u.id, "public_key": getattr(u, "public_key", None)}, status=200)

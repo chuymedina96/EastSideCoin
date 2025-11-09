@@ -16,6 +16,7 @@ import ServicesScreen from "../screens/ServicesScreen";
 import ProfileScreen from "../screens/ProfileScreen";
 import KeyScreenSetup from "../screens/KeyScreenSetup";
 import OnboardingScreen from "../screens/OnboardingScreen";
+import UserProfile from "../screens/UserProfile"; // NEW
 
 const AuthStack = createNativeStackNavigator();
 const AppStack = createNativeStackNavigator();
@@ -53,6 +54,7 @@ const HomeTabs = () => (
   >
     <Tab.Screen name="Home" component={HomeScreen} />
     <Tab.Screen name="Wallet" component={WalletScreen} />
+    {/* Use the tab name "Chat" when navigating, not "ChatScreen" */}
     <Tab.Screen name="Chat" component={ChatScreen} options={{ unmountOnBlur: true }} />
     <Tab.Screen name="Services" component={ServicesScreen} />
     <Tab.Screen name="Profile" component={ProfileScreen} />
@@ -108,6 +110,8 @@ const AppNavigator = () => {
       >
         <AppStack.Screen name="Onboarding" component={OnboardingScreen} options={{ gestureEnabled: false }} />
         <AppStack.Screen name="HomeTabs" component={HomeTabs} />
+        {/* Keep UserProfile available during onboarding too (optional) */}
+        <AppStack.Screen name="UserProfile" component={UserProfile} />
       </AppStack.Navigator>
     );
   }
@@ -120,6 +124,8 @@ const AppNavigator = () => {
       initialRouteName="HomeTabs"
     >
       <AppStack.Screen name="HomeTabs" component={HomeTabs} />
+      {/* NEW: enables navigation.navigate('UserProfile', { userId }) */}
+      <AppStack.Screen name="UserProfile" component={UserProfile} />
     </AppStack.Navigator>
   );
 };
