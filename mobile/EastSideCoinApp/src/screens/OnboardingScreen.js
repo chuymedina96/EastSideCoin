@@ -32,7 +32,23 @@ const NEIGHBORHOOD_SUGGESTIONS = [
 
 const OnboardingScreen = () => {
   const insets = useSafeAreaInsets();
-  const { user, getAccessToken, refreshUser } = useContext(AuthContext);
+  const { user, getAccessToken, refreshUser, logoutUser } = useContext(AuthContext);
+
+  // ---- Early guard: if user vanished on backend, log out rather than trap here
+  useEffect(() => {
+    (async () => {
+      try {
+        if (!user?.id) {
+          const me = await refreshUser?.();
+          if (!me?.id) {
+            await logoutUser?.();
+          }
+        }
+      } catch {
+        // ignore
+      }
+    })();
+  }, [user?.id, refreshUser, logoutUser]);
 
   const [neighborhood, setNeighborhood] = useState(user?.neighborhood || "");
   const [skills, setSkills] = useState(user?.skills || "");
@@ -82,13 +98,16 @@ const OnboardingScreen = () => {
   // ------- Avatar helpers -------
   const ensureMediaPermission = async () => {
     try {
-      const { status } = await ImagePicker.requestMediaLibraryPermissionsAsync();
-      if (status !== "granted") {
+      const res = await ImagePicker.requestMediaLibraryPermissionsAsync();
+      const status = res?.status;
+      // treat iOS "limited" as allowed, user will select from limited set
+      if (status !== "granted" && status !== "limited") {
         Alert.alert("Permission needed", "We need access to your photos to set your profile picture.");
         return false;
       }
       return true;
-    } catch {
+    } catch (e) {
+      console.log("requestMediaLibraryPermissionsAsync error:", e?.message || e);
       Alert.alert("Error", "Could not request photo permissions.");
       return false;
     }
@@ -102,7 +121,8 @@ const OnboardingScreen = () => {
         return false;
       }
       return true;
-    } catch {
+    } catch (e) {
+      console.log("requestCameraPermissionsAsync error:", e?.message || e);
       Alert.alert("Error", "Could not request camera permissions.");
       return false;
     }
@@ -111,49 +131,67 @@ const OnboardingScreen = () => {
   const pickFromLibrary = async () => {
     const ok = await ensureMediaPermission();
     if (!ok) return;
-    const res = await ImagePicker.launchImageLibraryAsync({
-      mediaTypes: ImagePicker.MediaTypeOptions.Images,
-      allowsEditing: true,
-      aspect: [1, 1],
-      quality: 0.9,
-      base64: false,
-      exif: false,
-    });
-    if (!res.canceled && res.assets?.length) {
-      await uploadAvatar(res.assets[0]);
+    try {
+      const res = await ImagePicker.launchImageLibraryAsync({
+        // ✅ Correct API: enum, not array
+        mediaTypes: ImagePicker.MediaTypeOptions.Images,
+        allowsEditing: true,
+        aspect: [1, 1],
+        quality: 0.9,
+        base64: false,
+        exif: false,
+        selectionLimit: 1, // future-safe
+      });
+      if (!res.canceled && res.assets?.length) {
+        await uploadAvatar(res.assets[0]);
+      }
+    } catch (e) {
+      console.log("launchImageLibraryAsync error:", e?.message || e);
+      Alert.alert("Open gallery failed", "Couldn’t open your photo library. Try again.");
     }
   };
 
   const takePhoto = async () => {
     const ok = await ensureCameraPermission();
     if (!ok) return;
-    const res = await ImagePicker.launchCameraAsync({
-      allowsEditing: true,
-      aspect: [1, 1],
-      quality: 0.9,
-      base64: false,
-      exif: false,
-    });
-    if (!res.canceled && res.assets?.length) {
-      await uploadAvatar(res.assets[0]);
+    try {
+      const res = await ImagePicker.launchCameraAsync({
+        allowsEditing: true,
+        aspect: [1, 1],
+        quality: 0.9,
+        base64: false,
+        exif: false,
+      });
+      if (!res.canceled && res.assets?.length) {
+        await uploadAvatar(res.assets[0]);
+      }
+    } catch (e) {
+      console.log("launchCameraAsync error:", e?.message || e);
+      Alert.alert("Open camera failed", "Couldn’t open your camera. Try again.");
     }
   };
 
   const refreshUserSafe = async () => {
     try {
       if (typeof refreshUser === "function") {
-        await refreshUser();
+        const me = await refreshUser();
+        if (!me?.id) await logoutUser?.();
       } else {
         await api.get("/me/");
       }
-    } catch {}
+    } catch {
+      await logoutUser?.();
+    }
   };
 
   const uploadAvatar = async (asset) => {
     try {
       setAvatarUploading(true);
       const token = await getAccessToken();
-      if (!token) throw new Error("Not authenticated");
+      if (!token) {
+        await logoutUser?.();
+        throw new Error("Not authenticated");
+      }
 
       const uri = asset.uri || asset.localUri;
       if (!uri) throw new Error("Missing file URI");
@@ -161,7 +199,7 @@ const OnboardingScreen = () => {
       const guessedName = asset.fileName || (uri.split("/").pop() || `avatar_${Date.now()}.jpg`);
       const type =
         asset.mimeType ||
-        asset.type || // some SDKs put it here
+        asset.type ||
         (guessedName.toLowerCase().endsWith(".png") ? "image/png" : "image/jpeg");
 
       const form = new FormData();
@@ -171,6 +209,10 @@ const OnboardingScreen = () => {
         const data = await apiUpload("/profile/avatar/", form, { timeout: 45000 });
         setAvatarUrl(data?.avatar_url || null);
       } catch (e1) {
+        if (e1?.status === 404 || e1?.data?.code === "user_not_found") {
+          await logoutUser?.();
+          return;
+        }
         if (e1?.status === 404) {
           const data2 = await apiUpload("/users/me/avatar/", form, { timeout: 45000 });
           setAvatarUrl(data2?.avatar_url || null);
@@ -181,7 +223,13 @@ const OnboardingScreen = () => {
 
       await refreshUserSafe();
     } catch (e) {
-      const status = e?.status;
+      const status = e?.status || e?.response?.status;
+      const code = e?.data?.code || e?.response?.data?.code;
+
+      if (code === "user_not_found" || status === 404) {
+        await logoutUser?.();
+        return;
+      }
       if (status === 413) {
         Alert.alert("Image too large", "Please choose a smaller photo and try again.");
       } else if (status === 415) {
@@ -203,6 +251,10 @@ const OnboardingScreen = () => {
       try {
         await api.del("/profile/avatar/");
       } catch (e1) {
+        if (e1?.status === 404 || e1?.data?.code === "user_not_found") {
+          await logoutUser?.();
+          return;
+        }
         if (e1?.status === 404) {
           await api.del("/users/me/avatar/");
         } else {
@@ -227,6 +279,12 @@ const OnboardingScreen = () => {
     }
     setSaving(true);
     try {
+      const tok = await getAccessToken();
+      if (!tok) {
+        await logoutUser?.();
+        return;
+      }
+
       const payload = {
         neighborhood: neighborhood.trim(),
         skills: skills.trim(),
@@ -240,12 +298,18 @@ const OnboardingScreen = () => {
       await refreshUserSafe();
       resetNavigation("HomeTabs");
     } catch (e) {
+      const status = e?.status || e?.response?.status;
+      const code = e?.data?.code || e?.response?.data?.code;
+      if (status === 404 || code === "user_not_found") {
+        await logoutUser?.();
+        return;
+      }
       console.log("Onboarding save failed:", e?.data || e?.message || e);
       Alert.alert("Save failed", "Couldn’t finish onboarding. Please try again.");
     } finally {
       setSaving(false);
     }
-  }, [neighborhood, skills, languages, bio, age, canSubmit]);
+  }, [neighborhood, skills, languages, bio, age, canSubmit, getAccessToken, logoutUser, refreshUserSafe]);
 
   const skipForNow = () => {
     resetNavigation("HomeTabs");
@@ -293,7 +357,7 @@ const OnboardingScreen = () => {
                 )}
               </View>
 
-              <View style={styles.avatarCtas}>
+              <View className="avatarCtas" style={styles.avatarCtas}>
                 <Pressable
                   onPress={pickFromLibrary}
                   disabled={avatarUploading}
@@ -445,10 +509,10 @@ const styles = StyleSheet.create({
     borderRadius: AVATAR_SIZE / 2,
     overflow: "hidden",
     borderWidth: 1,
-    borderColor: "#2a2a2e",
+    borderColor: "#2a2ae0",
     alignItems: "center",
     justifyContent: "center",
-    backgroundColor: "#1b1b1f",
+    backgroundColor: "#1b1bf",
   },
   avatar: { width: AVATAR_SIZE, height: AVATAR_SIZE, borderRadius: AVATAR_SIZE / 2, resizeMode: "cover" },
   avatarPlaceholder: { alignItems: "center", justifyContent: "center" },
@@ -500,7 +564,7 @@ const styles = StyleSheet.create({
     borderRadius: 10,
     backgroundColor: "#131318",
     borderWidth: 1,
-    borderColor: "#2a2a2e",
+    borderColor: "#2a2ae",
   },
   suggestion: { paddingVertical: 8, paddingHorizontal: 12, borderBottomWidth: 1, borderBottomColor: "#1e1e24" },
   suggestionText: { color: "#ddd", fontSize: 13 },

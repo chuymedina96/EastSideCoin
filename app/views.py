@@ -395,7 +395,7 @@ def profile_avatar(request):
 
 
 # ===========================
-# 👥 Users / Search (no per-ID public_key endpoint anymore)
+# 👥 Users / Search / Detail
 # ===========================
 @api_view(["GET"])
 @permission_classes([IsAuthenticated])
@@ -419,6 +419,36 @@ def search_users(request):
 
     users = qs.only("id", "first_name", "last_name", "email", "wallet_address")[:25]
     return Response([_serialize_user_with_wallet(u, request) for u in users], status=status.HTTP_200_OK)
+
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def user_detail(request, user_id: int):
+    """
+    GET /users/<id>/
+      - If id == me.id -> full me-style payload
+      - Else -> public-ish info with wallet + profile fields
+    """
+    try:
+        u = User.objects.get(id=user_id)
+    except User.DoesNotExist:
+        return Response({"error": "User not found"}, status=404)
+
+    if u.id == request.user.id:
+        payload = _serialize_me(u, request)
+    else:
+        payload = _serialize_user_with_wallet(u, request)
+        # public profile fields for neighbors
+        payload.update({
+            "bio": getattr(u, "bio", "") or "",
+            "education": getattr(u, "education", "") or "",
+            "age": getattr(u, "age", None),
+            "neighborhood": getattr(u, "neighborhood", "") or "",
+            "skills": getattr(u, "skills", "") or "",
+            "languages": getattr(u, "languages", "") or "",
+        })
+
+    return Response(payload, status=200)
 
 
 # ===========================
@@ -469,7 +499,7 @@ def conversations_index(request):
                 "unread": unread_map.get(u.id, 0),
                 "lastText": "",
                 "avatar_url": _avatar_url(u, request),
-                "has_public_key": bool(getattr(u, "public_key", None)),  # ✅ add this line
+                "has_public_key": bool(getattr(u, "public_key", None)),
             })
 
         items.sort(key=lambda x: x["updatedAt"], reverse=True)
@@ -1164,20 +1194,21 @@ def bookings_complete(request, booking_id: int):
     )
     return Response(payload, status=code)
 
+
 @api_view(["GET"])
 @permission_classes([IsAuthenticated])
 def boot_status(request):
     u = request.user
-    # normalize presence fields from your existing model
     data = {
         "onboarding_completed": bool(getattr(u, "onboarding_completed", False)),
         "has_public_key": bool(getattr(u, "public_key", None)),
-        "avatar_set": bool(getattr(u, "avatar_url", None)),
+        "avatar_set": bool(getattr(u, "avatar", None)),
         "wallet_address": getattr(u, "wallet_address", None) or "",
         "id": u.id,
         "email": u.email,
     }
     return Response(data, status=200)
+
 
 @api_view(["GET"])
 @permission_classes([IsAuthenticated])

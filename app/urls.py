@@ -10,7 +10,10 @@ from .views import (
     refresh_token_view,
 
     # 👥 Users
-    search_users,  # ⬅️ keep search
+    search_users,      # ⬅️ keep search
+    user_detail,       # ⬅️ NEW: per-user profile
+    users_public_keys,
+    user_public_key,
 
     # 💬 Chat / Messaging
     send_message,
@@ -43,9 +46,6 @@ from .views import (
     me_detail_update,
     profile_avatar,
     boot_status,
-    users_public_keys,
-    user_public_key
-    
 )
 
 urlpatterns = [
@@ -64,8 +64,9 @@ urlpatterns = [
     # ===========================
     path("search_users/", search_users, name="search_users"),
     path("users/search/", search_users, name="users_search_alias"),
-    # ⛔️ Removed public key endpoint (deprecated)
-    # path("users/<int:user_id>/public_key/", get_user_public_key, name="get_user_public_key"),
+    path("users/<int:user_id>/", user_detail, name="user_detail"),
+    path("users/public_keys/", users_public_keys, name="users_public_keys"),
+    path("users/<int:user_id>/public_key/", user_public_key, name="user_public_key"),
 
     # ===========================
     # 💬 Conversations / Threads
@@ -115,8 +116,5 @@ urlpatterns = [
     path("users/me/", me_detail_update, name="users_me_alias"),
     path("profile/avatar/", profile_avatar, name="profile_avatar"),
     path("users/me/avatar/", profile_avatar, name="users_me_avatar"),
-    
     path("users/me/boot_status/", boot_status, name="boot_status"),
-    path("users/public_keys/", users_public_keys, name="users_public_keys"),
-    path("users/<int:user_id>/public_key/", user_public_key, name="user_public_key"),
 ]

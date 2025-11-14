@@ -266,21 +266,37 @@ const AuthProvider = ({ children }) => {
     return tok || authToken;
   }, [hydrated, authToken, maybeRefreshToken, markActivity]);
 
+  // ---- NEW: central path to logout if backend user is gone ----
+  const handleBackendUserMissing = useCallback(async () => {
+    await logoutUser();
+  }, [logoutUser]);
+
   const refreshUser = useCallback(async () => {
     try {
       const tok = await getAccessToken();
       if (!tok) return null;
-      const { data } = await axios.get(`${API_URL}/me/`, { headers: { Authorization: `Bearer ${tok}` } });
+
+      const { data } = await axios.get(`${API_URL}/me/`, {
+        headers: { Authorization: `Bearer ${tok}` },
+      });
+
       if (data) {
         setUser(data);
         await AsyncStorage.setItem("user", JSON.stringify(data));
       }
       return data;
     } catch (e) {
+      const status = e?.response?.status;
+      const code = e?.response?.data?.code;
+      if (status === 404 || code === "user_not_found") {
+        // user was deleted or no longer exists on the server → hard logout
+        await handleBackendUserMissing();
+        return null;
+      }
       console.warn("refreshUser error:", e?.response?.data || e?.message || e);
       return null;
     }
-  }, [getAccessToken]);
+  }, [getAccessToken, handleBackendUserMissing]);
 
   useEffect(() => {
     apiSetAuthToken(() => getAccessToken());
@@ -473,18 +489,18 @@ const AuthProvider = ({ children }) => {
         AsyncStorage.getItem("authToken"),
         AsyncStorage.getItem("user"),
       ]);
-      const currentUser = rawUser ? JSON.parse(rawUser) : null;
-      const uid = currentUser?.id;
+    const currentUser = rawUser ? JSON.parse(rawUser) : null;
+    const uid = currentUser?.id;
 
-      if (!accessTokenLocal || !uid) {
-        await wipeLocalAfterDelete(null);
-        return;
-      }
+    if (!accessTokenLocal || !uid) {
+      await wipeLocalAfterDelete(null);
+      return;
+    }
 
-      const res = await axios.delete(`${API_URL}/delete_account/`, { headers: { Authorization: `Bearer ${accessTokenLocal}` } });
-      if (!(res.status === 204 || res.status === 200)) throw new Error(`Delete failed (status ${res.status})`);
+    const res = await axios.delete(`${API_URL}/delete_account/`, { headers: { Authorization: `Bearer ${accessTokenLocal}` } });
+    if (!(res.status === 204 || res.status === 200)) throw new Error(`Delete failed (status ${res.status})`);
 
-      await wipeLocalAfterDelete(uid);
+    await wipeLocalAfterDelete(uid);
     } catch (err) {
       console.error("Delete account error:", err?.response?.data || err?.message || err);
       Alert.alert("Delete Failed", "We couldn’t delete your account. Please try again.");

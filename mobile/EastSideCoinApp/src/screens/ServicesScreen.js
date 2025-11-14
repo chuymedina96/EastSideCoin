@@ -37,7 +37,6 @@ import { API_URL } from "../config";
 import avatarPlaceholder from "../../assets/avatar-placeholder.png"; // ✅ same placeholder used in ProfileScreen
 
 // NOTE: Removed import { Audio } from "expo-av"; to avoid the "interruptionModeIOS" error.
-// If you need Audio elsewhere, configure it there with valid props.
 
 const THEME = {
   bg: "#101012",
@@ -94,6 +93,18 @@ const isoDay = (d) => {
   dd.setHours(0, 0, 0, 0);
   return dd.toISOString().slice(0, 10);
 };
+
+// ✅ Local-day helper: get YYYY-MM-DD for *local* date from ISO string
+const localDayFromISO = (iso) => {
+  if (!iso) return "";
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return "";
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
+  return `${y}-${m}-${day}`;
+};
+
 const startOfMonthISO = (date) => isoDay(new Date(date.getFullYear(), date.getMonth(), 1));
 const endOfMonthISO = (date) => isoDay(new Date(date.getFullYear(), date.getMonth() + 1, 0));
 
@@ -293,10 +304,12 @@ const ServicesScreen = ({ navigation, route }) => {
     (list) => (bkSegment === "Upcoming" ? list.filter((b) => !isPast(b.start_at)) : list.filter((b) => isPast(b.start_at))),
     [bkSegment]
   );
+
+  // ✅ Use localDayFromISO so late-night bookings don't show up as next-day
   const filterByDay = useCallback(
     (list) => {
       if (!bkDayISO) return list;
-      return list.filter((b) => (b.start_at || "").slice(0, 10) === bkDayISO);
+      return list.filter((b) => localDayFromISO(b.start_at) === bkDayISO);
     },
     [bkDayISO]
   );
@@ -315,9 +328,26 @@ const ServicesScreen = ({ navigation, route }) => {
         setBkError("");
         const res = await listBookings(params);
         const base = Array.isArray(res?.results) ? res.results : Array.isArray(res) ? res : [];
-        const seg = filterBySegment(base);
-        const filtered = filterByDay(seg);
+
+        let seg = filterBySegment(base);
+        let filtered = filterByDay(seg);
+
+        // ✅ Always sort by start_at ascending (All Dates / any filter)
+        filtered = [...filtered].sort((a, b) => {
+          const aT = new Date(a.start_at || a.start || "").getTime() || 0;
+          const bT = new Date(b.start_at || b.start || "").getTime() || 0;
+          return aT - bT;
+        });
+
         const merged = replace ? filtered : [...bkItems, ...filtered];
+
+        // Ensure final list is sorted earliest → latest
+        merged.sort((a, b) => {
+          const aT = new Date(a.start_at || a.start || "").getTime() || 0;
+          const bT = new Date(b.start_at || b.start || "").getTime() || 0;
+          return aT - bT;
+        });
+
         setBkItems(merged);
         setBkNextPage(res?.next_page || null);
         setBkPage(p);
@@ -348,7 +378,8 @@ const ServicesScreen = ({ navigation, route }) => {
       const list = Array.isArray(res?.results) ? res.results : Array.isArray(res) ? res : [];
       const map = {};
       for (const b of list) {
-        const day = (b?.start_at || "").slice(0, 10);
+        // ✅ Use localDayFromISO so dots appear on correct local day
+        const day = localDayFromISO(b?.start_at);
         if (!day) continue;
         map[day] = (map[day] || 0) + 1;
       }
@@ -871,7 +902,6 @@ const ServicesScreen = ({ navigation, route }) => {
   const fetchProviderBookingsForDay = useCallback(async (providerId, dayISO) => {
     const start = `${dayISO}T00:00:00`;
     const end = `${dayISO}T23:59:59`;
-    // Use raw api for flexible params
     const params = {
       role: "provider",
       provider_id: providerId,
@@ -885,7 +915,8 @@ const ServicesScreen = ({ navigation, route }) => {
   }, []);
 
   const openBook = (svc) => {
-    if (svc?.user?.id && meId && String(svc.user.id) === String(meId)) {
+    const owner = svc?.user || svc?.owner || svc?.provider || svc?.poster;
+    if (owner?.id && meId && String(owner.id) === String(meId)) {
       Alert.alert("Heads up", "You can’t book your own service.");
       return;
     }
@@ -940,8 +971,8 @@ const ServicesScreen = ({ navigation, route }) => {
       setBookSaving(true);
       setBookErr("");
 
-      // DOUBLE BOOKING GUARD
-      const providerId = bookSvc?.user?.id;
+      const provider = bookSvc?.user || bookSvc?.owner || bookSvc?.provider || bookSvc?.poster;
+      const providerId = provider?.id;
       if (providerId) {
         const dayBookings = await fetchProviderBookingsForDay(providerId, bookDay);
         const overlapping = dayBookings.find((b) => hasOverlap(startISO, endISO, b.start_at, b.end_at));
@@ -952,7 +983,6 @@ const ServicesScreen = ({ navigation, route }) => {
         }
       }
 
-      // Create booking
       await bookService(bookSvc.id, {
         start: startISO,
         end: endISO,
@@ -973,7 +1003,7 @@ const ServicesScreen = ({ navigation, route }) => {
     }
   };
 
-  // Time slots helper (08:00 → 20:00, 30-min steps)
+  // Time slots helper (08:00 → 20:00, 30-min steps) – internal 24h, label 12h
   const timeSlots = useMemo(() => {
     const slots = [];
     for (let h = 8; h <= 20; h++) {
@@ -993,19 +1023,26 @@ const ServicesScreen = ({ navigation, route }) => {
 
   /* =================== SERVICES UI PIECES =================== */
 
-  // robust chat navigation (targets the "Chat" tab)
+  // robust chat navigation
   const navigateToChat = useCallback(
     (toUser) => {
+      if (!toUser) {
+        Alert.alert("Messaging not available", "User information is missing.");
+        return;
+      }
       const toUserEmail = typeof toUser === "string" ? toUser : (toUser?.email || "");
-      const params = toUserEmail ? { toUserEmail } : { toUserId: toUser?.id };
+      const userId = typeof toUser === "object" ? toUser?.id : undefined;
 
-      // Primary: tab name is "Chat"
+      const params = {
+        ...(userId ? { userId, toUserId: userId, otherUserId: userId } : {}),
+        ...(toUserEmail ? { toUserEmail } : {}),
+      };
+
       try {
         navigation?.navigate?.("Chat", params);
         return;
       } catch {}
 
-      // Fallbacks for nested setups you might add later
       try {
         navigation?.navigate?.("Messages", { screen: "Chat", params });
         return;
@@ -1031,12 +1068,19 @@ const ServicesScreen = ({ navigation, route }) => {
   const openProviderProfile = useCallback(
     (userId) => {
       if (!userId) return;
-      // Primary: your AppNavigator has "UserProfile" registered
+      // ✅ If it's you, go straight to your Profile tab
+      try {
+        if (meId && String(userId) === String(meId)) {
+          navigation?.navigate?.("Profile");
+          return;
+        }
+      } catch {}
+
+      // Otherwise, open their user profile
       try {
         navigation?.navigate?.("UserProfile", { userId });
         return;
       } catch {}
-      // Other possible names, if you change later:
       try {
         navigation?.navigate?.("ProfileView", { userId });
         return;
@@ -1047,7 +1091,7 @@ const ServicesScreen = ({ navigation, route }) => {
       } catch {}
       Alert.alert("Profile", "Couldn’t open the user’s profile. Add a 'UserProfile' route to your navigator.");
     },
-    [navigation]
+    [navigation, meId]
   );
 
   const Header = () => (
@@ -1141,11 +1185,12 @@ const ServicesScreen = ({ navigation, route }) => {
   };
 
   const ServiceCard = ({ item }) => {
+    const owner = item.user || item.owner || item.provider || item.poster;
     const ownerName =
-      item.user?.first_name || item.user?.last_name
-        ? `${item.user?.first_name || ""} ${item.user?.last_name || ""}`.trim()
-        : item.user?.email || "Neighbor";
-    const avatarUri = resolveAvatarUri(item.user);
+      owner?.first_name || owner?.last_name
+        ? `${owner?.first_name || ""} ${owner?.last_name || ""}`.trim()
+        : owner?.email || owner?.name || "Neighbor";
+    const avatarUri = resolveAvatarUri(owner);
 
     const priceNum = Number(item.price);
     const priceLabel = Number.isFinite(priceNum)
@@ -1153,11 +1198,11 @@ const ServicesScreen = ({ navigation, route }) => {
       : "—";
 
     const isMineTab = tab === Tabs.Mine;
-    const amOwner = String(item?.user?.id) === String(meId);
+    const amOwner = String(owner?.id) === String(meId);
 
     return (
       <Pressable
-        onPress={() => openServiceDetail(item)} // open modal instead of route
+        onPress={() => openServiceDetail(item)}
         onLongPress={() => (isMineTab ? openEdit(item) : undefined)}
         delayLongPress={250}
         style={({ pressed }) => [styles.card, pressed && { opacity: 0.96 }]}
@@ -1171,16 +1216,12 @@ const ServicesScreen = ({ navigation, route }) => {
               <Pressable onPress={() => openEdit(item)} style={styles.editPill}>
                 <Text style={styles.editPillText}>Edit</Text>
               </Pressable>
-            ) : !amOwner ? (
-              <Pressable onPress={() => openBook(item)} style={styles.editPill}>
-                <Text style={styles.editPillText}>Book</Text>
-              </Pressable>
             ) : null}
             <Text style={styles.price}>{priceLabel} ESC</Text>
           </View>
         </View>
 
-        <Pressable style={styles.ownerRow} onPress={() => openProviderProfile(item?.user?.id)}>
+        <Pressable style={styles.ownerRow} onPress={() => openProviderProfile(owner?.id)}>
           <Image
             source={avatarUri ? { uri: avatarUri, headers: imageHeaders } : avatarPlaceholder}
             style={styles.avatarSm}
@@ -1200,17 +1241,16 @@ const ServicesScreen = ({ navigation, route }) => {
           {!isMineTab && !amOwner && (
             <>
               <Pressable
-                style={({ pressed }) => [styles.primaryBtn, pressed && { transform: [{ scale: 0.98 }] }]}
-                onPress={() => navigateToChat(item.user)}
-              >
-                <Text style={styles.primaryBtnText}>Message</Text>
-              </Pressable>
-              {/* ⬇️ Pay removed; show explicit Book CTA instead */}
-              <Pressable
                 style={({ pressed }) => [styles.secondaryBtn, pressed && { opacity: 0.9 }]}
+                onPress={() => navigateToChat(owner)}
+              >
+                <Text style={styles.secondaryBtnText}>Message</Text>
+              </Pressable>
+              <Pressable
+                style={({ pressed }) => [styles.bookBtn, pressed && { transform: [{ scale: 0.98 }] }]}
                 onPress={() => openBook(item)}
               >
-                <Text style={styles.secondaryBtnText}>Book</Text>
+                <Text style={styles.bookBtnText}>Book</Text>
               </Pressable>
             </>
           )}
@@ -1414,7 +1454,6 @@ const ServicesScreen = ({ navigation, route }) => {
         category: eCategory,
       };
 
-      // Try PATCH (standard), fallback to PUT or PATCH-with-body wrapper
       let updated;
       try {
         updated = await api.patch(`/services/${editId}/`, payload);
@@ -1478,7 +1517,6 @@ const ServicesScreen = ({ navigation, route }) => {
               <TabBar />
             </View>
 
-            {/* Bookings pane replaces search/chips/list when active */}
             {tab === Tabs.Bookings ? (
               <BookingsPane />
             ) : (
@@ -1498,7 +1536,6 @@ const ServicesScreen = ({ navigation, route }) => {
         keyboardShouldPersistTaps="handled"
       />
 
-      {/* Initial skeletons for services lists (not for bookings) */}
       {tab !== Tabs.Bookings && isLoadingList && (
         <View style={[styles.skeletonWrap, { top: skeletonTop }]}>
           <Skeleton />
@@ -1560,7 +1597,6 @@ const ServicesScreen = ({ navigation, route }) => {
                     </Pressable>
                   </View>
 
-                  {/* Category scroller */}
                   <View style={styles.catScrollerBox}>
                     {catCanLeft && (
                       <Pressable onPress={() => catScrollRef.current?.scrollTo({ x: 0, animated: true })} style={[styles.chev, styles.chevLeft]}>
@@ -1636,7 +1672,6 @@ const ServicesScreen = ({ navigation, route }) => {
             </ScrollView>
           </View>
 
-          {/* Category grid sheet */}
           <Modal visible={catGridOpen} transparent animationType="fade" onRequestClose={() => setCatGridOpen(false)}>
             <View style={styles.modalBackdrop}>
               <View style={styles.gridCard}>
@@ -1754,7 +1789,7 @@ const ServicesScreen = ({ navigation, route }) => {
         </KeyboardAvoidingView>
       </Modal>
 
-      {/* Service Detail Modal (Tap -> Modal; Book / Message / View Profile) */}
+      {/* Service Detail Modal */}
       <Modal visible={svcDetailOpen} transparent animationType="fade" onRequestClose={closeServiceDetail}>
         <KeyboardAvoidingView
           behavior={Platform.select({ ios: "padding", android: undefined })}
@@ -1762,79 +1797,83 @@ const ServicesScreen = ({ navigation, route }) => {
         >
           <View style={styles.modalCard}>
             <Text style={styles.modalTitle}>{svcDetailItem?.title || "Service"}</Text>
-            {svcDetailItem ? (
-              <>
-                {/* Owner row with avatar + profile link */}
-                <Pressable
-                  style={[styles.ownerRow, { marginTop: 2 }]}
-                  onPress={() => openProviderProfile(svcDetailItem?.user?.id)}
-                >
-                  <Image
-                    source={
-                      resolveAvatarUri(svcDetailItem?.user)
-                        ? { uri: resolveAvatarUri(svcDetailItem?.user), headers: imageHeaders }
-                        : avatarPlaceholder
-                    }
-                    style={styles.avatarSm}
-                    resizeMode="cover"
-                  />
-                  <Text style={styles.owner} numberOfLines={1}>
-                    by{" "}
-                    <Text style={styles.ownerLink}>
-                      {(svcDetailItem?.user?.first_name || svcDetailItem?.user?.last_name
-                        ? `${svcDetailItem?.user?.first_name || ""} ${svcDetailItem?.user?.last_name || ""}`.trim()
-                        : svcDetailItem?.user?.email) || "Neighbor"}
+            {svcDetailItem ? (() => {
+              const owner = svcDetailItem?.user || svcDetailItem?.owner || svcDetailItem?.provider || svcDetailItem?.poster;
+              const ownerAvatar = resolveAvatarUri(owner);
+              const ownerName =
+                owner?.first_name || owner?.last_name
+                  ? `${owner?.first_name || ""} ${owner?.last_name || ""}`.trim()
+                  : owner?.email || owner?.name || "Neighbor";
+              const isOwner = String(owner?.id) === String(meId);
+
+              return (
+                <>
+                  <Pressable
+                    style={[styles.ownerRow, { marginTop: 2 }]}
+                    onPress={() => openProviderProfile(owner?.id)}
+                  >
+                    <Image
+                      source={ownerAvatar ? { uri: ownerAvatar, headers: imageHeaders } : avatarPlaceholder}
+                      style={styles.avatarSm}
+                      resizeMode="cover"
+                    />
+                    <Text style={styles.owner} numberOfLines={1}>
+                      by <Text style={styles.ownerLink}>{ownerName}</Text>
+                      {"  "}
+                      • <Text style={styles.categoryText}>{svcDetailItem?.category || "Other"}</Text>
                     </Text>
-                    {"  "}
-                    • <Text style={styles.categoryText}>{svcDetailItem?.category || "Other"}</Text>
-                  </Text>
-                </Pressable>
-
-                <Text style={[styles.desc, { marginTop: 8 }]}>
-                  {svcDetailItem?.description || "—"}
-                </Text>
-                <Text style={[styles.price, { marginTop: 8 }]}>
-                  {Number(svcDetailItem?.price || 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })} ESC
-                </Text>
-
-                <View style={[styles.row, { gap: 8, marginTop: 14, flexWrap: "wrap" }]}>
-                  {String(svcDetailItem?.user?.id) !== String(meId) && (
-                    <>
-                      <Pressable
-                        style={styles.primaryBtn}
-                        onPress={() => {
-                          closeServiceDetail();
-                          openBook(svcDetailItem);
-                        }}
-                      >
-                        <Text style={styles.primaryBtnText}>Book</Text>
-                      </Pressable>
-                      <Pressable
-                        style={styles.secondaryBtn}
-                        onPress={() => {
-                          closeServiceDetail();
-                          navigateToChat(svcDetailItem?.user);
-                        }}
-                      >
-                        <Text style={styles.secondaryBtnText}>Message</Text>
-                      </Pressable>
-                      <Pressable
-                        style={styles.secondaryBtn}
-                        onPress={() => {
-                          closeServiceDetail();
-                          openProviderProfile(svcDetailItem?.user?.id);
-                        }}
-                      >
-                        <Text style={styles.secondaryBtnText}>View Profile</Text>
-                      </Pressable>
-                    </>
-                  )}
-                  <Pressable style={styles.secondaryBtn} onPress={closeServiceDetail}>
-                    <Text style={styles.secondaryBtnText}>Close</Text>
                   </Pressable>
-                </View>
-              </>
-            ) : (
+
+                  <Text style={[styles.desc, { marginTop: 8 }]}>
+                    {svcDetailItem?.description || "—"}
+                  </Text>
+                  <Text style={[styles.price, { marginTop: 8 }]}>
+                    {Number(svcDetailItem?.price || 0).toLocaleString(undefined, {
+                      minimumFractionDigits: 2,
+                      maximumFractionDigits: 2,
+                    })}{" "}
+                    ESC
+                  </Text>
+
+                  <View style={[styles.row, { gap: 8, marginTop: 14, flexWrap: "wrap" }]}>
+                    {!isOwner && (
+                      <>
+                        <Pressable
+                          style={styles.bookBtn}
+                          onPress={() => {
+                            closeServiceDetail();
+                            openBook(svcDetailItem);
+                          }}
+                        >
+                          <Text style={styles.bookBtnText}>Book</Text>
+                        </Pressable>
+                        <Pressable
+                          style={styles.secondaryBtn}
+                          onPress={() => {
+                            closeServiceDetail();
+                            navigateToChat(owner);
+                          }}
+                        >
+                          <Text style={styles.secondaryBtnText}>Message</Text>
+                        </Pressable>
+                        <Pressable
+                          style={styles.secondaryBtn}
+                          onPress={() => {
+                            closeServiceDetail();
+                            openProviderProfile(owner?.id);
+                          }}
+                        >
+                          <Text style={styles.secondaryBtnText}>View Profile</Text>
+                        </Pressable>
+                      </>
+                    )}
+                    <Pressable style={styles.secondaryBtn} onPress={closeServiceDetail}>
+                      <Text style={styles.secondaryBtnText}>Close</Text>
+                    </Pressable>
+                  </View>
+                </>
+              );
+            })() : (
               <ActivityIndicator color={THEME.accentGold} />
             )}
           </View>
@@ -1850,11 +1889,9 @@ const ServicesScreen = ({ navigation, route }) => {
           <View style={styles.modalCard}>
             <Text style={styles.modalTitle}>Book: {bookSvc?.title || "Service"} </Text>
             <ScrollView keyboardShouldPersistTaps="handled">
-              {/* Day picker (month calendar for booking) */}
               <Text style={styles.inputLabel}>Pick a day</Text>
               <MonthCalendarBooking />
 
-              {/* Time picker */}
               <Text style={styles.inputLabel}>Start time</Text>
               <ScrollView horizontal showsHorizontalScrollIndicator={false} style={{ marginBottom: 10 }} keyboardShouldPersistTaps="handled">
                 <View style={{ flexDirection: "row", gap: 8 }}>
@@ -1873,7 +1910,6 @@ const ServicesScreen = ({ navigation, route }) => {
                 </View>
               </ScrollView>
 
-              {/* Duration */}
               <Text style={styles.inputLabel}>Duration (minutes)</Text>
               <View style={{ flexDirection: "row", gap: 8, marginBottom: 10 }}>
                 {[30, 60, 90, 120].map((d) => {
@@ -1886,7 +1922,6 @@ const ServicesScreen = ({ navigation, route }) => {
                 })}
               </View>
 
-              {/* Note */}
               <View style={styles.inputWrap}>
                 <Text style={styles.inputLabel}>Note (optional)</Text>
                 <TextInput
@@ -1922,7 +1957,7 @@ const ServicesScreen = ({ navigation, route }) => {
         </KeyboardAvoidingView>
       </Modal>
 
-      {/* Booking Detail Modal (view/approve/deny) */}
+      {/* Booking Detail Modal */}
       <Modal visible={detailOpen} transparent animationType="fade" onRequestClose={closeDetail}>
         <KeyboardAvoidingView
           behavior={Platform.select({ ios: "padding", android: undefined })}
@@ -2132,6 +2167,8 @@ const styles = StyleSheet.create({
     justifyContent: "space-between",
     marginTop: 12,
   },
+
+  // orange primary (for general actions, not Book)
   primaryBtn: {
     backgroundColor: THEME.accentOrange,
     borderRadius: 10,
@@ -2147,6 +2184,8 @@ const styles = StyleSheet.create({
     flex: 1,
   },
   primaryBtnText: { color: "#fff", fontWeight: "800" },
+
+  // neutral secondary
   secondaryBtn: {
     backgroundColor: "#2d2d2f",
     borderRadius: 10,
@@ -2167,6 +2206,18 @@ const styles = StyleSheet.create({
     marginRight: 10,
   },
   secondaryBtnText: { color: THEME.text, fontWeight: "800" },
+
+  // ✅ Green Book button
+  bookBtn: {
+    backgroundColor: "#16a34a",
+    borderRadius: 10,
+    paddingHorizontal: 14,
+    paddingVertical: 10,
+  },
+  bookBtnText: {
+    color: "#f9fafb",
+    fontWeight: "800",
+  },
 
   // Bookings UI
   segmentBar: { flexDirection: "row", gap: 8, marginTop: 6 },
@@ -2310,12 +2361,10 @@ const styles = StyleSheet.create({
     borderWidth: 1,
   },
 
-  // accents
   accent: { position: "absolute", width: 300, height: 300, borderRadius: 999, opacity: 0.1 },
   accentTop: { top: -70, right: -60, backgroundColor: THEME.accentGold },
   accentBottom: { bottom: -90, left: -70, backgroundColor: THEME.accentOrange },
 
-  // modal
   modalBackdrop: { flex: 1, backgroundColor: "rgba(0,0,0,0.6)", padding: 16, justifyContent: "center" },
   modalCard: {
     width: "100%",
@@ -2345,7 +2394,6 @@ const styles = StyleSheet.create({
   row: { flexDirection: "row", alignItems: "center" },
   rowBetween: { flexDirection: "row", alignItems: "flex-start", justifyContent: "space-between" },
 
-  // Category scroller (modal)
   catHeaderRow: { flexDirection: "row", alignItems: "center", justifyContent: "space-between" },
   viewAllBtn: { paddingHorizontal: 6, paddingVertical: 4 },
   viewAllText: { color: THEME.accentGold, fontWeight: "800", fontSize: 12 },
@@ -2411,7 +2459,6 @@ const styles = StyleSheet.create({
   gridCloseBtn: { marginTop: 10, backgroundColor: THEME.accentOrange, borderRadius: 12, paddingVertical: 12, alignItems: "center" },
   gridCloseText: { color: "#fff", fontWeight: "900" },
 
-  // actions on booking cards
   actionBtn: {
     backgroundColor: THEME.slate,
     borderRadius: 10,
@@ -2433,7 +2480,6 @@ const styles = StyleSheet.create({
 
   catHint: { color: THEME.subtle, marginTop: 6, fontSize: 12 },
 
-  // booking detail modal small bits
   detailRow: { color: THEME.text, marginTop: 6 },
   detailLabel: { color: THEME.subtext, fontWeight: "800" },
 });
