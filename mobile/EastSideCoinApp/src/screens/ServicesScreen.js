@@ -1,5 +1,12 @@
 // screens/ServicesScreen.js
-import React, { useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
+import React, {
+  useCallback,
+  useContext,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import {
   View,
   Text,
@@ -26,17 +33,10 @@ import {
   listMyServices,
   listServiceCategories,
   createService,
-  listBookings,
-  confirmBooking,
-  rejectBooking,
-  cancelBookingAction,
-  completeBooking,
   bookService,
 } from "../utils/api";
 import { API_URL } from "../config";
-import avatarPlaceholder from "../../assets/avatar-placeholder.png"; // ✅ same placeholder used in ProfileScreen
-
-// NOTE: Removed import { Audio } from "expo-av"; to avoid the "interruptionModeIOS" error.
+import avatarPlaceholder from "../../assets/avatar-placeholder.png";
 
 const THEME = {
   bg: "#101012",
@@ -53,11 +53,16 @@ const THEME = {
   slate: "#2d2d2f",
 };
 
-const DEFAULT_CATEGORIES = ["All", "Barber", "Lawn Care", "Studio", "Tutoring", "Cleaning", "Other"];
-const Tabs = { Browse: "Browse", Mine: "Mine", Bookings: "Bookings" };
-const Roles = ["All", "Provider", "Client"];
-const StatusChips = ["All", "pending", "confirmed", "completed", "cancelled", "rejected"];
-const Segments = ["Upcoming", "Past"];
+const DEFAULT_CATEGORIES = [
+  "All",
+  "Barber",
+  "Lawn Care",
+  "Studio",
+  "Tutoring",
+  "Cleaning",
+  "Other",
+];
+const Tabs = { Browse: "Browse", Mine: "Mine" };
 
 const toArray = (data) => {
   if (Array.isArray(data)) return data;
@@ -78,7 +83,9 @@ function resolveAvatarUri(userLike, fallback) {
     lower.startsWith("data:") ||
     lower.startsWith("file:") ||
     lower.startsWith("content:");
-  const base = isAbsolute ? raw : `${API_URL.replace(/\/+$/, "")}/${String(raw).replace(/^\/+/, "")}`;
+  const base = isAbsolute
+    ? raw
+    : `${API_URL.replace(/\/+$/, "")}/${String(raw).replace(/^\/+/, "")}`;
   const ts =
     userLike?.avatar_updated_at ||
     userLike?.updated_at ||
@@ -93,20 +100,6 @@ const isoDay = (d) => {
   dd.setHours(0, 0, 0, 0);
   return dd.toISOString().slice(0, 10);
 };
-
-// ✅ Local-day helper: get YYYY-MM-DD for *local* date from ISO string
-const localDayFromISO = (iso) => {
-  if (!iso) return "";
-  const d = new Date(iso);
-  if (Number.isNaN(d.getTime())) return "";
-  const y = d.getFullYear();
-  const m = String(d.getMonth() + 1).padStart(2, "0");
-  const day = String(d.getDate()).padStart(2, "0");
-  return `${y}-${m}-${day}`;
-};
-
-const startOfMonthISO = (date) => isoDay(new Date(date.getFullYear(), date.getMonth(), 1));
-const endOfMonthISO = (date) => isoDay(new Date(date.getFullYear(), date.getMonth() + 1, 0));
 
 /* ======================== MAIN ======================== */
 const ServicesScreen = ({ navigation, route }) => {
@@ -169,12 +162,25 @@ const ServicesScreen = ({ navigation, route }) => {
   useEffect(() => {
     Animated.loop(
       Animated.sequence([
-        Animated.timing(float, { toValue: 1, duration: 2500, easing: Easing.inOut(Easing.quad), useNativeDriver: true }),
-        Animated.timing(float, { toValue: 0, duration: 2500, easing: Easing.inOut(Easing.quad), useNativeDriver: true }),
+        Animated.timing(float, {
+          toValue: 1,
+          duration: 2500,
+          easing: Easing.inOut(Easing.quad),
+          useNativeDriver: true,
+        }),
+        Animated.timing(float, {
+          toValue: 0,
+          duration: 2500,
+          easing: Easing.inOut(Easing.quad),
+          useNativeDriver: true,
+        }),
       ])
     ).start();
   }, [float]);
-  const floatY = float.interpolate({ inputRange: [0, 1], outputRange: [0, -3] });
+  const floatY = float.interpolate({
+    inputRange: [0, 1],
+    outputRange: [0, -3],
+  });
 
   // Single in-flight controllers for browse + mine
   const abortBrowseRef = useRef(null);
@@ -187,7 +193,9 @@ const ServicesScreen = ({ navigation, route }) => {
       const cleaned = serverCats
         .map((c) => (typeof c === "string" ? c : c?.name))
         .filter(Boolean);
-      const uniq = Array.from(new Set(["All", ...cleaned, ...DEFAULT_CATEGORIES]));
+      const uniq = Array.from(
+        new Set(["All", ...cleaned, ...DEFAULT_CATEGORIES])
+      );
       setCategories(uniq);
       setCategory((prev) => (uniq.includes(prev) ? prev : "All"));
     } catch {
@@ -208,7 +216,10 @@ const ServicesScreen = ({ navigation, route }) => {
         if (q && q.trim().length > 0) params.q = q.trim();
         if (cat && cat !== "All") params.category = cat;
 
-        const payload = await api.get("/services/", { params, signal: ctrl.signal });
+        const payload = await api.get("/services/", {
+          params,
+          signal: ctrl.signal,
+        });
         setBrowse(toArray(payload));
       } catch (e) {
         if (e.name === "CanceledError" || e.name === "AbortError") return;
@@ -266,619 +277,12 @@ const ServicesScreen = ({ navigation, route }) => {
     doFetchBrowse(query, cat);
   };
 
-  /* =================== BOOKINGS PANE =================== */
-  // filters
-  const [bkSegment, setBkSegment] = useState(Segments[0]);
-  const [bkRole, setBkRole] = useState(Roles[0]);
-  const [bkStatus, setBkStatus] = useState(StatusChips[0]);
-  const [bkDayISO, setBkDayISO] = useState(""); // selected day filter (YYYY-MM-DD)
-
-  // state
-  const [bkItems, setBkItems] = useState([]);
-  const [bkLoading, setBkLoading] = useState(false);
-  const [bkRefreshing, setBkRefreshing] = useState(false);
-  const [bkError, setBkError] = useState("");
-  const [bkPage, setBkPage] = useState(1);
-  const [bkNextPage, setBkNextPage] = useState(null);
-  const bkAbortRef = useRef(null);
-
-  // calendar-day availability (dots) for Bookings pane month view
-  const [bkMonthAvailability, setBkMonthAvailability] = useState({}); // { 'YYYY-MM-DD': count }
-
-  const serverRole = useMemo(() => {
-    if (bkRole === "Provider") return "provider";
-    if (bkRole === "Client") return "client";
-    return "all";
-  }, [bkRole]);
-  const serverStatus = useMemo(() => (bkStatus === "All" ? "" : bkStatus), [bkStatus]);
-
-  const isPast = (startISO) => {
-    try {
-      return new Date(startISO).getTime() < Date.now();
-    } catch {
-      return false;
-    }
-  };
-
-  const filterBySegment = useCallback(
-    (list) => (bkSegment === "Upcoming" ? list.filter((b) => !isPast(b.start_at)) : list.filter((b) => isPast(b.start_at))),
-    [bkSegment]
-  );
-
-  // ✅ Use localDayFromISO so late-night bookings don't show up as next-day
-  const filterByDay = useCallback(
-    (list) => {
-      if (!bkDayISO) return list;
-      return list.filter((b) => localDayFromISO(b.start_at) === bkDayISO);
-    },
-    [bkDayISO]
-  );
-
-  const fetchBookings = useCallback(
-    async (p = 1, replace = false) => {
-      if (bkAbortRef.current) bkAbortRef.current.abort();
-      const ctrl = new AbortController();
-      bkAbortRef.current = ctrl;
-
-      const params = { role: serverRole, page: p, limit: 50 };
-      if (serverStatus) params.status = serverStatus;
-
-      try {
-        if (replace) setBkLoading(true);
-        setBkError("");
-        const res = await listBookings(params);
-        const base = Array.isArray(res?.results) ? res.results : Array.isArray(res) ? res : [];
-
-        let seg = filterBySegment(base);
-        let filtered = filterByDay(seg);
-
-        // ✅ Always sort by start_at ascending (All Dates / any filter)
-        filtered = [...filtered].sort((a, b) => {
-          const aT = new Date(a.start_at || a.start || "").getTime() || 0;
-          const bT = new Date(b.start_at || b.start || "").getTime() || 0;
-          return aT - bT;
-        });
-
-        const merged = replace ? filtered : [...bkItems, ...filtered];
-
-        // Ensure final list is sorted earliest → latest
-        merged.sort((a, b) => {
-          const aT = new Date(a.start_at || a.start || "").getTime() || 0;
-          const bT = new Date(b.start_at || b.start || "").getTime() || 0;
-          return aT - bT;
-        });
-
-        setBkItems(merged);
-        setBkNextPage(res?.next_page || null);
-        setBkPage(p);
-      } catch (e) {
-        if (e.name === "CanceledError" || e.name === "AbortError") return;
-        setBkError("Could not load bookings right now.");
-      } finally {
-        setBkLoading(false);
-        setBkRefreshing(false);
-      }
-    },
-    [serverRole, serverStatus, filterBySegment, filterByDay, bkItems]
-  );
-
-  // month availability loader for Bookings pane month calendar
-  const refreshMonthAvailability = useCallback(async (cursorDate) => {
-    const startISO = startOfMonthISO(cursorDate);
-    const endISO = endOfMonthISO(cursorDate);
-    try {
-      const params = {
-        role: "all",
-        from: `${startISO}T00:00:00`,
-        to: `${endISO}T23:59:59`,
-        limit: 500,
-        page: 1,
-      };
-      const res = await api.get("/bookings/", { params });
-      const list = Array.isArray(res?.results) ? res.results : Array.isArray(res) ? res : [];
-      const map = {};
-      for (const b of list) {
-        // ✅ Use localDayFromISO so dots appear on correct local day
-        const day = localDayFromISO(b?.start_at);
-        if (!day) continue;
-        map[day] = (map[day] || 0) + 1;
-      }
-      setBkMonthAvailability(map);
-    } catch {
-      setBkMonthAvailability({});
-    }
-  }, []);
-
-  // connect reload ref to latest fetchBookings
-  const fetchBookingsRef = useRef(fetchBookings);
-  useEffect(() => {
-    fetchBookingsRef.current = fetchBookings;
-  }, [fetchBookings]);
-  const fetchBookingsProxy = (...args) => fetchBookingsRef.current(...args);
-
-  // load when entering Bookings or filters change
-  const [monthCursor, setMonthCursor] = useState(() => {
-    const d = new Date();
-    d.setDate(1);
-    d.setHours(0, 0, 0, 0);
-    return d;
-  });
-  useEffect(() => {
-    if (tab === Tabs.Bookings) {
-      fetchBookingsProxy(1, true);
-      refreshMonthAvailability(monthCursor);
-    }
-    return () => {
-      if (bkAbortRef.current) bkAbortRef.current.abort();
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [tab, serverRole, serverStatus, bkSegment, bkDayISO, refreshMonthAvailability]);
-
-  const bkLoadMore = useCallback(async () => {
-    if (!bkNextPage || bkLoading) return;
-    await fetchBookingsProxy(bkPage + 1, false);
-  }, [bkNextPage, bkLoading, bkPage]);
-
-  // ----- PULL TO REFRESH (services + bookings + month dots) -----
+  // ----- PULL TO REFRESH (services only now) -----
   const onRefresh = useCallback(async () => {
     setRefreshing(true);
-    await Promise.all([
-      loadBrowse(),
-      loadMine(),
-      tab === Tabs.Bookings ? fetchBookingsProxy(1, true) : Promise.resolve(),
-      tab === Tabs.Bookings ? refreshMonthAvailability(monthCursor) : Promise.resolve(),
-    ]);
+    await Promise.all([loadBrowse(), loadMine()]);
     setRefreshing(false);
-  }, [loadBrowse, loadMine, tab, refreshMonthAvailability, monthCursor]);
-
-  const fmtTime = (iso) => {
-    try {
-      const d = new Date(iso);
-      return d.toLocaleString(undefined, {
-        month: "short",
-        day: "numeric",
-        hour: "numeric",
-        minute: "2-digit",
-        hour12: true,
-      });
-    } catch {
-      return iso;
-    }
-  };
-
-  const fmtTimeOnly = (iso) => {
-    try {
-      const d = new Date(iso);
-      return d.toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit", hour12: true });
-    } catch {
-      return iso;
-    }
-  };
-
-  const statusPillStyle = (status) => {
-    switch (status) {
-      case "pending":
-        return { borderColor: THEME.accentGold, color: THEME.accentGold };
-      case "confirmed":
-        return { borderColor: THEME.blue, color: THEME.blue };
-      case "completed":
-        return { borderColor: THEME.green, color: THEME.green };
-      case "cancelled":
-      case "rejected":
-        return { borderColor: THEME.red, color: THEME.red };
-      default:
-        return { borderColor: THEME.subtle, color: THEME.subtle };
-    }
-  };
-
-  const actionsFor = (booking) => {
-    const mineAsProvider = String(meId) === String(booking?.provider?.id);
-    const mineAsClient = String(meId) === String(booking?.client?.id);
-    const s = booking?.status;
-    const act = [];
-    if (s === "pending") {
-      if (mineAsProvider) act.push("Confirm", "Reject");
-      if (mineAsClient || mineAsProvider) act.push("Cancel");
-    } else if (s === "confirmed") {
-      if (mineAsProvider) act.push("Complete");
-      if (mineAsClient || mineAsProvider) act.push("Cancel");
-    }
-    return act;
-  };
-
-  const postAction = async (id, action) => {
-    const call = {
-      Confirm: () => confirmBooking(id),
-      Reject: () => rejectBooking(id),
-      Cancel: () => cancelBookingAction(id),
-      Complete: () => completeBooking(id),
-    }[action];
-
-    if (!call) return;
-    const previous = bkItems.slice();
-    try {
-      const next = bkItems.map((b) => {
-        if (b.id !== id) return b;
-        const now = new Date().toISOString();
-        if (action === "Confirm") return { ...b, status: "confirmed", updated_at: now };
-        if (action === "Reject") return { ...b, status: "rejected", updated_at: now };
-        if (action === "Cancel") return { ...b, status: "cancelled", updated_at: now, cancelled_at: now };
-        if (action === "Complete") return { ...b, status: "completed", updated_at: now, completed_at: now };
-        return b;
-      });
-      setBkItems(next);
-      await call();
-      refreshMonthAvailability(monthCursor);
-    } catch (e) {
-      setBkItems(previous);
-      Alert.alert("Action failed", "Please try again.");
-    }
-  };
-
-  const confirmBkAction = (b, action) => {
-    let msg = {
-      Confirm: "Confirm this booking?",
-      Reject: "Reject this booking request?",
-      Cancel: "Cancel this booking?",
-      Complete: "Mark this booking as completed?",
-    }[action];
-    Alert.alert(action, msg, [
-      { text: "No", style: "cancel" },
-      { text: "Yes", style: "destructive", onPress: () => postAction(b.id, action) },
-    ]);
-  };
-
-  // ---------- Booking Detail Modal ----------
-  const [detailOpen, setDetailOpen] = useState(false);
-  const [detailBk, setDetailBk] = useState(null);
-
-  const openDetail = (b) => {
-    setDetailBk(b);
-    setDetailOpen(true);
-  };
-  const closeDetail = () => {
-    setDetailOpen(false);
-    setDetailBk(null);
-  };
-
-  const BookingCard = ({ item }) => {
-    const sStyle = statusPillStyle(item.status);
-    const acts = actionsFor(item);
-    const mineAsProvider = String(meId) === String(item?.provider?.id);
-    const targetUser = mineAsProvider ? item?.client : item?.provider;
-    const targetName =
-      targetUser?.first_name || targetUser?.last_name
-        ? `${targetUser?.first_name || ""} ${targetUser?.last_name || ""}`.trim()
-        : targetUser?.email || "Neighbor";
-
-    const avatarUri = resolveAvatarUri(targetUser);
-    return (
-      <Pressable style={({ pressed }) => [styles.card, pressed && { opacity: 0.97 }]} onPress={() => openDetail(item)}>
-        <View style={styles.cardTopRow}>
-          <Text style={styles.cardTitle} numberOfLines={1}>
-            {item.service?.title || "Service"}
-          </Text>
-          <Text style={[styles.statusPill, { borderColor: sStyle.borderColor, color: sStyle.color }]}>
-            {item.status}
-          </Text>
-        </View>
-
-        <Pressable
-          style={styles.ownerRow}
-          onPress={() => openProviderProfile(targetUser?.id)}
-        >
-          <Image
-            source={avatarUri ? { uri: avatarUri, headers: imageHeaders } : avatarPlaceholder}
-            style={styles.avatarSm}
-            resizeMode="cover"
-          />
-          <Text style={styles.owner} numberOfLines={1}>
-            with <Text style={styles.ownerLink}>{targetName}</Text> •{" "}
-            <Text style={styles.categoryText}>{item.service?.category || "Other"}</Text>
-          </Text>
-        </Pressable>
-
-        <Text style={[styles.desc, { marginTop: 6 }]}>
-          {fmtTime(item.start_at)} → {fmtTimeOnly(item.end_at)}
-        </Text>
-
-        <View style={styles.cardFooter}>
-          <Text style={styles.price}>
-            {(item.price_snapshot ?? 0).toLocaleString(undefined, {
-              minimumFractionDigits: 2,
-              maximumFractionDigits: 2,
-            })}{" "}
-            ESC
-          </Text>
-          <View style={{ flexDirection: "row", gap: 8, flexWrap: "wrap" }}>
-            {acts.map((a) => (
-              <Pressable
-                key={a}
-                onPress={() => confirmBkAction(item, a)}
-                style={[
-                  styles.actionBtn,
-                  a === "Confirm" && styles.actionBtnPrimary,
-                  a === "Complete" && styles.actionBtnSuccess,
-                ]}
-              >
-                <Text style={styles.actionBtnText}>{a}</Text>
-              </Pressable>
-            ))}
-          </View>
-        </View>
-      </Pressable>
-    );
-  };
-
-  /* ---------- Date Helpers & Calendars ---------- */
-  const today = useMemo(() => {
-    const d = new Date();
-    d.setHours(0, 0, 0, 0);
-    return d;
-  }, []);
-
-  // ---- 3-week strip that recenters around an anchor date ----
-  const [stripAnchorDate, setStripAnchorDate] = useState(today);
-  const makeDaysStrip = useCallback(
-    (anchorDate) => {
-      // 21 days; center on anchor -> start 7 days before anchor
-      const start = new Date(anchorDate);
-      start.setDate(start.getDate() - 7);
-      start.setHours(0, 0, 0, 0);
-      const arr = [];
-      for (let i = 0; i < 21; i++) {
-        const d = new Date(start.getTime() + i * 86400000);
-        const dayIso = d.toISOString().slice(0, 10);
-        arr.push({
-          iso: dayIso,
-          labelTop: d.toLocaleString(undefined, { weekday: "short" }),
-          labelBottom: d.getDate(),
-          isToday: d.toDateString() === today.toDateString(),
-        });
-      }
-      return arr;
-    },
-    [today]
-  );
-
-  const [daysStrip, setDaysStrip] = useState(() => makeDaysStrip(today));
-
-  // update strip when selected day changes or when month changes
-  useEffect(() => {
-    if (bkDayISO) {
-      const d = new Date(bkDayISO + "T00:00:00");
-      setStripAnchorDate(d);
-    }
-  }, [bkDayISO]);
-
-  // Mini Month Grid base (shared logic)
-  const buildMonthInfo = useCallback(
-    (cursor) => {
-      const first = new Date(cursor);
-      const year = first.getFullYear();
-      const month = first.getMonth();
-      const startWeekday = new Date(year, month, 1).getDay(); // 0=Sun..6=Sat
-      const grid = [];
-      let dayNum = 1 - startWeekday;
-      for (let r = 0; r < 6; r++) {
-        const row = [];
-        for (let c = 0; c < 7; c++) {
-          const cellDate = new Date(year, month, dayNum);
-          const inMonth = cellDate.getMonth() === month;
-          const iso = cellDate.toISOString().slice(0, 10);
-          row.push({
-            iso,
-            inMonth,
-            isToday: cellDate.toDateString() === today.toDateString(),
-            label: cellDate.getDate(),
-          });
-          dayNum++;
-        }
-        grid.push(row);
-      }
-      const title = first.toLocaleString(undefined, { month: "long", year: "numeric" });
-      return { grid, title, year, month };
-    },
-    [today]
-  );
-
-  // Bookings filter month calendar
-  const monthInfo = useMemo(() => buildMonthInfo(monthCursor), [buildMonthInfo, monthCursor]);
-
-  const gotoPrevMonth = () => {
-    const d = new Date(monthCursor);
-    d.setMonth(d.getMonth() - 1);
-    setMonthCursor(d);
-  };
-  const gotoNextMonth = () => {
-    const d = new Date(monthCursor);
-    d.setMonth(d.getMonth() + 1);
-    setMonthCursor(d);
-  };
-
-  // re-center 3-week strip when month changes
-  useEffect(() => {
-    setStripAnchorDate(new Date(monthCursor));
-  }, [monthCursor]);
-
-  // rebuild strip whenever anchor changes
-  useEffect(() => {
-    setDaysStrip(makeDaysStrip(stripAnchorDate));
-  }, [stripAnchorDate, makeDaysStrip]);
-
-  // also refresh month availability when month changes (Bookings tab only)
-  useEffect(() => {
-    if (tab === Tabs.Bookings) refreshMonthAvailability(monthCursor);
-  }, [monthCursor, tab, refreshMonthAvailability]);
-
-  const CalendarStrip = () => (
-    <ScrollView horizontal showsHorizontalScrollIndicator={false} style={{ marginTop: 10 }} keyboardShouldPersistTaps="handled">
-      <View style={{ flexDirection: "row", gap: 8 }}>
-        <Pressable onPress={() => setBkDayISO("")} style={[styles.dayChip, bkDayISO === "" && styles.dayChipActive]}>
-          <Text style={[styles.dayChipTop, bkDayISO === "" && styles.dayChipTextActive]}>All</Text>
-          <Text style={[styles.dayChipBottom, bkDayISO === "" && styles.dayChipTextActive]}>Dates</Text>
-        </Pressable>
-        {daysStrip.map((d) => {
-          const active = bkDayISO === d.iso;
-          return (
-            <Pressable key={d.iso} onPress={() => setBkDayISO(d.iso)} style={[styles.dayChip, active && styles.dayChipActive]}>
-              <Text style={[styles.dayChipTop, active && styles.dayChipTextActive]}>
-                {d.isToday ? "Today" : d.labelTop}
-              </Text>
-              <Text style={[styles.dayChipBottom, active && styles.dayChipTextActive]}>{d.labelBottom}</Text>
-            </Pressable>
-          );
-        })}
-      </View>
-    </ScrollView>
-  );
-
-  const MonthCalendar = () => (
-    <View style={styles.monthWrap}>
-      <View style={styles.monthHeader}>
-        <Pressable onPress={gotoPrevMonth} style={styles.monthNavBtn}>
-          <Text style={styles.monthNavText}>‹</Text>
-        </Pressable>
-        <Text style={styles.monthTitle}>{monthInfo.title}</Text>
-        <Pressable onPress={gotoNextMonth} style={styles.monthNavBtn}>
-          <Text style={styles.monthNavText}>›</Text>
-        </Pressable>
-      </View>
-
-      <View style={styles.weekHeaderRow}>
-        {["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"].map((w) => (
-          <Text key={w} style={styles.weekHeaderText}>
-            {w}
-          </Text>
-        ))}
-      </View>
-
-      {monthInfo.grid.map((row, idx) => (
-        <View key={idx} style={styles.weekRow}>
-          {row.map((cell) => {
-            const active = bkDayISO === cell.iso;
-            const hasBookings = bkMonthAvailability[cell.iso] > 0;
-            return (
-              <Pressable
-                key={cell.iso}
-                onPress={() => setBkDayISO(cell.iso)}
-                style={[
-                  styles.dayCell,
-                  !cell.inMonth && { opacity: 0.4 },
-                  active && styles.dayCellActive,
-                  cell.isToday && !active && styles.dayCellToday,
-                ]}
-              >
-                <Text
-                  style={[
-                    styles.dayCellText,
-                    active && styles.dayCellTextActive,
-                    cell.isToday && !active && styles.dayCellTextToday,
-                  ]}
-                >
-                  {cell.label}
-                </Text>
-                {hasBookings ? <View style={styles.dot} /> : null}
-              </Pressable>
-            );
-          })}
-        </View>
-      ))}
-    </View>
-  );
-
-  const BookingsPane = () => (
-    <>
-      {/* Filters */}
-      <View style={styles.segmentBar}>
-        {Segments.map((s) => {
-          const active = s === bkSegment;
-          return (
-            <Pressable key={s} onPress={() => setBkSegment(s)} style={[styles.segmentChip, active && styles.segmentChipActive]}>
-              <Text style={[styles.segmentChipText, active && styles.segmentChipTextActive]}>{s}</Text>
-            </Pressable>
-          );
-        })}
-      </View>
-
-      <View style={styles.roleBar}>
-        {Roles.map((r) => {
-          const active = r === bkRole;
-          return (
-            <Pressable key={r} onPress={() => setBkRole(r)} style={[styles.roleChip, active && styles.roleChipActive]}>
-              <Text style={[styles.roleChipText, active && styles.roleChipTextActive]}>{r}</Text>
-            </Pressable>
-          );
-        })}
-      </View>
-
-      <View style={styles.statusRow}>
-        {StatusChips.map((s) => {
-          const active = s === bkStatus;
-          return (
-            <Pressable key={s} onPress={() => setBkStatus(s)} style={[styles.statusChip, active && styles.statusChipActive]}>
-              <Text style={[styles.statusChipText, active && styles.statusChipTextActive]}>{s}</Text>
-            </Pressable>
-          );
-        })}
-      </View>
-
-      {/* Month Calendar (with availability dots) */}
-      <MonthCalendar />
-
-      {/* Quick calendar strip (re-centered) */}
-      <CalendarStrip />
-
-      {bkError ? <Text style={styles.errorText}>{bkError}</Text> : null}
-
-      {/* List */}
-      <FlatList
-        data={bkItems}
-        keyExtractor={(b) => String(b.id)}
-        renderItem={({ item }) => <BookingCard item={item} />}
-        contentContainerStyle={{ paddingBottom: 28 }}
-        onEndReachedThreshold={0.4}
-        onEndReached={bkLoadMore}
-        ListEmptyComponent={
-          !bkLoading ? (
-            <View style={styles.emptyWrap}>
-              <Text style={styles.emptyTitle}>No bookings</Text>
-              <Text style={styles.emptyText}>
-                {bkSegment === "Upcoming" ? "You have no upcoming bookings." : "You have no past bookings."}
-              </Text>
-            </View>
-          ) : null
-        }
-        ListFooterComponent={
-          bkNextPage ? (
-            <View style={{ paddingVertical: 16 }}>
-              <ActivityIndicator color={THEME.accentGold} />
-            </View>
-          ) : (
-            <View style={{ height: 10 }} />
-          )
-        }
-        refreshControl={
-          <RefreshControl
-            refreshing={bkRefreshing}
-            onRefresh={() => {
-              setBkRefreshing(true);
-              fetchBookingsProxy(1, true);
-              refreshMonthAvailability(monthCursor);
-            }}
-            tintColor={THEME.accentGold}
-          />
-        }
-        keyboardShouldPersistTaps="handled"
-      />
-
-      {bkLoading && bkItems.length === 0 ? (
-        <View style={styles.loadingOverlay}>
-          <ActivityIndicator size="large" color={THEME.accentGold} />
-        </View>
-      ) : null}
-    </>
-  );
+  }, [loadBrowse, loadMine]);
 
   /* =================== BOOK MODAL (create a booking) =================== */
   const [bookOpen, setBookOpen] = useState(false);
@@ -911,7 +315,11 @@ const ServicesScreen = ({ navigation, route }) => {
       page: 1,
     };
     const res = await api.get("/bookings/", { params });
-    return Array.isArray(res?.results) ? res.results : Array.isArray(res) ? res : [];
+    return Array.isArray(res?.results)
+      ? res.results
+      : Array.isArray(res)
+      ? res
+      : [];
   }, []);
 
   const openBook = (svc) => {
@@ -921,7 +329,10 @@ const ServicesScreen = ({ navigation, route }) => {
       return;
     }
     const now = new Date();
-    const roundUp = new Date(Math.ceil((now.getTime() + 5 * 60 * 1000) / (30 * 60 * 1000)) * (30 * 60 * 1000));
+    const roundUp = new Date(
+      Math.ceil((now.getTime() + 5 * 60 * 1000) / (30 * 60 * 1000)) *
+        (30 * 60 * 1000)
+    );
     const iso = isoDay(roundUp);
     const hh = String(roundUp.getHours()).padStart(2, "0");
     const mm = String(roundUp.getMinutes()).padStart(2, "0");
@@ -954,7 +365,8 @@ const ServicesScreen = ({ navigation, route }) => {
     if (!bookSvc?.id) return "No service selected.";
     if (!bookDay) return "Choose a day.";
     if (!bookTime) return "Choose a start time.";
-    if (!Number.isFinite(bookDuration) || bookDuration <= 0) return "Duration must be positive.";
+    if (!Number.isFinite(bookDuration) || bookDuration <= 0)
+      return "Duration must be positive.";
     return null;
   };
 
@@ -965,17 +377,28 @@ const ServicesScreen = ({ navigation, route }) => {
       return;
     }
     const startISO = makeISO(bookDay, bookTime);
-    const endISO = new Date(new Date(startISO).getTime() + bookDuration * 60 * 1000).toISOString();
+    const endISO = new Date(
+      new Date(startISO).getTime() + bookDuration * 60 * 1000
+    ).toISOString();
 
     try {
       setBookSaving(true);
       setBookErr("");
 
-      const provider = bookSvc?.user || bookSvc?.owner || bookSvc?.provider || bookSvc?.poster;
+      const provider =
+        bookSvc?.user ||
+        bookSvc?.owner ||
+        bookSvc?.provider ||
+        bookSvc?.poster;
       const providerId = provider?.id;
       if (providerId) {
-        const dayBookings = await fetchProviderBookingsForDay(providerId, bookDay);
-        const overlapping = dayBookings.find((b) => hasOverlap(startISO, endISO, b.start_at, b.end_at));
+        const dayBookings = await fetchProviderBookingsForDay(
+          providerId,
+          bookDay
+        );
+        const overlapping = dayBookings.find((b) =>
+          hasOverlap(startISO, endISO, b.start_at, b.end_at)
+        );
         if (overlapping) {
           setBookErr("This provider is already booked during that time.");
           setBookSaving(false);
@@ -990,9 +413,9 @@ const ServicesScreen = ({ navigation, route }) => {
       });
 
       setBookOpen(false);
-      setTab(Tabs.Bookings);
-      await fetchBookingsProxy(1, true);
-      refreshMonthAvailability(monthCursor);
+
+      // optional: jump to the dedicated Bookings screen
+      navigation?.navigate?.("Bookings");
 
       Alert.alert("Requested", "Your booking request was sent to the provider.");
     } catch (e) {
@@ -1010,11 +433,14 @@ const ServicesScreen = ({ navigation, route }) => {
       for (let m of [0, 30]) {
         const hh = String(h).padStart(2, "0");
         const mm = String(m).padStart(2, "0");
-        const label = new Date(1970, 0, 1, h, m, 0).toLocaleTimeString(undefined, {
-          hour: "numeric",
-          minute: "2-digit",
-          hour12: true,
-        });
+        const label = new Date(1970, 0, 1, h, m, 0).toLocaleTimeString(
+          undefined,
+          {
+            hour: "numeric",
+            minute: "2-digit",
+            hour12: true,
+          }
+        );
         slots.push({ value: `${hh}:${mm}`, label });
       }
     }
@@ -1030,7 +456,8 @@ const ServicesScreen = ({ navigation, route }) => {
         Alert.alert("Messaging not available", "User information is missing.");
         return;
       }
-      const toUserEmail = typeof toUser === "string" ? toUser : (toUser?.email || "");
+      const toUserEmail =
+        typeof toUser === "string" ? toUser : toUser?.email || "";
       const userId = typeof toUser === "object" ? toUser?.id : undefined;
 
       const params = {
@@ -1068,7 +495,7 @@ const ServicesScreen = ({ navigation, route }) => {
   const openProviderProfile = useCallback(
     (userId) => {
       if (!userId) return;
-      // ✅ If it's you, go straight to your Profile tab
+      // If it's you, go straight to your Profile tab
       try {
         if (meId && String(userId) === String(meId)) {
           navigation?.navigate?.("Profile");
@@ -1086,10 +513,16 @@ const ServicesScreen = ({ navigation, route }) => {
         return;
       } catch {}
       try {
-        navigation?.navigate?.("Profile", { screen: "UserProfile", params: { userId } });
+        navigation?.navigate?.("Profile", {
+          screen: "UserProfile",
+          params: { userId },
+        });
         return;
       } catch {}
-      Alert.alert("Profile", "Couldn’t open the user’s profile. Add a 'UserProfile' route to your navigator.");
+      Alert.alert(
+        "Profile",
+        "Couldn’t open the user’s profile. Add a 'UserProfile' route to your navigator."
+      );
     },
     [navigation, meId]
   );
@@ -1103,24 +536,47 @@ const ServicesScreen = ({ navigation, route }) => {
 
   const TabBar = () => (
     <View style={styles.tabBar}>
-      {[Tabs.Browse, Tabs.Mine, Tabs.Bookings].map((t) => {
+      {[Tabs.Browse, Tabs.Mine].map((t) => {
         const active = tab === t;
         return (
           <Pressable
             key={t}
             onPress={() => setTab(t)}
-            style={({ pressed }) => [styles.tab, active && styles.tabActive, pressed && { opacity: 0.9 }]}
+            style={({ pressed }) => [
+              styles.tab,
+              active && styles.tabActive,
+              pressed && { opacity: 0.9 },
+            ]}
           >
-            <Text style={[styles.tabText, active && styles.tabTextActive]}>{t}</Text>
+            <Text style={[styles.tabText, active && styles.tabTextActive]}>
+              {t}
+            </Text>
           </Pressable>
         );
       })}
+
       <View style={{ flex: 1 }} />
-      {tab !== Tabs.Bookings && (
-        <Pressable onPress={() => setCreateOpen(true)} style={({ pressed }) => [styles.createBtn, pressed && { transform: [{ scale: 0.98 }] }]}>
-          <Text style={styles.createBtnText}>+ New</Text>
-        </Pressable>
-      )}
+
+      {/* Link to dedicated Bookings screen */}
+      <Pressable
+        onPress={() => navigation?.navigate?.("Bookings")}
+        style={({ pressed }) => [
+          styles.bookingsLinkBtn,
+          pressed && { opacity: 0.9 },
+        ]}
+      >
+        <Text style={styles.bookingsLinkText}>Bookings</Text>
+      </Pressable>
+
+      <Pressable
+        onPress={() => openCreate()}
+        style={({ pressed }) => [
+          styles.createBtn,
+          pressed && { transform: [{ scale: 0.98 }] },
+        ]}
+      >
+        <Text style={styles.createBtnText}>+ New</Text>
+      </Pressable>
     </View>
   );
 
@@ -1149,9 +605,17 @@ const ServicesScreen = ({ navigation, route }) => {
             <Pressable
               key={c}
               onPress={() => onSelectCategory(c)}
-              style={({ pressed }) => [styles.chip, active && styles.chipActive, pressed && { opacity: 0.85 }]}
+              style={({ pressed }) => [
+                styles.chip,
+                active && styles.chipActive,
+                pressed && { opacity: 0.85 },
+              ]}
             >
-              <Text style={[styles.chipText, active && styles.chipTextActive]}>{c}</Text>
+              <Text
+                style={[styles.chipText, active && styles.chipTextActive]}
+              >
+                {c}
+              </Text>
             </Pressable>
           );
         })}
@@ -1160,9 +624,15 @@ const ServicesScreen = ({ navigation, route }) => {
 
   const EmptyState = ({ kind }) => (
     <View style={styles.emptyWrap}>
-      <Text style={styles.emptyTitle}>{kind === "mine" ? "You haven’t posted a service yet" : "No services found"}</Text>
+      <Text style={styles.emptyTitle}>
+        {kind === "mine"
+          ? "You haven’t posted a service yet"
+          : "No services found"}
+      </Text>
       <Text style={styles.emptyText}>
-        {kind === "mine" ? "Tap “+ New” to publish your first service." : "Try a different keyword or switch categories."}
+        {kind === "mine"
+          ? "Tap “+ New” to publish your first service."
+          : "Try a different keyword or switch categories."}
       </Text>
     </View>
   );
@@ -1171,7 +641,9 @@ const ServicesScreen = ({ navigation, route }) => {
     <View style={styles.card}>
       <View style={[styles.skeleton, { width: "62%" }]} />
       <View style={[styles.skeleton, { width: "88%", marginTop: 8 }]} />
-      <View style={[styles.skeleton, { width: "45%", height: 14, marginTop: 10 }]} />
+      <View
+        style={[styles.skeleton, { width: "45%", height: 14, marginTop: 10 }]}
+      />
     </View>
   );
 
@@ -1194,7 +666,10 @@ const ServicesScreen = ({ navigation, route }) => {
 
     const priceNum = Number(item.price);
     const priceLabel = Number.isFinite(priceNum)
-      ? priceNum.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })
+      ? priceNum.toLocaleString(undefined, {
+          minimumFractionDigits: 2,
+          maximumFractionDigits: 2,
+        })
       : "—";
 
     const isMineTab = tab === Tabs.Mine;
@@ -1221,9 +696,16 @@ const ServicesScreen = ({ navigation, route }) => {
           </View>
         </View>
 
-        <Pressable style={styles.ownerRow} onPress={() => openProviderProfile(owner?.id)}>
+        <Pressable
+          style={styles.ownerRow}
+          onPress={() => openProviderProfile(owner?.id)}
+        >
           <Image
-            source={avatarUri ? { uri: avatarUri, headers: imageHeaders } : avatarPlaceholder}
+            source={
+              avatarUri
+                ? { uri: avatarUri, headers: imageHeaders }
+                : avatarPlaceholder
+            }
             style={styles.avatarSm}
             resizeMode="cover"
           />
@@ -1241,13 +723,19 @@ const ServicesScreen = ({ navigation, route }) => {
           {!isMineTab && !amOwner && (
             <>
               <Pressable
-                style={({ pressed }) => [styles.secondaryBtn, pressed && { opacity: 0.9 }]}
+                style={({ pressed }) => [
+                  styles.secondaryBtn,
+                  pressed && { opacity: 0.9 },
+                ]}
                 onPress={() => navigateToChat(owner)}
               >
                 <Text style={styles.secondaryBtnText}>Message</Text>
               </Pressable>
               <Pressable
-                style={({ pressed }) => [styles.bookBtn, pressed && { transform: [{ scale: 0.98 }] }]}
+                style={({ pressed }) => [
+                  styles.bookBtn,
+                  pressed && { transform: [{ scale: 0.98 }] },
+                ]}
                 onPress={() => openBook(item)}
               >
                 <Text style={styles.bookBtnText}>Book</Text>
@@ -1258,13 +746,19 @@ const ServicesScreen = ({ navigation, route }) => {
           {isMineTab && (
             <>
               <Pressable
-                style={({ pressed }) => [styles.primaryBtn, pressed && { transform: [{ scale: 0.98 }] }]}
+                style={({ pressed }) => [
+                  styles.primaryBtn,
+                  pressed && { transform: [{ scale: 0.98 }] },
+                ]}
                 onPress={() => openEdit(item)}
               >
                 <Text style={styles.primaryBtnText}>Edit</Text>
               </Pressable>
               <Pressable
-                style={({ pressed }) => [styles.secondaryBtn, pressed && { opacity: 0.9 }]}
+                style={({ pressed }) => [
+                  styles.secondaryBtn,
+                  pressed && { opacity: 0.9 },
+                ]}
                 onPress={() => confirmDelete(item)}
               >
                 <Text style={styles.secondaryBtnText}>Delete</Text>
@@ -1281,14 +775,48 @@ const ServicesScreen = ({ navigation, route }) => {
 
   const skeletonTop = useMemo(() => insets.top + 160, [insets.top]);
 
-  /* ===== Booking Month Picker (for modal; separate state from filters) ===== */
+  /* ===== Booking Month Picker (for modal) ===== */
   const [bookMonthCursor, setBookMonthCursor] = useState(() => {
     const d = new Date();
     d.setDate(1);
     d.setHours(0, 0, 0, 0);
     return d;
   });
-  const bookMonthInfo = useMemo(() => buildMonthInfo(bookMonthCursor), [buildMonthInfo, bookMonthCursor]);
+
+  const buildMonthInfo = useCallback((cursor) => {
+    const first = new Date(cursor);
+    const year = first.getFullYear();
+    const month = first.getMonth();
+    const startWeekday = new Date(year, month, 1).getDay(); // 0=Sun..6=Sat
+    const grid = [];
+    let dayNum = 1 - startWeekday;
+    for (let r = 0; r < 6; r++) {
+      const row = [];
+      for (let c = 0; c < 7; c++) {
+        const cellDate = new Date(year, month, dayNum);
+        const inMonth = cellDate.getMonth() === month;
+        const iso = cellDate.toISOString().slice(0, 10);
+        row.push({
+          iso,
+          inMonth,
+          isToday: cellDate.toDateString() === new Date().toDateString(),
+          label: cellDate.getDate(),
+        });
+        dayNum++;
+      }
+      grid.push(row);
+    }
+    const title = first.toLocaleString(undefined, {
+      month: "long",
+      year: "numeric",
+    });
+    return { grid, title, year, month };
+  }, []);
+
+  const bookMonthInfo = useMemo(
+    () => buildMonthInfo(bookMonthCursor),
+    [buildMonthInfo, bookMonthCursor]
+  );
   const bookPrevMonth = () => {
     const d = new Date(bookMonthCursor);
     d.setMonth(d.getMonth() - 1);
@@ -1338,7 +866,9 @@ const ServicesScreen = ({ navigation, route }) => {
                   style={[
                     styles.dayCellText,
                     active && styles.dayCellTextActive,
-                    cell.isToday && !active && styles.dayCellTextToday,
+                    cell.isToday &&
+                      !active &&
+                      styles.dayCellTextToday,
                   ]}
                 >
                   {cell.label}
@@ -1369,7 +899,8 @@ const ServicesScreen = ({ navigation, route }) => {
     if (!cTitle.trim()) return "Please add a title.";
     if (!cDesc.trim()) return "Please add a short description.";
     const price = Number(cPrice);
-    if (!Number.isFinite(price) || price < 0) return "Enter a valid non-negative price.";
+    if (!Number.isFinite(price) || price < 0)
+      return "Enter a valid non-negative price.";
     if (!cCategory || cCategory === "All") return "Select a category.";
     return null;
   };
@@ -1399,7 +930,9 @@ const ServicesScreen = ({ navigation, route }) => {
       };
       setMine((cur) => [normalized, ...cur]);
 
-      const matchesCat = category === "All" || cCategory.toLowerCase() === category.toLowerCase();
+      const matchesCat =
+        category === "All" ||
+        cCategory.toLowerCase() === category.toLowerCase();
       const qLower = query.trim().toLowerCase();
       const matchesQuery =
         !qLower ||
@@ -1433,7 +966,8 @@ const ServicesScreen = ({ navigation, route }) => {
     if (!eTitle.trim()) return "Please add a title.";
     if (!eDesc.trim()) return "Please add a short description.";
     const price = Number(ePrice);
-    if (!Number.isFinite(price) || price < 0) return "Enter a valid non-negative price.";
+    if (!Number.isFinite(price) || price < 0)
+      return "Enter a valid non-negative price.";
     if (!eCategory || eCategory === "All") return "Select a category.";
     return null;
   };
@@ -1471,8 +1005,16 @@ const ServicesScreen = ({ navigation, route }) => {
         user: updated?.user || updated?.owner || null,
       };
 
-      setMine((cur) => cur.map((s) => (String(s.id) === String(editId) ? { ...s, ...normalized } : s)));
-      setBrowse((cur) => cur.map((s) => (String(s.id) === String(editId) ? { ...s, ...normalized } : s)));
+      setMine((cur) =>
+        cur.map((s) =>
+          String(s.id) === String(editId) ? { ...s, ...normalized } : s
+        )
+      );
+      setBrowse((cur) =>
+        cur.map((s) =>
+          String(s.id) === String(editId) ? { ...s, ...normalized } : s
+        )
+      );
 
       setEditOpen(false);
     } catch (e) {
@@ -1499,15 +1041,55 @@ const ServicesScreen = ({ navigation, route }) => {
     } catch {}
   };
 
+  const fmtTime = (iso) => {
+    try {
+      const d = new Date(iso);
+      return d.toLocaleString(undefined, {
+        month: "short",
+        day: "numeric",
+        hour: "numeric",
+        minute: "2-digit",
+        hour12: true,
+      });
+    } catch {
+      return iso;
+    }
+  };
+
+  const fmtTimeOnly = (iso) => {
+    try {
+      const d = new Date(iso);
+      return d.toLocaleTimeString(undefined, {
+        hour: "numeric",
+        minute: "2-digit",
+        hour12: true,
+      });
+    } catch {
+      return iso;
+    }
+  };
+
   return (
     <SafeAreaView style={styles.safe}>
       {/* Accents */}
-      <Animated.View style={[styles.accent, styles.accentTop, { transform: [{ translateY: floatY }] }]} />
-      <Animated.View style={[styles.accent, styles.accentBottom, { transform: [{ translateY: floatY }] }]} />
+      <Animated.View
+        style={[
+          styles.accent,
+          styles.accentTop,
+          { transform: [{ translateY: floatY }] },
+        ]}
+      />
+      <Animated.View
+        style={[
+          styles.accent,
+          styles.accentBottom,
+          { transform: [{ translateY: floatY }] },
+        ]}
+      />
 
-      {/* HEAD + TABS */}
+      {/* HEAD + TABS + SERVICES LIST */}
       <FlatList
-        data={tab === Tabs.Bookings ? [] : data}
+        data={data}
         keyExtractor={(item) => String(item.id)}
         renderItem={({ item }) => <ServiceCard item={item} />}
         ListHeaderComponent={
@@ -1517,26 +1099,30 @@ const ServicesScreen = ({ navigation, route }) => {
               <TabBar />
             </View>
 
-            {tab === Tabs.Bookings ? (
-              <BookingsPane />
-            ) : (
-              <>
-                <SearchBar />
-                <CategoryChips />
-                {error && tab === Tabs.Browse ? <Text style={styles.errorText}>{error}</Text> : null}
-              </>
-            )}
+            <SearchBar />
+            <CategoryChips />
+            {error && tab === Tabs.Browse ? (
+              <Text style={styles.errorText}>{error}</Text>
+            ) : null}
           </>
         }
         ListEmptyComponent={
-          tab !== Tabs.Bookings && !isLoadingList ? <EmptyState kind={tab === Tabs.Mine ? "mine" : "browse"} /> : null
+          !isLoadingList ? (
+            <EmptyState kind={tab === Tabs.Mine ? "mine" : "browse"} />
+          ) : null
         }
         contentContainerStyle={[styles.listContent, { paddingTop: 8 }]}
-        refreshControl={<RefreshControl refreshing={refreshing} onRefresh={onRefresh} tintColor={THEME.accentGold} />}
+        refreshControl={
+          <RefreshControl
+            refreshing={refreshing}
+            onRefresh={onRefresh}
+            tintColor={THEME.accentGold}
+          />
+        }
         keyboardShouldPersistTaps="handled"
       />
 
-      {tab !== Tabs.Bookings && isLoadingList && (
+      {isLoadingList && (
         <View style={[styles.skeletonWrap, { top: skeletonTop }]}>
           <Skeleton />
           <Skeleton />
@@ -1592,19 +1178,35 @@ const ServicesScreen = ({ navigation, route }) => {
                 <View style={[styles.inputWrap, { flex: 1, marginLeft: 8 }]}>
                   <View style={styles.catHeaderRow}>
                     <Text style={styles.inputLabel}>Category</Text>
-                    <Pressable onPress={() => setCatGridOpen(true)} style={styles.viewAllBtn}>
+                    <Pressable
+                      onPress={() => setCatGridOpen(true)}
+                      style={styles.viewAllBtn}
+                    >
                       <Text style={styles.viewAllText}>All categories</Text>
                     </Pressable>
                   </View>
 
                   <View style={styles.catScrollerBox}>
                     {catCanLeft && (
-                      <Pressable onPress={() => catScrollRef.current?.scrollTo({ x: 0, animated: true })} style={[styles.chev, styles.chevLeft]}>
+                      <Pressable
+                        onPress={() =>
+                          catScrollRef.current?.scrollTo({
+                            x: 0,
+                            animated: true,
+                          })
+                        }
+                        style={[styles.chev, styles.chevLeft]}
+                      >
                         <Text style={styles.chevText}>‹</Text>
                       </Pressable>
                     )}
                     {catCanRight && (
-                      <Pressable onPress={() => catScrollRef.current?.scrollToEnd({ animated: true })} style={[styles.chev, styles.chevRight]}>
+                      <Pressable
+                        onPress={() =>
+                          catScrollRef.current?.scrollToEnd({ animated: true })
+                        }
+                        style={[styles.chev, styles.chevRight]}
+                      >
                         <Text style={styles.chevText}>›</Text>
                       </Pressable>
                     )}
@@ -1637,9 +1239,20 @@ const ServicesScreen = ({ navigation, route }) => {
                               <Pressable
                                 key={c}
                                 onPress={() => setCCategory(c)}
-                                style={({ pressed }) => [styles.chipSmall, active && styles.chipActive, pressed && { opacity: 0.9 }]}
+                                style={({ pressed }) => [
+                                  styles.chipSmall,
+                                  active && styles.chipActive,
+                                  pressed && { opacity: 0.9 },
+                                ]}
                               >
-                                <Text style={[styles.chipSmallText, active && styles.chipTextActive]}>{c}</Text>
+                                <Text
+                                  style={[
+                                    styles.chipSmallText,
+                                    active && styles.chipTextActive,
+                                  ]}
+                                >
+                                  {c}
+                                </Text>
                               </Pressable>
                             );
                           })}
@@ -1647,32 +1260,51 @@ const ServicesScreen = ({ navigation, route }) => {
                     </ScrollView>
                   </View>
 
-                  {!catHintSeen && <Text style={styles.catHint}>Swipe to see more →</Text>}
+                  {!catHintSeen && (
+                    <Text style={styles.catHint}>Swipe to see more →</Text>
+                  )}
                 </View>
               </View>
 
-              {createError ? <Text style={styles.errorText}>{createError}</Text> : null}
+              {createError ? (
+                <Text style={styles.errorText}>{createError}</Text>
+              ) : null}
 
               <View style={[styles.row, { marginTop: 14 }]}>
                 <Pressable
                   onPress={closeCreate}
-                  style={({ pressed }) => [styles.secondaryBtnWide, pressed && { opacity: 0.9 }]}
+                  style={({ pressed }) => [
+                    styles.secondaryBtnWide,
+                    pressed && { opacity: 0.9 },
+                  ]}
                   disabled={creating}
                 >
                   <Text style={styles.secondaryBtnText}>Cancel</Text>
                 </Pressable>
                 <Pressable
                   onPress={handleCreate}
-                  style={({ pressed }) => [styles.primaryBtnWide, pressed && { transform: [{ scale: 0.98 }] }]}
+                  style={({ pressed }) => [
+                    styles.primaryBtnWide,
+                    pressed && { transform: [{ scale: 0.98 }] },
+                  ]}
                   disabled={creating}
                 >
-                  {creating ? <ActivityIndicator color="#fff" /> : <Text style={styles.primaryBtnText}>Publish</Text>}
+                  {creating ? (
+                    <ActivityIndicator color="#fff" />
+                  ) : (
+                    <Text style={styles.primaryBtnText}>Publish</Text>
+                  )}
                 </Pressable>
               </View>
             </ScrollView>
           </View>
 
-          <Modal visible={catGridOpen} transparent animationType="fade" onRequestClose={() => setCatGridOpen(false)}>
+          <Modal
+            visible={catGridOpen}
+            transparent
+            animationType="fade"
+            onRequestClose={() => setCatGridOpen(false)}
+          >
             <View style={styles.modalBackdrop}>
               <View style={styles.gridCard}>
                 <Text style={styles.gridTitle}>Select a category</Text>
@@ -1688,14 +1320,27 @@ const ServicesScreen = ({ navigation, route }) => {
                             setCCategory(c);
                             setCatGridOpen(false);
                           }}
-                          style={[styles.gridItem, active && styles.gridItemActive]}
+                          style={[
+                            styles.gridItem,
+                            active && styles.gridItemActive,
+                          ]}
                         >
-                          <Text style={[styles.gridItemText, active && styles.gridItemTextActive]}>{c}</Text>
+                          <Text
+                            style={[
+                              styles.gridItemText,
+                              active && styles.gridItemTextActive,
+                            ]}
+                          >
+                            {c}
+                          </Text>
                         </Pressable>
                       );
                     })}
                 </View>
-                <Pressable onPress={() => setCatGridOpen(false)} style={styles.gridCloseBtn}>
+                <Pressable
+                  onPress={() => setCatGridOpen(false)}
+                  style={styles.gridCloseBtn}
+                >
                   <Text style={styles.gridCloseText}>Close</Text>
                 </Pressable>
               </View>
@@ -1757,8 +1402,19 @@ const ServicesScreen = ({ navigation, route }) => {
                       .map((c) => {
                         const active = c === eCategory;
                         return (
-                          <Pressable key={c} onPress={() => setECategory(c)} style={[styles.chipSmall, active && styles.chipActive]}>
-                            <Text style={[styles.chipSmallText, active && styles.chipTextActive]}>{c}</Text>
+                          <Pressable
+                            key={c}
+                            onPress={() => setECategory(c)}
+                            style={[styles.chipSmall, active && styles.chipActive]}
+                          >
+                            <Text
+                              style={[
+                                styles.chipSmallText,
+                                active && styles.chipTextActive,
+                              ]}
+                            >
+                              {c}
+                            </Text>
                           </Pressable>
                         );
                       })}
@@ -1766,22 +1422,34 @@ const ServicesScreen = ({ navigation, route }) => {
                 </View>
               </View>
 
-              {editError ? <Text style={styles.errorText}>{editError}</Text> : null}
+              {editError ? (
+                <Text style={styles.errorText}>{editError}</Text>
+              ) : null}
 
               <View style={[styles.row, { marginTop: 14 }]}>
                 <Pressable
                   onPress={closeEdit}
-                  style={({ pressed }) => [styles.secondaryBtnWide, pressed && { opacity: 0.9 }]}
+                  style={({ pressed }) => [
+                    styles.secondaryBtnWide,
+                    pressed && { opacity: 0.9 },
+                  ]}
                   disabled={savingEdit}
                 >
                   <Text style={styles.secondaryBtnText}>Cancel</Text>
                 </Pressable>
                 <Pressable
                   onPress={handleSaveEdit}
-                  style={({ pressed }) => [styles.primaryBtnWide, pressed && { transform: [{ scale: 0.98 }] }]}
+                  style={({ pressed }) => [
+                    styles.primaryBtnWide,
+                    pressed && { transform: [{ scale: 0.98 }] },
+                  ]}
                   disabled={savingEdit}
                 >
-                  {savingEdit ? <ActivityIndicator color="#fff" /> : <Text style={styles.primaryBtnText}>Save Changes</Text>}
+                  {savingEdit ? (
+                    <ActivityIndicator color="#fff" />
+                  ) : (
+                    <Text style={styles.primaryBtnText}>Save Changes</Text>
+                  )}
                 </Pressable>
               </View>
             </ScrollView>
@@ -1790,90 +1458,125 @@ const ServicesScreen = ({ navigation, route }) => {
       </Modal>
 
       {/* Service Detail Modal */}
-      <Modal visible={svcDetailOpen} transparent animationType="fade" onRequestClose={closeServiceDetail}>
+      <Modal
+        visible={svcDetailOpen}
+        transparent
+        animationType="fade"
+        onRequestClose={closeServiceDetail}
+      >
         <KeyboardAvoidingView
           behavior={Platform.select({ ios: "padding", android: undefined })}
           style={styles.modalBackdrop}
         >
           <View style={styles.modalCard}>
-            <Text style={styles.modalTitle}>{svcDetailItem?.title || "Service"}</Text>
-            {svcDetailItem ? (() => {
-              const owner = svcDetailItem?.user || svcDetailItem?.owner || svcDetailItem?.provider || svcDetailItem?.poster;
-              const ownerAvatar = resolveAvatarUri(owner);
-              const ownerName =
-                owner?.first_name || owner?.last_name
-                  ? `${owner?.first_name || ""} ${owner?.last_name || ""}`.trim()
-                  : owner?.email || owner?.name || "Neighbor";
-              const isOwner = String(owner?.id) === String(meId);
+            <Text style={styles.modalTitle}>
+              {svcDetailItem?.title || "Service"}
+            </Text>
+            {svcDetailItem ? (
+              (() => {
+                const owner =
+                  svcDetailItem?.user ||
+                  svcDetailItem?.owner ||
+                  svcDetailItem?.provider ||
+                  svcDetailItem?.poster;
+                const ownerAvatar = resolveAvatarUri(owner);
+                const ownerName =
+                  owner?.first_name || owner?.last_name
+                    ? `${owner?.first_name || ""} ${
+                        owner?.last_name || ""
+                      }`.trim()
+                    : owner?.email || owner?.name || "Neighbor";
+                const isOwner = String(owner?.id) === String(meId);
 
-              return (
-                <>
-                  <Pressable
-                    style={[styles.ownerRow, { marginTop: 2 }]}
-                    onPress={() => openProviderProfile(owner?.id)}
-                  >
-                    <Image
-                      source={ownerAvatar ? { uri: ownerAvatar, headers: imageHeaders } : avatarPlaceholder}
-                      style={styles.avatarSm}
-                      resizeMode="cover"
-                    />
-                    <Text style={styles.owner} numberOfLines={1}>
-                      by <Text style={styles.ownerLink}>{ownerName}</Text>
-                      {"  "}
-                      • <Text style={styles.categoryText}>{svcDetailItem?.category || "Other"}</Text>
-                    </Text>
-                  </Pressable>
-
-                  <Text style={[styles.desc, { marginTop: 8 }]}>
-                    {svcDetailItem?.description || "—"}
-                  </Text>
-                  <Text style={[styles.price, { marginTop: 8 }]}>
-                    {Number(svcDetailItem?.price || 0).toLocaleString(undefined, {
-                      minimumFractionDigits: 2,
-                      maximumFractionDigits: 2,
-                    })}{" "}
-                    ESC
-                  </Text>
-
-                  <View style={[styles.row, { gap: 8, marginTop: 14, flexWrap: "wrap" }]}>
-                    {!isOwner && (
-                      <>
-                        <Pressable
-                          style={styles.bookBtn}
-                          onPress={() => {
-                            closeServiceDetail();
-                            openBook(svcDetailItem);
-                          }}
-                        >
-                          <Text style={styles.bookBtnText}>Book</Text>
-                        </Pressable>
-                        <Pressable
-                          style={styles.secondaryBtn}
-                          onPress={() => {
-                            closeServiceDetail();
-                            navigateToChat(owner);
-                          }}
-                        >
-                          <Text style={styles.secondaryBtnText}>Message</Text>
-                        </Pressable>
-                        <Pressable
-                          style={styles.secondaryBtn}
-                          onPress={() => {
-                            closeServiceDetail();
-                            openProviderProfile(owner?.id);
-                          }}
-                        >
-                          <Text style={styles.secondaryBtnText}>View Profile</Text>
-                        </Pressable>
-                      </>
-                    )}
-                    <Pressable style={styles.secondaryBtn} onPress={closeServiceDetail}>
-                      <Text style={styles.secondaryBtnText}>Close</Text>
+                return (
+                  <>
+                    <Pressable
+                      style={[styles.ownerRow, { marginTop: 2 }]}
+                      onPress={() => openProviderProfile(owner?.id)}
+                    >
+                      <Image
+                        source={
+                          ownerAvatar
+                            ? { uri: ownerAvatar, headers: imageHeaders }
+                            : avatarPlaceholder
+                        }
+                        style={styles.avatarSm}
+                        resizeMode="cover"
+                      />
+                      <Text style={styles.owner} numberOfLines={1}>
+                        by <Text style={styles.ownerLink}>{ownerName}</Text>
+                        {"  "}
+                        •{" "}
+                        <Text style={styles.categoryText}>
+                          {svcDetailItem?.category || "Other"}
+                        </Text>
+                      </Text>
                     </Pressable>
-                  </View>
-                </>
-              );
-            })() : (
+
+                    <Text style={[styles.desc, { marginTop: 8 }]}>
+                      {svcDetailItem?.description || "—"}
+                    </Text>
+                    <Text style={[styles.price, { marginTop: 8 }]}>
+                      {Number(svcDetailItem?.price || 0).toLocaleString(
+                        undefined,
+                        {
+                          minimumFractionDigits: 2,
+                          maximumFractionDigits: 2,
+                        }
+                      )}{" "}
+                      ESC
+                    </Text>
+
+                    <View
+                      style={[
+                        styles.row,
+                        { gap: 8, marginTop: 14, flexWrap: "wrap" },
+                      ]}
+                    >
+                      {!isOwner && (
+                        <>
+                          <Pressable
+                            style={styles.bookBtn}
+                            onPress={() => {
+                              closeServiceDetail();
+                              openBook(svcDetailItem);
+                            }}
+                          >
+                            <Text style={styles.bookBtnText}>Book</Text>
+                          </Pressable>
+                          <Pressable
+                            style={styles.secondaryBtn}
+                            onPress={() => {
+                              closeServiceDetail();
+                              navigateToChat(owner);
+                            }}
+                          >
+                            <Text style={styles.secondaryBtnText}>Message</Text>
+                          </Pressable>
+                          <Pressable
+                            style={styles.secondaryBtn}
+                            onPress={() => {
+                              closeServiceDetail();
+                              openProviderProfile(owner?.id);
+                            }}
+                          >
+                            <Text style={styles.secondaryBtnText}>
+                              View Profile
+                            </Text>
+                          </Pressable>
+                        </>
+                      )}
+                      <Pressable
+                        style={styles.secondaryBtn}
+                        onPress={closeServiceDetail}
+                      >
+                        <Text style={styles.secondaryBtnText}>Close</Text>
+                      </Pressable>
+                    </View>
+                  </>
+                );
+              })()
+            ) : (
               <ActivityIndicator color={THEME.accentGold} />
             )}
           </View>
@@ -1887,13 +1590,20 @@ const ServicesScreen = ({ navigation, route }) => {
           style={styles.modalBackdrop}
         >
           <View style={styles.modalCard}>
-            <Text style={styles.modalTitle}>Book: {bookSvc?.title || "Service"} </Text>
+            <Text style={styles.modalTitle}>
+              Book: {bookSvc?.title || "Service"}{" "}
+            </Text>
             <ScrollView keyboardShouldPersistTaps="handled">
               <Text style={styles.inputLabel}>Pick a day</Text>
               <MonthCalendarBooking />
 
               <Text style={styles.inputLabel}>Start time</Text>
-              <ScrollView horizontal showsHorizontalScrollIndicator={false} style={{ marginBottom: 10 }} keyboardShouldPersistTaps="handled">
+              <ScrollView
+                horizontal
+                showsHorizontalScrollIndicator={false}
+                style={{ marginBottom: 10 }}
+                keyboardShouldPersistTaps="handled"
+              >
                 <View style={{ flexDirection: "row", gap: 8 }}>
                   {timeSlots.map((t) => {
                     const active = bookTime === t.value;
@@ -1901,9 +1611,19 @@ const ServicesScreen = ({ navigation, route }) => {
                       <Pressable
                         key={t.value}
                         onPress={() => setBookTime(t.value)}
-                        style={[styles.timeChip, active && styles.timeChipActive]}
+                        style={[
+                          styles.timeChip,
+                          active && styles.timeChipActive,
+                        ]}
                       >
-                        <Text style={[styles.timeChipText, active && styles.timeChipTextActive]}>{t.label}</Text>
+                        <Text
+                          style={[
+                            styles.timeChipText,
+                            active && styles.timeChipTextActive,
+                          ]}
+                        >
+                          {t.label}
+                        </Text>
                       </Pressable>
                     );
                   })}
@@ -1911,12 +1631,32 @@ const ServicesScreen = ({ navigation, route }) => {
               </ScrollView>
 
               <Text style={styles.inputLabel}>Duration (minutes)</Text>
-              <View style={{ flexDirection: "row", gap: 8, marginBottom: 10 }}>
+              <View
+                style={{
+                  flexDirection: "row",
+                  gap: 8,
+                  marginBottom: 10,
+                }}
+              >
                 {[30, 60, 90, 120].map((d) => {
                   const active = bookDuration === d;
                   return (
-                    <Pressable key={d} onPress={() => setBookDuration(d)} style={[styles.timeChip, active && styles.timeChipActive]}>
-                      <Text style={[styles.timeChipText, active && styles.timeChipTextActive]}>{d}</Text>
+                    <Pressable
+                      key={d}
+                      onPress={() => setBookDuration(d)}
+                      style={[
+                        styles.timeChip,
+                        active && styles.timeChipActive,
+                      ]}
+                    >
+                      <Text
+                        style={[
+                          styles.timeChipText,
+                          active && styles.timeChipTextActive,
+                        ]}
+                      >
+                        {d}
+                      </Text>
                     </Pressable>
                   );
                 })}
@@ -1934,96 +1674,37 @@ const ServicesScreen = ({ navigation, route }) => {
                 />
               </View>
 
-              {bookErr ? <Text style={styles.errorText}>{bookErr}</Text> : null}
+              {bookErr ? (
+                <Text style={styles.errorText}>{bookErr}</Text>
+              ) : null}
 
               <View style={[styles.row, { marginTop: 14 }]}>
                 <Pressable
                   onPress={closeBook}
-                  style={({ pressed }) => [styles.secondaryBtnWide, pressed && { opacity: 0.9 }]}
+                  style={({ pressed }) => [
+                    styles.secondaryBtnWide,
+                    pressed && { opacity: 0.9 },
+                  ]}
                   disabled={bookSaving}
                 >
                   <Text style={styles.secondaryBtnText}>Cancel</Text>
                 </Pressable>
                 <Pressable
                   onPress={handleCreateBooking}
-                  style={({ pressed }) => [styles.primaryBtnWide, pressed && { transform: [{ scale: 0.98 }] }]}
+                  style={({ pressed }) => [
+                    styles.primaryBtnWide,
+                    pressed && { transform: [{ scale: 0.98 }] },
+                  ]}
                   disabled={bookSaving}
                 >
-                  {bookSaving ? <ActivityIndicator color="#fff" /> : <Text style={styles.primaryBtnText}>Request Booking</Text>}
+                  {bookSaving ? (
+                    <ActivityIndicator color="#fff" />
+                  ) : (
+                    <Text style={styles.primaryBtnText}>Request Booking</Text>
+                  )}
                 </Pressable>
               </View>
             </ScrollView>
-          </View>
-        </KeyboardAvoidingView>
-      </Modal>
-
-      {/* Booking Detail Modal */}
-      <Modal visible={detailOpen} transparent animationType="fade" onRequestClose={closeDetail}>
-        <KeyboardAvoidingView
-          behavior={Platform.select({ ios: "padding", android: undefined })}
-          style={styles.modalBackdrop}
-        >
-          <View style={styles.modalCard}>
-            <Text style={styles.modalTitle}>Booking Details</Text>
-            {detailBk ? (
-              <View>
-                <Text style={styles.detailRow}>
-                  <Text style={styles.detailLabel}>Service:</Text> {detailBk?.service?.title || "Service"}
-                </Text>
-                <Text style={styles.detailRow}>
-                  <Text style={styles.detailLabel}>When:</Text> {fmtTime(detailBk?.start_at)} → {fmtTimeOnly(detailBk?.end_at)}
-                </Text>
-                <Text style={styles.detailRow}>
-                  <Text style={styles.detailLabel}>Status:</Text>{" "}
-                  <Text style={{ color: statusPillStyle(detailBk?.status).color }}>{detailBk?.status}</Text>
-                </Text>
-                <Text style={styles.detailRow}>
-                  <Text style={styles.detailLabel}>Client:</Text> {detailBk?.client?.email || "—"}
-                </Text>
-                <Text style={styles.detailRow}>
-                  <Text style={styles.detailLabel}>Provider:</Text>{" "}
-                  <Text
-                    style={styles.ownerLink}
-                    onPress={() => {
-                      closeDetail();
-                      openProviderProfile(detailBk?.provider?.id);
-                    }}
-                  >
-                    {detailBk?.provider?.email || "—"}
-                  </Text>
-                </Text>
-                {detailBk?.note ? (
-                  <View style={{ marginTop: 8 }}>
-                    <Text style={styles.detailLabel}>Note from client</Text>
-                    <Text style={styles.desc}>{detailBk.note}</Text>
-                  </View>
-                ) : null}
-
-                <View style={[styles.row, { gap: 8, marginTop: 16, flexWrap: "wrap" }]}>
-                  {actionsFor(detailBk).map((a) => (
-                    <Pressable
-                      key={a}
-                      onPress={() => {
-                        closeDetail();
-                        confirmBkAction(detailBk, a);
-                      }}
-                      style={[
-                        styles.primaryBtn,
-                        a === "Confirm" && { backgroundColor: THEME.accentOrange },
-                        a === "Complete" && { backgroundColor: "#1f3b2a" },
-                      ]}
-                    >
-                      <Text style={styles.primaryBtnText}>{a}</Text>
-                    </Pressable>
-                  ))}
-                  <Pressable onPress={closeDetail} style={styles.secondaryBtn}>
-                    <Text style={styles.secondaryBtnText}>Close</Text>
-                  </Pressable>
-                </View>
-              </View>
-            ) : (
-              <ActivityIndicator color={THEME.accentGold} />
-            )}
           </View>
         </KeyboardAvoidingView>
       </Modal>
@@ -2062,6 +1743,21 @@ const styles = StyleSheet.create({
   tabActive: { backgroundColor: "#1b2a4b", borderColor: "#22355f" },
   tabText: { color: THEME.subtext, fontWeight: "700" },
   tabTextActive: { color: "#cfe0ff" },
+
+  bookingsLinkBtn: {
+    borderRadius: 999,
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    borderWidth: 1,
+    borderColor: THEME.border,
+    marginRight: 8,
+    backgroundColor: "#1f2026",
+  },
+  bookingsLinkText: {
+    color: THEME.subtext,
+    fontWeight: "800",
+    fontSize: 12,
+  },
 
   createBtn: {
     backgroundColor: THEME.accentOrange,
@@ -2131,8 +1827,17 @@ const styles = StyleSheet.create({
     shadowRadius: 10,
     shadowOffset: { width: 0, height: 6 },
   },
-  cardTopRow: { flexDirection: "row", alignItems: "center", justifyContent: "space-between" },
-  cardTitle: { color: THEME.text, fontSize: 16, fontWeight: "800", maxWidth: "64%" },
+  cardTopRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+  },
+  cardTitle: {
+    color: THEME.text,
+    fontSize: 16,
+    fontWeight: "800",
+    maxWidth: "64%",
+  },
   price: { color: THEME.accentGold, fontWeight: "900", fontSize: 16 },
 
   editPill: {
@@ -2168,7 +1873,7 @@ const styles = StyleSheet.create({
     marginTop: 12,
   },
 
-  // orange primary (for general actions, not Book)
+  // orange primary (for general actions)
   primaryBtn: {
     backgroundColor: THEME.accentOrange,
     borderRadius: 10,
@@ -2219,62 +1924,7 @@ const styles = StyleSheet.create({
     fontWeight: "800",
   },
 
-  // Bookings UI
-  segmentBar: { flexDirection: "row", gap: 8, marginTop: 6 },
-  segmentChip: {
-    paddingHorizontal: 12,
-    paddingVertical: 8,
-    borderRadius: 999,
-    borderWidth: 1,
-    borderColor: THEME.border,
-    backgroundColor: "#1f2026",
-  },
-  segmentChipActive: { backgroundColor: "#1b2a4b", borderColor: "#22355f" },
-  segmentChipText: { color: THEME.subtext, fontWeight: "700" },
-  segmentChipTextActive: { color: "#cfe0ff", fontWeight: "800" },
-
-  roleBar: { flexDirection: "row", gap: 8, marginTop: 10 },
-  roleChip: {
-    paddingHorizontal: 12,
-    paddingVertical: 8,
-    borderRadius: 999,
-    borderWidth: 1,
-    borderColor: THEME.border,
-    backgroundColor: "#1f2026",
-  },
-  roleChipActive: { backgroundColor: "#2a1f1f", borderColor: "#4a2b22" },
-  roleChipText: { color: THEME.subtext, fontWeight: "700" },
-  roleChipTextActive: { color: "#ffd7c7", fontWeight: "800" },
-
-  statusRow: { flexDirection: "row", flexWrap: "wrap", gap: 8, marginTop: 10, marginBottom: 6 },
-  statusChip: {
-    paddingHorizontal: 12,
-    paddingVertical: 6,
-    borderRadius: 999,
-    borderWidth: 1,
-    borderColor: THEME.border,
-    backgroundColor: "#1f2026",
-  },
-  statusChipActive: { backgroundColor: "#1b2a4b", borderColor: "#22355f" },
-  statusChipText: { color: THEME.subtext, fontWeight: "700", fontSize: 12 },
-  statusChipTextActive: { color: "#cfe0ff", fontWeight: "800", fontSize: 12 },
-
-  // Calendar strip chips
-  dayChip: {
-    width: 68,
-    borderWidth: 1,
-    borderColor: THEME.border,
-    backgroundColor: "#1f2026",
-    borderRadius: 12,
-    paddingVertical: 8,
-    alignItems: "center",
-  },
-  dayChipActive: { backgroundColor: "#1b2a4b", borderColor: "#22355f" },
-  dayChipTop: { color: THEME.subtext, fontSize: 12, fontWeight: "700" },
-  dayChipBottom: { color: THEME.text, fontSize: 16, fontWeight: "900", marginTop: 2 },
-  dayChipTextActive: { color: "#cfe0ff" },
-
-  // Month calendar
+  // Month calendar (reused for booking modal)
   monthWrap: {
     marginTop: 6,
     borderWidth: 1,
@@ -2283,7 +1933,12 @@ const styles = StyleSheet.create({
     borderRadius: 12,
     padding: 10,
   },
-  monthHeader: { flexDirection: "row", alignItems: "center", justifyContent: "space-between", marginBottom: 6 },
+  monthHeader: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    marginBottom: 6,
+  },
   monthTitle: { color: THEME.text, fontWeight: "900" },
   monthNavBtn: {
     width: 30,
@@ -2297,7 +1952,13 @@ const styles = StyleSheet.create({
   },
   monthNavText: { color: THEME.text, fontWeight: "900", fontSize: 16 },
   weekHeaderRow: { flexDirection: "row", marginTop: 4, marginBottom: 4 },
-  weekHeaderText: { flex: 1, textAlign: "center", color: THEME.subtle, fontSize: 12, fontWeight: "800" },
+  weekHeaderText: {
+    flex: 1,
+    textAlign: "center",
+    color: THEME.subtle,
+    fontSize: 12,
+    fontWeight: "800",
+  },
   weekRow: { flexDirection: "row", marginBottom: 6 },
   dayCell: {
     flex: 1,
@@ -2315,13 +1976,6 @@ const styles = StyleSheet.create({
   dayCellText: { color: THEME.subtext, fontWeight: "800" },
   dayCellTextActive: { color: "#cfe0ff" },
   dayCellTextToday: { color: THEME.accentGold },
-  dot: {
-    width: 6,
-    height: 6,
-    borderRadius: 3,
-    backgroundColor: THEME.accentGold,
-    marginTop: 4,
-  },
 
   // time chips
   timeChip: {
@@ -2340,16 +1994,6 @@ const styles = StyleSheet.create({
   emptyTitle: { color: THEME.text, fontSize: 16, fontWeight: "800" },
   emptyText: { color: THEME.subtext, marginTop: 6 },
 
-  statusPill: {
-    paddingHorizontal: 10,
-    paddingVertical: 4,
-    borderRadius: 999,
-    borderWidth: 1,
-    fontSize: 12,
-    fontWeight: "900",
-    textTransform: "capitalize",
-  },
-
   errorText: { color: THEME.red, marginTop: 8 },
 
   skeletonWrap: { position: "absolute", left: 16, right: 16 },
@@ -2361,11 +2005,22 @@ const styles = StyleSheet.create({
     borderWidth: 1,
   },
 
-  accent: { position: "absolute", width: 300, height: 300, borderRadius: 999, opacity: 0.1 },
+  accent: {
+    position: "absolute",
+    width: 300,
+    height: 300,
+    borderRadius: 999,
+    opacity: 0.1,
+  },
   accentTop: { top: -70, right: -60, backgroundColor: THEME.accentGold },
   accentBottom: { bottom: -90, left: -70, backgroundColor: THEME.accentOrange },
 
-  modalBackdrop: { flex: 1, backgroundColor: "rgba(0,0,0,0.6)", padding: 16, justifyContent: "center" },
+  modalBackdrop: {
+    flex: 1,
+    backgroundColor: "rgba(0,0,0,0.6)",
+    padding: 16,
+    justifyContent: "center",
+  },
   modalCard: {
     width: "100%",
     maxWidth: 520,
@@ -2376,7 +2031,13 @@ const styles = StyleSheet.create({
     borderRadius: 16,
     padding: 16,
   },
-  modalTitle: { color: THEME.text, fontSize: 18, fontWeight: "900", marginBottom: 12, textAlign: "center" },
+  modalTitle: {
+    color: THEME.text,
+    fontSize: 18,
+    fontWeight: "900",
+    marginBottom: 12,
+    textAlign: "center",
+  },
 
   inputWrap: { marginTop: 10 },
   inputLabel: { color: THEME.subtext, fontSize: 12, marginBottom: 6 },
@@ -2392,9 +2053,17 @@ const styles = StyleSheet.create({
   textarea: { minHeight: 88, textAlignVertical: "top" },
 
   row: { flexDirection: "row", alignItems: "center" },
-  rowBetween: { flexDirection: "row", alignItems: "flex-start", justifyContent: "space-between" },
+  rowBetween: {
+    flexDirection: "row",
+    alignItems: "flex-start",
+    justifyContent: "space-between",
+  },
 
-  catHeaderRow: { flexDirection: "row", alignItems: "center", justifyContent: "space-between" },
+  catHeaderRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+  },
   viewAllBtn: { paddingHorizontal: 6, paddingVertical: 4 },
   viewAllText: { color: THEME.accentGold, fontWeight: "800", fontSize: 12 },
 
@@ -2442,8 +2111,19 @@ const styles = StyleSheet.create({
     borderRadius: 16,
     padding: 14,
   },
-  gridTitle: { color: THEME.text, fontSize: 16, fontWeight: "900", textAlign: "center", marginBottom: 8 },
-  gridWrap: { flexDirection: "row", flexWrap: "wrap", gap: 10, justifyContent: "space-between" },
+  gridTitle: {
+    color: THEME.text,
+    fontSize: 16,
+    fontWeight: "900",
+    textAlign: "center",
+    marginBottom: 8,
+  },
+  gridWrap: {
+    flexDirection: "row",
+    flexWrap: "wrap",
+    gap: 10,
+    justifyContent: "space-between",
+  },
   gridItem: {
     width: "48%",
     borderWidth: 1,
@@ -2456,30 +2136,14 @@ const styles = StyleSheet.create({
   gridItemActive: { backgroundColor: "#1b2a4b", borderColor: "#22355f" },
   gridItemText: { color: THEME.subtext, fontWeight: "700" },
   gridItemTextActive: { color: "#cfe0ff", fontWeight: "800" },
-  gridCloseBtn: { marginTop: 10, backgroundColor: THEME.accentOrange, borderRadius: 12, paddingVertical: 12, alignItems: "center" },
+  gridCloseBtn: {
+    marginTop: 10,
+    backgroundColor: THEME.accentOrange,
+    borderRadius: 12,
+    paddingVertical: 12,
+    alignItems: "center",
+  },
   gridCloseText: { color: "#fff", fontWeight: "900" },
 
-  actionBtn: {
-    backgroundColor: THEME.slate,
-    borderRadius: 10,
-    paddingHorizontal: 12,
-    paddingVertical: 8,
-    borderWidth: 1,
-    borderColor: "#3a3a3f",
-  },
-  actionBtnPrimary: { backgroundColor: THEME.accentOrange, borderColor: THEME.accentOrange },
-  actionBtnSuccess: { backgroundColor: "#1f3b2a", borderColor: "#2c6e49" },
-  actionBtnText: { color: "#fff", fontWeight: "800", fontSize: 12 },
-
-  loadingOverlay: {
-    ...StyleSheet.absoluteFillObject,
-    alignItems: "center",
-    justifyContent: "center",
-    backgroundColor: "transparent",
-  },
-
   catHint: { color: THEME.subtle, marginTop: 6, fontSize: 12 },
-
-  detailRow: { color: THEME.text, marginTop: 6 },
-  detailLabel: { color: THEME.subtext, fontWeight: "800" },
 });

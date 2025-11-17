@@ -3,7 +3,7 @@ import { API_URL } from "../config";
 
 /**
  * Minimal fetch wrapper with:
- * - token as string OR async provider () => Promise<string|null>
+ * - token as string OR async token provider () => Promise<string|null>
  * - optional refresh handler on 401 (setTokenRefreshHandler)
  * - query param support
  * - JSON parsing + normalized errors
@@ -15,6 +15,9 @@ import { API_URL } from "../config";
 
 let _tokenOrProvider = null;          // string token or async () => token
 let _refreshHandler = null;           // async () => string|null (new token) or throws
+
+// Global demo switch for wallet helpers
+const DEMO_MODE = true;
 
 /** Pass a string token or an async provider (() => Promise<string|null>) */
 export function setAuthToken(tokenOrProvider) {
@@ -29,7 +32,9 @@ export function setTokenRefreshHandler(handler /* async () => string|null */) {
 async function resolveToken() {
   if (!_tokenOrProvider) return null;
   try {
-    return typeof _tokenOrProvider === "function" ? await _tokenOrProvider() : _tokenOrProvider;
+    return typeof _tokenOrProvider === "function"
+      ? await _tokenOrProvider()
+      : _tokenOrProvider;
   } catch {
     return null;
   }
@@ -66,7 +71,11 @@ async function doFetch(url, init, { timeout, signal }) {
     const res = await fetch(url, { ...init, signal: activeSignal });
     const text = await res.text();
     let data = null;
-    try { data = text ? JSON.parse(text) : null; } catch { data = text || null; }
+    try {
+      data = text ? JSON.parse(text) : null;
+    } catch {
+      data = text || null;
+    }
     return { res, data };
   } catch (e) {
     if (e.name === "AbortError") {
@@ -99,7 +108,9 @@ export async function request(
         ...(token ? { Authorization: `Bearer ${token}` } : {}),
         ...(headers || {}),
       },
-      ...(body ? { body: body instanceof FormData ? body : JSON.stringify(body) } : {}),
+      ...(body
+        ? { body: body instanceof FormData ? body : JSON.stringify(body) }
+        : {}),
     };
   };
 
@@ -117,7 +128,11 @@ export async function request(
       triedRefresh = true;
       try {
         const newToken = await _refreshHandler();
-        if (typeof newToken === "string" && newToken.length > 0 && typeof _tokenOrProvider !== "function") {
+        if (
+          typeof newToken === "string" &&
+          newToken.length > 0 &&
+          typeof _tokenOrProvider !== "function"
+        ) {
           setAuthToken(newToken);
         }
         init = await makeInit();
@@ -130,32 +145,48 @@ export async function request(
 
     // Backoff retry for 5xx/429
     if ((res.status >= 500 || res.status === 429) && retries > 0) {
-      await new Promise((r) => setTimeout(r, 400 * Math.pow(1.6, attempt)));
+      await new Promise((r) =>
+        setTimeout(r, 400 * Math.pow(1.6, attempt))
+      );
       attempt++;
       retries--;
       continue;
     }
 
-    throw toError("ApiError", `HTTP ${res.status}`, { status: res.status, data, url, method });
+    throw toError("ApiError", `HTTP ${res.status}`, {
+      status: res.status,
+      data,
+      url,
+      method,
+    });
   }
 }
 
 // Shorthand verbs
 export const api = {
   get: (path, opts) => request("GET", path, opts),
-  post: (path, { body, ...opts } = {}) => request("POST", path, { body, ...opts }),
-  put: (path, { body, ...opts } = {}) => request("PUT", path, { body, ...opts }),
-  patch: (path, { body, ...opts } = {}) => request("PATCH", path, { body, ...opts }),
+  post: (path, { body, ...opts } = {}) =>
+    request("POST", path, { body, ...opts }),
+  put: (path, { body, ...opts } = {}) =>
+    request("PUT", path, { body, ...opts }),
+  patch: (path, { body, ...opts } = {}) =>
+    request("PATCH", path, { body, ...opts }),
   del: (path, opts) => request("DELETE", path, opts),
   delete: (path, opts) => request("DELETE", path, opts), // alias
 };
 
 // Multipart helper
-export async function upload(path, formData, { params, headers, timeout = 30000, signal } = {}) {
+export async function upload(
+  path,
+  formData,
+  { params, headers, timeout = 30000, signal } = {}
+) {
   return request("POST", path, {
     params,
     body: formData, // must be FormData
-    headers: { ...(headers || {}) /* Content-Type auto-set by fetch for FormData */ },
+    headers: {
+      ...(headers || {}), // Content-Type auto-set by fetch for FormData
+    },
     timeout,
     signal,
   });
@@ -165,7 +196,9 @@ export async function upload(path, formData, { params, headers, timeout = 30000,
    🔐 AUTH / KEYS
    ======================================================= */
 
-export async function registerUser(payload /* { first_name, last_name, email, password, wallet_address } */) {
+export async function registerUser(
+  payload /* { first_name, last_name, email, password, wallet_address } */
+) {
   return api.post("/register/", { body: payload });
 }
 
@@ -181,7 +214,9 @@ export async function logoutUser(payload /* { token: <refresh_token> } */) {
   return api.post("/logout/", { body: payload });
 }
 
-export async function deleteAccount(payload /* optional: { refresh: <token> } */) {
+export async function deleteAccount(
+  payload /* optional: { refresh: <token> } */
+) {
   return api.del("/delete_account/", { body: payload });
 }
 
@@ -197,7 +232,9 @@ export async function fetchMe() {
   return api.get("/me/");
 }
 
-export async function updateMe(fields /* { neighborhood, skills, languages, bio, age, onboarding_completed } */) {
+export async function updateMe(
+  fields /* { neighborhood, skills, languages, bio, age, onboarding_completed } */
+) {
   return api.patch("/me/update/", { body: fields });
 }
 
@@ -230,10 +267,18 @@ export async function searchUsersFallback(query, { signal } = {}) {
 export async function searchUsersSmart(query, { signal } = {}) {
   try {
     const payload = await searchUsers(query, { signal });
-    return Array.isArray(payload) ? payload : (Array.isArray(payload?.results) ? payload.results : payload || []);
+    return Array.isArray(payload)
+      ? payload
+      : Array.isArray(payload?.results)
+      ? payload.results
+      : payload || [];
   } catch {
     const payload = await searchUsersFallback(query, { signal });
-    return Array.isArray(payload) ? payload : (Array.isArray(payload?.results) ? payload.results : payload || []);
+    return Array.isArray(payload)
+      ? payload
+      : Array.isArray(payload?.results)
+      ? payload.results
+      : payload || [];
   }
 }
 
@@ -290,7 +335,7 @@ export async function fetchUserPublicKey(userId) {
 
 export async function fetchThreadsIndex() {
   const payload = await api.get("/conversations/index/");
-  return Array.isArray(payload) ? payload : (payload?.results || []);
+  return Array.isArray(payload) ? payload : payload?.results || [];
 }
 
 export async function markThreadRead(otherUserId) {
@@ -307,7 +352,9 @@ export async function fetchConversation(
   return api.get(`/conversations/${otherUserId}/`, { params });
 }
 
-export async function sendEncryptedMessage(payload /* see /messages/send/ contract */) {
+export async function sendEncryptedMessage(
+  payload /* see /messages/send/ contract */
+) {
   return api.post("/messages/send/", { body: payload });
 }
 
@@ -324,11 +371,59 @@ export async function markMessagesReadBatch(ids /* string[] */) {
    ======================================================= */
 
 export async function walletBalance() {
-  return api.get("/wallet/balance/");
+  const raw = await api.get("/wallet/balance/");
+  const data = raw && typeof raw === "object" ? raw : {};
+
+  let addr = data.address || data.wallet_address || "";
+  if (!addr && DEMO_MODE) {
+    // fallback demo address so WalletScreen has something stable to key off
+    addr = "esc_demo_wallet_local";
+  }
+
+  let balNum = Number(data.balance);
+  if (!Number.isFinite(balNum) || balNum < 0) {
+    balNum = 0;
+  }
+
+  return {
+    ...data,
+    address: addr,
+    wallet_address: addr,
+    balance: balNum,
+  };
 }
 
 export async function checkBalance(address) {
   return api.get(`/check_balance/${encodeURIComponent(address)}/`);
+}
+
+/**
+ * Pay for a booking or send ESC
+ * Expects backend /wallet/pay/ to accept:
+ * { booking_id, amount, memo? }
+ */
+export async function walletPay(bookingId, amount, memo) {
+  const body = {
+    booking_id: bookingId,
+    amount,
+  };
+  if (memo) body.memo = memo;
+  return api.post("/wallet/pay/", { body });
+}
+
+/* =======================================================
+   📊 ESC ECONOMY / STATS
+   ======================================================= */
+
+/**
+ * Fetch ESC economy stats from /esc/stats/
+ * Optional range: { from, to } as ISO strings (if your backend supports it).
+ */
+export async function fetchEscStats({ from, to } = {}) {
+  const params = {};
+  if (from) params.from = from;
+  if (to) params.to = to;
+  return api.get("/esc/stats/", { params });
 }
 
 /* =======================================================
@@ -344,7 +439,9 @@ export async function listServices({ q, category, page, limit } = {}) {
   return api.get("/services/", { params });
 }
 
-export async function createService(payload /* { title, description, price, category, ... } */) {
+export async function createService(
+  payload /* { title, description, price, category, ... } */
+) {
   return api.post("/services/", { body: payload });
 }
 
@@ -373,12 +470,20 @@ export async function listMyServices(opts = {}) {
    ======================================================= */
 
 // Liberal creator that tries service subroutes then generic POST /bookings/
-export async function bookService(idOrObj, payload /* { start, end, note } */) {
+export async function bookService(
+  idOrObj,
+  payload /* { start, end, note } */
+) {
   const serviceId =
-    (idOrObj && typeof idOrObj === "object" ? (idOrObj.id || idOrObj.pk || idOrObj.service_id) : idOrObj);
+    idOrObj && typeof idOrObj === "object"
+      ? idOrObj.id || idOrObj.pk || idOrObj.service_id
+      : idOrObj;
 
   if (!serviceId) {
-    throw toError("ArgumentError", "Missing service id for booking", { payload, idOrObj });
+    throw toError("ArgumentError", "Missing service id for booking", {
+      payload,
+      idOrObj,
+    });
   }
 
   const sid = encodeURIComponent(String(serviceId));
@@ -392,8 +497,8 @@ export async function bookService(idOrObj, payload /* { start, end, note } */) {
   };
 
   const path1 = `/services/${sid}/bookings/`; // if you later add it
-  const path2 = `/services/${sid}/book/`;     // alt
-  const path3 = `/bookings/`;                 // current generic endpoint
+  const path2 = `/services/${sid}/book/`; // alt
+  const path3 = `/bookings/`; // current generic endpoint
 
   try {
     return await api.post(path1, { body });
@@ -412,14 +517,21 @@ export async function bookService(idOrObj, payload /* { start, end, note } */) {
   }
 }
 
-export async function listBookings({ role, status, page, limit, from, to } = {}) {
+export async function listBookings({
+  role,
+  status,
+  page,
+  limit,
+  from,
+  to,
+} = {}) {
   const params = {};
-  if (role) params.role = role;             // provider|client|all
-  if (status) params.status = status;       // pending|confirmed|completed|cancelled|rejected
+  if (role) params.role = role; // provider|client|all
+  if (status) params.status = status; // pending|confirmed|completed|cancelled|rejected
   if (page) params.page = page;
   if (limit) params.limit = limit;
-  if (from) params.from = from;             // ISO
-  if (to) params.to = to;                   // ISO
+  if (from) params.from = from; // ISO
+  if (to) params.to = to; // ISO
   return api.get("/bookings/", { params });
 }
 
@@ -428,22 +540,33 @@ export async function getBooking(bookingId) {
 }
 
 /** Generic patch for any state transition or notes update */
-export async function updateBooking(bookingId, payload /* { action?, note?, notes? } */) {
+export async function updateBooking(
+  bookingId,
+  payload /* { action?, note?, notes? } */
+) {
   return api.patch(`/bookings/${bookingId}/`, { body: payload });
 }
 
-// ---- Booking action shorthands (POST endpoints) ----
+// Booking action shorthands (POST endpoints)
 export async function confirmBooking(bookingId, note = "") {
-  return api.post(`/bookings/${bookingId}/confirm/`, { body: note ? { note } : {} });
+  return api.post(`/bookings/${bookingId}/confirm/`, {
+    body: note ? { note } : {},
+  });
 }
 export async function rejectBooking(bookingId, note = "") {
-  return api.post(`/bookings/${bookingId}/reject/`, { body: note ? { note } : {} });
+  return api.post(`/bookings/${bookingId}/reject/`, {
+    body: note ? { note } : {},
+  });
 }
 export async function cancelBookingAction(bookingId, note = "") {
-  return api.post(`/bookings/${bookingId}/cancel/`, { body: note ? { note } : {} });
+  return api.post(`/bookings/${bookingId}/cancel/`, {
+    body: note ? { note } : {},
+  });
 }
 export async function completeBooking(bookingId, note = "") {
-  return api.post(`/bookings/${bookingId}/complete/`, { body: note ? { note } : {} });
+  return api.post(`/bookings/${bookingId}/complete/`, {
+    body: note ? { note } : {},
+  });
 }
 
 /* =======================================================

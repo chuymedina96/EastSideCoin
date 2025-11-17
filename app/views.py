@@ -1,13 +1,17 @@
 # views.py
+from datetime import timedelta
+
 from django.utils.dateparse import parse_datetime
 from django.core.paginator import Paginator, EmptyPage
-from django.db.models import Q, Max, Count
+from django.db.models import Q, Max, Count, Sum
 from django.utils import timezone
 from django.contrib.auth.hashers import make_password, check_password
 from django.contrib.auth import get_user_model
 from django.conf import settings
 from django.core.files.images import get_image_dimensions
 from django.core.files.uploadedfile import InMemoryUploadedFile, TemporaryUploadedFile
+from django.core.mail import send_mail
+from django.db import transaction as db_transaction
 
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.permissions import AllowAny, IsAuthenticated
@@ -19,7 +23,13 @@ from rest_framework_simplejwt.exceptions import InvalidToken, TokenError
 
 from decimal import Decimal, InvalidOperation
 
-from .models import ChatMessage, Service, Booking, Transaction  # noqa: F401
+from .models import (
+    ChatMessage,
+    Service,
+    Booking,
+    Transaction,
+    WalletActivity,
+)  # noqa: F401
 
 User = get_user_model()
 
@@ -66,7 +76,9 @@ def _serialize_me(u: User, request=None):
         "last_name": u.last_name,
         "wallet_address": getattr(u, "wallet_address", None),
         "public_key": getattr(u, "public_key", None),
-        "has_public_key": bool(getattr(u, "public_key", None)),  # ✅ quick boolean for client
+        "has_public_key": bool(
+            getattr(u, "public_key", None)
+        ),  # ✅ quick boolean for client
         "avatar_url": _avatar_url(u, request),
         "esc_balance": float(getattr(u, "esc_balance", 0.0)),
         "is_vip": bool(getattr(u, "is_vip", False)),
@@ -127,10 +139,16 @@ def register_user(request):
         wallet_address = data.get("wallet_address")
 
         if not all([first_name, last_name, email, password, wallet_address]):
-            return Response({"error": "All fields are required"}, status=status.HTTP_400_BAD_REQUEST)
+            return Response(
+                {"error": "All fields are required"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
 
         if User.objects.filter(email=email).exists():
-            return Response({"error": "Email is already in use"}, status=status.HTTP_400_BAD_REQUEST)
+            return Response(
+                {"error": "Email is already in use"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
 
         user = User.objects.create(
             first_name=first_name,
@@ -147,7 +165,9 @@ def register_user(request):
         )
     except Exception as e:
         print(f"❌ ERROR Registering User: {e}")
-        return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+        return Response(
+            {"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR
+        )
 
 
 @api_view(["POST"])
@@ -157,20 +177,30 @@ def generate_keys(request):
     received_public_key = (request.data.get("public_key") or "").strip()
 
     if user.public_key:
-        return Response({"message": "Keys already generated"}, status=status.HTTP_400_BAD_REQUEST)
+        return Response(
+            {"message": "Keys already generated"},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
 
     if not received_public_key.startswith("-----BEGIN PUBLIC KEY-----"):
         print("❌ Invalid or missing public key format.")
-        return Response({"error": "Invalid public key format."}, status=status.HTTP_400_BAD_REQUEST)
+        return Response(
+            {"error": "Invalid public key format."},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
 
     try:
         user.public_key = received_public_key
         user.save(update_fields=["public_key"])
         print(f"✅ Public key stored for {user.email}")
-        return Response({"message": "Keys stored successfully"}, status=status.HTTP_200_OK)
+        return Response(
+            {"message": "Keys stored successfully"}, status=status.HTTP_200_OK
+        )
     except Exception as e:
         print(f"❌ ERROR Storing Keys: {e}")
-        return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+        return Response(
+            {"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR
+        )
 
 
 @api_view(["POST"])
@@ -182,17 +212,26 @@ def login_user(request):
         password = request.data.get("password")
 
         if not email or not password:
-            return Response({"error": "Email and password are required"}, status=status.HTTP_400_BAD_REQUEST)
+            return Response(
+                {"error": "Email and password are required"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
 
         try:
             user = User.objects.get(email=email)
         except User.DoesNotExist:
             print("❌ Invalid credentials (email)")
-            return Response({"error": "Invalid credentials"}, status=status.HTTP_401_UNAUTHORIZED)
+            return Response(
+                {"error": "Invalid credentials"},
+                status=status.HTTP_401_UNAUTHORIZED,
+            )
 
         if not check_password(password, user.password):
             print("❌ Invalid credentials (password)")
-            return Response({"error": "Invalid credentials"}, status=status.HTTP_401_UNAUTHORIZED)
+            return Response(
+                {"error": "Invalid credentials"},
+                status=status.HTTP_401_UNAUTHORIZED,
+            )
 
         refresh = RefreshToken.for_user(user)
         access = refresh.access_token
@@ -206,14 +245,18 @@ def login_user(request):
                 "user": {
                     **_serialize_user_with_wallet(user, request),
                     "public_key": getattr(user, "public_key", None),
-                    "has_public_key": bool(getattr(user, "public_key", None)),  # mirror /me/
+                    "has_public_key": bool(
+                        getattr(user, "public_key", None)
+                    ),  # mirror /me/
                 },
             },
             status=status.HTTP_200_OK,
         )
     except Exception as e:
         print(f"❌ CRITICAL ERROR in login: {e}")
-        return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+        return Response(
+            {"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR
+        )
 
 
 @api_view(["POST"])
@@ -245,19 +288,27 @@ def logout_user(request):
         print("🚀 Logout API Hit!")
         refresh_token = request.data.get("token")
         if not refresh_token:
-            return Response({"error": "Refresh token required"}, status=status.HTTP_400_BAD_REQUEST)
+            return Response(
+                {"error": "Refresh token required"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
 
         try:
             refresh = RefreshToken(refresh_token)
             refresh.blacklist()
             print("✅ Logout successful; refresh token blacklisted.")
-            return Response({"message": "Logout successful, token blacklisted."}, status=status.HTTP_200_OK)
+            return Response(
+                {"message": "Logout successful, token blacklisted."},
+                status=status.HTTP_200_OK,
+            )
         except Exception as e:
             print(f"❌ Invalid refresh token: {e}")
             return Response({"error": "Invalid token"}, status=status.HTTP_400_BAD_REQUEST)
     except Exception as e:
         print(f"❌ CRITICAL ERROR in logout: {e}")
-        return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+        return Response(
+            {"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR
+        )
 
 
 @api_view(["DELETE"])
@@ -282,7 +333,9 @@ def delete_account(request):
 
         return Response(status=status.HTTP_204_NO_CONTENT)
     except Exception as e:
-        return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+        return Response(
+            {"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR
+        )
 
 
 # ===========================
@@ -365,12 +418,17 @@ def profile_avatar(request):
 
     file = request.FILES.get("avatar")
     if not file:
-        return Response({"error": "No file uploaded (use 'avatar' field)."}, status=400)
+        return Response(
+            {"error": "No file uploaded (use 'avatar' field)."}, status=400
+        )
 
     allowed = {"image/jpeg", "image/png", "image/webp", "image/gif"}
     content_type = getattr(file, "content_type", "").lower()
     if content_type not in allowed:
-        return Response({"error": "Unsupported image type. Use JPEG/PNG/WebP/GIF."}, status=400)
+        return Response(
+            {"error": "Unsupported image type. Use JPEG/PNG/WebP/GIF."},
+            status=400,
+        )
 
     max_bytes = 5 * 1024 * 1024  # 5MB
     if file.size > max_bytes:
@@ -382,7 +440,10 @@ def profile_avatar(request):
             if not width or not height:
                 return Response({"error": "Invalid image."}, status=400)
             if width > 6000 or height > 6000:
-                return Response({"error": "Image too large in dimensions (max 6000x6000)."}, status=400)
+                return Response(
+                    {"error": "Image too large in dimensions (max 6000x6000)."},
+                    status=400,
+                )
     except Exception:
         pass
 
@@ -417,8 +478,13 @@ def search_users(request):
             | Q(wallet_address__icontains=t)
         )
 
-    users = qs.only("id", "first_name", "last_name", "email", "wallet_address")[:25]
-    return Response([_serialize_user_with_wallet(u, request) for u in users], status=status.HTTP_200_OK)
+    users = qs.only("id", "first_name", "last_name", "email", "wallet_address")[
+        :25
+    ]
+    return Response(
+        [_serialize_user_with_wallet(u, request) for u in users],
+        status=status.HTTP_200_OK,
+    )
 
 
 @api_view(["GET"])
@@ -439,14 +505,16 @@ def user_detail(request, user_id: int):
     else:
         payload = _serialize_user_with_wallet(u, request)
         # public profile fields for neighbors
-        payload.update({
-            "bio": getattr(u, "bio", "") or "",
-            "education": getattr(u, "education", "") or "",
-            "age": getattr(u, "age", None),
-            "neighborhood": getattr(u, "neighborhood", "") or "",
-            "skills": getattr(u, "skills", "") or "",
-            "languages": getattr(u, "languages", "") or "",
-        })
+        payload.update(
+            {
+                "bio": getattr(u, "bio", "") or "",
+                "education": getattr(u, "education", "") or "",
+                "age": getattr(u, "age", None),
+                "neighborhood": getattr(u, "neighborhood", "") or "",
+                "skills": getattr(u, "skills", "") or "",
+                "languages": getattr(u, "languages", "") or "",
+            }
+        )
 
     return Response(payload, status=200)
 
@@ -463,7 +531,9 @@ def conversations_index(request):
     me = request.user
     try:
         base = ChatMessage.objects.filter(Q(sender=me) | Q(receiver=me))
-        latest_rows = base.values("sender_id", "receiver_id").annotate(last_ts=Max("timestamp"))
+        latest_rows = base.values("sender_id", "receiver_id").annotate(
+            last_ts=Max("timestamp")
+        )
 
         partner_latest = {}
         for row in latest_rows:
@@ -480,27 +550,35 @@ def conversations_index(request):
             return Response([], status=status.HTTP_200_OK)
 
         unread_qs = (
-            ChatMessage.objects.filter(receiver=me, is_read=False, sender_id__in=partner_ids)
+            ChatMessage.objects.filter(
+                receiver=me, is_read=False, sender_id__in=partner_ids
+            )
             .values("sender_id")
             .annotate(unread=Count("id"))
         )
         unread_map = {row["sender_id"]: row["unread"] for row in unread_qs}
 
-        partners = User.objects.filter(id__in=partner_ids).only("id", "first_name", "last_name", "email")
+        partners = User.objects.filter(id__in=partner_ids).only(
+            "id", "first_name", "last_name", "email"
+        )
 
         items = []
         for u in partners:
-            items.append({
-                "id": u.id,
-                "first_name": u.first_name,
-                "last_name": u.last_name,
-                "email": u.email,
-                "updatedAt": (partner_latest.get(u.id) or timezone.now()).isoformat(),
-                "unread": unread_map.get(u.id, 0),
-                "lastText": "",
-                "avatar_url": _avatar_url(u, request),
-                "has_public_key": bool(getattr(u, "public_key", None)),
-            })
+            items.append(
+                {
+                    "id": u.id,
+                    "first_name": u.first_name,
+                    "last_name": u.last_name,
+                    "email": u.email,
+                    "updatedAt": (
+                        partner_latest.get(u.id) or timezone.now()
+                    ).isoformat(),
+                    "unread": unread_map.get(u.id, 0),
+                    "lastText": "",
+                    "avatar_url": _avatar_url(u, request),
+                    "has_public_key": bool(getattr(u, "public_key", None)),
+                }
+            )
 
         items.sort(key=lambda x: x["updatedAt"], reverse=True)
         return Response(items, status=status.HTTP_200_OK)
@@ -538,8 +616,12 @@ def get_messages(request):
     """
     print("🚀 Get Messages API Hit!")
     try:
-        messages = ChatMessage.objects.filter(receiver=request.user).order_by("-timestamp", "-id")
-        results = [_serialize_message_for_requester(m, request.user.id) for m in messages]
+        messages = ChatMessage.objects.filter(receiver=request.user).order_by(
+            "-timestamp", "-id"
+        )
+        results = [
+            _serialize_message_for_requester(m, request.user.id) for m in messages
+        ]
         return Response(results, status=status.HTTP_200_OK)
     except Exception as e:
         print("❌ get_messages error:", e)
@@ -572,16 +654,22 @@ def my_threads(request):
         if not latest_by_peer:
             return Response([], status=status.HTTP_200_OK)
 
-        peers = User.objects.filter(id__in=list(latest_by_peer.keys())).only("id", "first_name", "last_name", "email")
+        peers = User.objects.filter(id__in=list(latest_by_peer.keys())).only(
+            "id", "first_name", "last_name", "email"
+        )
 
         items = []
         for u in peers:
             meta = latest_by_peer.get(u.id)
-            items.append({
-                "peer": _serialize_user(u),
-                "latest_timestamp": meta["timestamp"].isoformat() if meta["timestamp"] else None,
-                "latest_encrypted_message": meta["encrypted_message"],
-            })
+            items.append(
+                {
+                    "peer": _serialize_user(u),
+                    "latest_timestamp": meta["timestamp"].isoformat()
+                    if meta["timestamp"]
+                    else None,
+                    "latest_encrypted_message": meta["encrypted_message"],
+                }
+            )
 
         items.sort(key=lambda x: x["latest_timestamp"] or "", reverse=True)
         return Response(items, status=status.HTTP_200_OK)
@@ -611,8 +699,8 @@ def get_conversation(request, other_id: int):
         after = _tzsafe_parse(request.GET.get("after"))
 
         qs = ChatMessage.objects.filter(
-            Q(sender=request.user, receiver=other) |
-            Q(sender=other, receiver=request.user)
+            Q(sender=request.user, receiver=other)
+            | Q(sender=other, receiver=request.user)
         )
         if after:
             qs = qs.filter(timestamp__gt=after)
@@ -625,23 +713,32 @@ def get_conversation(request, other_id: int):
         try:
             page_obj = paginator.page(page)
         except EmptyPage:
-            return Response({
-                "results": [],
-                "next_page": None,
-                "prev_page": None,
-                "count": paginator.count,
-            }, status=status.HTTP_200_OK)
+            return Response(
+                {
+                    "results": [],
+                    "next_page": None,
+                    "prev_page": None,
+                    "count": paginator.count,
+                },
+                status=status.HTTP_200_OK,
+            )
 
-        items = [_serialize_message_for_requester(m, request.user.id) for m in page_obj.object_list]
+        items = [
+            _serialize_message_for_requester(m, request.user.id)
+            for m in page_obj.object_list
+        ]
         next_page = page + 1 if page_obj.has_next() else None
         prev_page = page - 1 if page_obj.has_previous() else None
 
-        return Response({
-            "results": items,
-            "next_page": next_page,
-            "prev_page": prev_page,
-            "count": paginator.count,
-        }, status=status.HTTP_200_OK)
+        return Response(
+            {
+                "results": items,
+                "next_page": next_page,
+                "prev_page": prev_page,
+                "count": paginator.count,
+            },
+            status=status.HTTP_200_OK,
+        )
     except Exception as e:
         print("❌ get_conversation error:", e)
         return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
@@ -653,7 +750,9 @@ def mark_message_read(request):
     print("🚀 Mark Message Read API Hit!")
     message_id = request.data.get("message_id")
     if not message_id:
-        return Response({"error": "Message ID is required"}, status=status.HTTP_400_BAD_REQUEST)
+        return Response(
+            {"error": "Message ID is required"}, status=status.HTTP_400_BAD_REQUEST
+        )
 
     try:
         message = ChatMessage.objects.get(id=message_id, receiver=request.user)
@@ -676,7 +775,10 @@ def mark_messages_read_batch(request):
     print("🚀 Mark Messages Read BATCH API Hit!")
     ids = request.data.get("ids") or []
     if not isinstance(ids, list) or not ids:
-        return Response({"error": "ids must be a non-empty list"}, status=status.HTTP_400_BAD_REQUEST)
+        return Response(
+            {"error": "ids must be a non-empty list"},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
     try:
         updated = ChatMessage.objects.filter(
             id__in=ids, receiver=request.user, is_read=False
@@ -712,13 +814,19 @@ def send_message(request):
         enc_msg = data.get("encrypted_message")
         iv = data.get("iv")
         mac = data.get("mac")
-        enc_key_recv = data.get("encrypted_key") or data.get("encrypted_key_for_receiver")
-        enc_key_sender = data.get("encrypted_key_sender") or data.get("encrypted_key_for_sender")
+        enc_key_recv = data.get("encrypted_key") or data.get(
+            "encrypted_key_for_receiver"
+        )
+        enc_key_sender = data.get("encrypted_key_sender") or data.get(
+            "encrypted_key_for_sender"
+        )
 
         if not all([receiver_id, enc_msg, iv, mac, enc_key_recv]):
             return Response(
-                {"error": "receiver_id, encrypted_message, iv, mac, and encrypted_key (receiver) are required"},
-                status=status.HTTP_400_BAD_REQUEST
+                {
+                    "error": "receiver_id, encrypted_message, iv, mac, and encrypted_key (receiver) are required"
+                },
+                status=status.HTTP_400_BAD_REQUEST,
             )
 
         try:
@@ -755,11 +863,21 @@ def wallet_balance(request):
     GET /wallet/balance/
     """
     me = request.user
-    return Response({
-        "address": me.wallet_address,
-        "balance": float(getattr(me, "esc_balance", 0.0)),
-        "pending": False,
-    }, status=status.HTTP_200_OK)
+    balance = Decimal(getattr(me, "esc_balance", 0) or 0)
+    # For now: fixed reference price; later, wire to on-chain or econ config.
+    price_usd = Decimal(str(getattr(settings, "ESC_PRICE_USD", "0.10")))
+    value_usd = balance * price_usd
+
+    return Response(
+        {
+            "address": me.wallet_address,
+            "balance": float(balance),
+            "price_usd": float(price_usd),
+            "value_usd": float(value_usd),
+            "pending": False,
+        },
+        status=status.HTTP_200_OK,
+    )
 
 
 @api_view(["GET"])
@@ -773,10 +891,263 @@ def check_balance(request, wallet_address):
         user = User.objects.filter(wallet_address=wallet_address).first()
         if not user:
             return Response({"error": "Wallet not found"}, status=status.HTTP_404_NOT_FOUND)
-        return Response({"wallet": wallet_address, "balance": float(getattr(user, "esc_balance", 0.0))}, status=status.HTTP_200_OK)
+        return Response(
+            {
+                "wallet": wallet_address,
+                "balance": float(getattr(user, "esc_balance", 0.0)),
+            },
+            status=status.HTTP_200_OK,
+        )
     except Exception as e:
         print(f"❌ ERROR Fetching Balance: {e}")
         return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def wallet_transactions(request):
+    """
+    GET /wallet/transactions/?limit=50
+    Simple transaction history for the authenticated user.
+    """
+    me = request.user
+    try:
+        limit = int(request.GET.get("limit", 50))
+    except ValueError:
+        limit = 50
+    limit = max(1, min(limit, 200))
+
+    qs = (
+        Transaction.objects.filter(Q(sender=me) | Q(receiver=me))
+        .select_related("sender", "receiver")
+        .order_by("-created_at")[:limit]
+    )
+
+    items = []
+    for tx in qs:
+        direction = "outgoing" if tx.sender_id == me.id else "incoming"
+        other = tx.receiver if direction == "outgoing" else tx.sender
+
+        # There should be at most one booking tied to this tx
+        booking = Booking.objects.filter(transaction=tx).select_related(
+            "service"
+        ).first()
+
+        items.append(
+            {
+                "id": tx.id,
+                "direction": direction,
+                "tx_type": getattr(tx, "tx_type", "payment"),
+                "status": tx.status,
+                "amount": float(tx.amount),
+                "price_usd": float(getattr(tx, "price_usd", Decimal("0"))),
+                "amount_usd": float(getattr(tx, "amount_usd", Decimal("0"))),
+                "memo": getattr(tx, "memo", "") or "",
+                "created_at": tx.created_at.isoformat() if tx.created_at else None,
+                "other_user": {
+                    "id": other.id if other else None,
+                    "first_name": getattr(other, "first_name", "") if other else "",
+                    "last_name": getattr(other, "last_name", "") if other else "",
+                    "email": getattr(other, "email", "") if other else "",
+                }
+                if other
+                else None,
+                "booking": {
+                    "id": booking.id,
+                    "service_title": booking.service.title
+                    if booking and booking.service
+                    else "",
+                    "start_at": booking.start_at.isoformat()
+                    if booking and booking.start_at
+                    else None,
+                }
+                if booking
+                else None,
+            }
+        )
+
+    return Response({"results": items}, status=status.HTTP_200_OK)
+
+
+@api_view(["POST"])
+@permission_classes([IsAuthenticated])
+def wallet_pay(request):
+    """
+    POST /wallet/pay/
+    Body:
+      {
+        "booking_id": <int>,
+        "amount": <esc_amount>,   # or "amount_esc"
+        "memo": "optional note"
+      }
+
+    - Only the client for the booking can pay.
+    - Booking must be COMPLETED by the provider.
+    - Moves esc_balance from client -> provider.
+    - Creates Transaction + WalletActivity + ties to Booking.
+    """
+    me = request.user
+    data = request.data or {}
+    booking_id = data.get("booking_id")
+    raw_amount = data.get("amount") or data.get("amount_esc")
+    memo = (data.get("memo") or "").strip()
+
+    if not booking_id or raw_amount is None:
+        return Response(
+            {"error": "booking_id and amount are required"},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    try:
+        amount = Decimal(str(raw_amount))
+    except Exception:
+        return Response(
+            {"error": "amount must be numeric"}, status=status.HTTP_400_BAD_REQUEST
+        )
+
+    if amount <= 0:
+        return Response(
+            {"error": "amount must be positive"}, status=status.HTTP_400_BAD_REQUEST
+        )
+
+    try:
+        booking = Booking.objects.select_related(
+            "service", "provider", "client"
+        ).get(id=booking_id)
+    except Booking.DoesNotExist:
+        return Response({"error": "Booking not found"}, status=status.HTTP_404_NOT_FOUND)
+
+    if booking.client_id != me.id:
+        return Response(
+            {"error": "Only the client for this booking can pay"},
+            status=status.HTTP_403_FORBIDDEN,
+        )
+
+    if booking.status != Booking.Status.COMPLETED:
+        return Response(
+            {
+                "error": "Booking must be completed before payment",
+                "current_status": booking.status,
+            },
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    expected = (
+        booking.price_snapshot
+        if booking.price_snapshot is not None
+        else booking.service.price
+    )
+    if expected is not None and amount != expected:
+        return Response(
+            {
+                "error": "Payment amount must match booking price",
+                "expected_amount": float(expected),
+            },
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    provider = booking.provider
+
+    # For now: fixed “neighborhood reference price”
+    price_usd = Decimal(str(getattr(settings, "ESC_PRICE_USD", "0.10")))
+    amount_usd = amount * price_usd
+
+    with db_transaction.atomic():
+        me.refresh_from_db()
+        provider.refresh_from_db()
+
+        current_balance = Decimal(getattr(me, "esc_balance", 0) or 0)
+        provider_balance = Decimal(getattr(provider, "esc_balance", 0) or 0)
+
+        if current_balance < amount:
+            return Response(
+                {
+                    "error": "Insufficient ESC balance",
+                    "current_balance": float(current_balance),
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        # Move ESC
+        me.esc_balance = current_balance - amount
+        provider.esc_balance = provider_balance + amount
+        me.save(update_fields=["esc_balance"])
+        provider.save(update_fields=["esc_balance"])
+
+        # Create Transaction record
+        tx = Transaction.objects.create(
+            sender=me,
+            receiver=provider,
+            amount=amount,
+            status="completed",
+            tx_type="payment",
+            price_usd=price_usd,
+            amount_usd=amount_usd,
+            memo=(
+                memo
+                or f"Payment for {booking.service.title} on {booking.start_at:%Y-%m-%d %I:%M %p}"
+            ),
+        )
+
+        # Link booking to tx + mark paid_at
+        booking.transaction = tx
+        booking.paid_at = timezone.now()
+        booking.updated_at = booking.paid_at
+        booking.save(update_fields=["transaction", "paid_at", "updated_at"])
+
+        # WalletActivity logs
+        WalletActivity.objects.create(
+            user=me,
+            activity_type="transfer",
+            amount=-amount,
+            transaction_hash=str(tx.id),
+        )
+        WalletActivity.objects.create(
+            user=provider,
+            activity_type="transfer",
+            amount=amount,
+            transaction_hash=str(tx.id),
+        )
+
+    # Email receipt to provider (best-effort; won't break tx if this fails)
+    try:
+        if provider.email:
+            subject = f"[ESC] Payment received: {amount} ESC"
+            lines = [
+                f"Hi {provider.first_name or provider.email},",
+                "",
+                f"You just received {amount} ESC (~${amount_usd} at time of payment).",
+                "",
+                f"From: {me.first_name or me.email}",
+                f"Service: {booking.service.title}",
+                f"When: {booking.start_at:%Y-%m-%d %I:%M %p}",
+                "",
+                f"Memo: {memo or '(none)'}",
+            ]
+            send_mail(
+                subject,
+                "\n".join(lines),
+                getattr(
+                    settings,
+                    "DEFAULT_FROM_EMAIL",
+                    "no-reply@eastsidecoin.app",
+                ),
+                [provider.email],
+                fail_silently=True,
+            )
+    except Exception as e:
+        print("⚠️ send_mail error in wallet_pay:", e)
+
+    return Response(
+        {
+            "tx_id": tx.id,
+            "amount": float(tx.amount),
+            "amount_usd": float(tx.amount_usd),
+            "sender_balance": float(me.esc_balance),
+            "receiver_balance": float(provider.esc_balance),
+        },
+        status=status.HTTP_201_CREATED,
+    )
 
 
 # ===========================
@@ -848,15 +1219,26 @@ def services_list_create(request):
         try:
             page_obj = paginator.page(page)
         except EmptyPage:
-            return Response({"results": [], "next_page": None, "prev_page": None, "count": 0}, status=200)
+            return Response(
+                {
+                    "results": [],
+                    "next_page": None,
+                    "prev_page": None,
+                    "count": 0,
+                },
+                status=200,
+            )
 
         items = [_serialize_service(s) for s in page_obj.object_list]
-        return Response({
-            "results": items,
-            "next_page": page + 1 if page_obj.has_next() else None,
-            "prev_page": page - 1 if page_obj.has_previous() else None,
-            "count": paginator.count,
-        }, status=200)
+        return Response(
+            {
+                "results": items,
+                "next_page": page + 1 if page_obj.has_next() else None,
+                "prev_page": page - 1 if page_obj.has_previous() else None,
+                "count": paginator.count,
+            },
+            status=200,
+        )
 
     # POST (create)
     data = request.data
@@ -866,7 +1248,10 @@ def services_list_create(request):
     price_raw = data.get("price")
 
     if not title or not description or price_raw in (None, ""):
-        return Response({"error": "title, description, and price are required"}, status=400)
+        return Response(
+            {"error": "title, description, and price are required"},
+            status=400,
+        )
 
     try:
         price = Decimal(str(price_raw))
@@ -913,7 +1298,7 @@ def services_detail(request, service_id: int):
     if "title" in data:
         s.title = (data.get("title") or s.title or "").strip()[:255]
     if "description" in data:
-        s.description = (data.get("description") or s.description or "")
+        s.description = data.get("description") or s.description or ""
     if "category" in data:
         s.category = (data.get("category") or s.category or "Other").strip()[:100]
     if "price" in data:
@@ -935,7 +1320,11 @@ def my_services(request):
     """
     GET /services/mine/
     """
-    qs = Service.objects.filter(user=request.user).select_related("user").order_by("-created_at", "-id")
+    qs = (
+        Service.objects.filter(user=request.user)
+        .select_related("user")
+        .order_by("-created_at", "-id")
+    )
     return Response([_serialize_service(s) for s in qs], status=200)
 
 
@@ -956,7 +1345,9 @@ def _serialize_booking(b: Booking):
         "start_at": b.start_at.isoformat(),
         "end_at": b.end_at.isoformat(),
         "status": b.status,
-        "price_snapshot": float(b.price_snapshot) if b.price_snapshot is not None else None,
+        "price_snapshot": float(b.price_snapshot)
+        if b.price_snapshot is not None
+        else None,
         "currency": b.currency,
         "transaction_id": b.transaction_id,
         "notes": b.notes or "",
@@ -965,6 +1356,7 @@ def _serialize_booking(b: Booking):
         "updated_at": b.updated_at.isoformat(),
         "cancelled_at": b.cancelled_at.isoformat() if b.cancelled_at else None,
         "completed_at": b.completed_at.isoformat() if b.completed_at else None,
+        "paid_at": b.paid_at.isoformat() if b.paid_at else None,
     }
 
 
@@ -994,7 +1386,9 @@ def bookings_list_create(request):
         notes = (data.get("note") or data.get("notes") or "").strip()[:500]
 
         if not all([service_id, start_at, end_at]):
-            return Response({"error": "service_id, start_at, end_at are required"}, status=400)
+            return Response(
+                {"error": "service_id, start_at, end_at are required"}, status=400
+            )
         if end_at <= start_at:
             return Response({"error": "end_at must be after start_at"}, status=400)
 
@@ -1006,10 +1400,15 @@ def bookings_list_create(request):
         provider = service.user
         client = request.user
         if provider.id == client.id:
-            return Response({"error": "You cannot book your own service"}, status=400)
+            return Response(
+                {"error": "You cannot book your own service"}, status=400
+            )
 
         if _provider_has_conflict(provider.id, start_at, end_at):
-            return Response({"error": "Time window conflicts with an existing booking"}, status=409)
+            return Response(
+                {"error": "Time window conflicts with an existing booking"},
+                status=409,
+            )
 
         b = Booking.objects.create(
             service=service,
@@ -1055,22 +1454,35 @@ def bookings_list_create(request):
     try:
         page_obj = paginator.page(page)
     except EmptyPage:
-        return Response({"results": [], "next_page": None, "prev_page": None, "count": 0}, status=200)
+        return Response(
+            {
+                "results": [],
+                "next_page": None,
+                "prev_page": None,
+                "count": 0,
+            },
+            status=200,
+        )
 
     items = [_serialize_booking(b) for b in page_obj.object_list]
-    return Response({
-        "results": items,
-        "next_page": page + 1 if page_obj.has_next() else None,
-        "prev_page": page - 1 if page_obj.has_previous() else None,
-        "count": paginator.count,
-    }, status=200)
+    return Response(
+        {
+            "results": items,
+            "next_page": page + 1 if page_obj.has_next() else None,
+            "prev_page": page - 1 if page_obj.has_previous() else None,
+            "count": paginator.count,
+        },
+        status=200,
+    )
 
 
 def _mutate_booking(me: User, b: Booking, action: str, new_notes: str):
     now = timezone.now()
 
     if new_notes:
-        b.notes = (new_notes if not b.notes else (b.notes + "\n" + new_notes))[:2000]
+        b.notes = (
+            new_notes if not b.notes else (b.notes + "\n" + new_notes)
+        )[:2000]
 
     action = (action or "").lower().strip()
     if action == "confirm":
@@ -1078,8 +1490,12 @@ def _mutate_booking(me: User, b: Booking, action: str, new_notes: str):
             return {"error": "Only provider can confirm"}, 403
         if b.status != Booking.Status.PENDING:
             return {"error": f"Cannot confirm from status {b.status}"}, 400
-        if _provider_has_conflict(b.provider_id, b.start_at, b.end_at, exclude_id=b.id):
-            return {"error": "Time window conflicts with another booking"}, 409
+        if _provider_has_conflict(
+            b.provider_id, b.start_at, b.end_at, exclude_id=b.id
+        ):
+            return {
+                "error": "Time window conflicts with another booking"
+            }, 409
         b.mark_confirmed()
         b.save()
         return _serialize_booking(b), 200
@@ -1097,7 +1513,10 @@ def _mutate_booking(me: User, b: Booking, action: str, new_notes: str):
     if action == "cancel":
         if me.id not in (b.client_id, b.provider_id):
             return {"error": "Only client or provider can cancel"}, 403
-        if b.status not in [Booking.Status.PENDING, Booking.Status.CONFIRMED]:
+        if b.status not in [
+            Booking.Status.PENDING,
+            Booking.Status.CONFIRMED,
+        ]:
             return {"error": f"Cannot cancel from status {b.status}"}, 400
         b.mark_cancelled()
         b.save()
@@ -1123,7 +1542,9 @@ def bookings_detail(request, booking_id: int):
     PATCH /bookings/<id>/ { action: confirm|reject|cancel|complete, note?/notes? }
     """
     try:
-        b = Booking.objects.select_related("service", "provider", "client").get(id=booking_id)
+        b = Booking.objects.select_related(
+            "service", "provider", "client"
+        ).get(id=booking_id)
     except Booking.DoesNotExist:
         return Response({"error": "Booking not found"}, status=404)
 
@@ -1147,11 +1568,16 @@ def bookings_detail(request, booking_id: int):
 @permission_classes([IsAuthenticated])
 def bookings_confirm(request, booking_id: int):
     try:
-        b = Booking.objects.select_related("service", "provider", "client").get(id=booking_id)
+        b = Booking.objects.select_related(
+            "service", "provider", "client"
+        ).get(id=booking_id)
     except Booking.DoesNotExist:
         return Response({"error": "Booking not found"}, status=404)
     payload, code = _mutate_booking(
-        request.user, b, "confirm", (request.data.get("note") or request.data.get("notes") or "").strip()
+        request.user,
+        b,
+        "confirm",
+        (request.data.get("note") or request.data.get("notes") or "").strip(),
     )
     return Response(payload, status=code)
 
@@ -1160,11 +1586,16 @@ def bookings_confirm(request, booking_id: int):
 @permission_classes([IsAuthenticated])
 def bookings_reject(request, booking_id: int):
     try:
-        b = Booking.objects.select_related("service", "provider", "client").get(id=booking_id)
+        b = Booking.objects.select_related(
+            "service", "provider", "client"
+        ).get(id=booking_id)
     except Booking.DoesNotExist:
         return Response({"error": "Booking not found"}, status=404)
     payload, code = _mutate_booking(
-        request.user, b, "reject", (request.data.get("note") or request.data.get("notes") or "").strip()
+        request.user,
+        b,
+        "reject",
+        (request.data.get("note") or request.data.get("notes") or "").strip(),
     )
     return Response(payload, status=code)
 
@@ -1173,11 +1604,16 @@ def bookings_reject(request, booking_id: int):
 @permission_classes([IsAuthenticated])
 def bookings_cancel(request, booking_id: int):
     try:
-        b = Booking.objects.select_related("service", "provider", "client").get(id=booking_id)
+        b = Booking.objects.select_related(
+            "service", "provider", "client"
+        ).get(id=booking_id)
     except Booking.DoesNotExist:
         return Response({"error": "Booking not found"}, status=404)
     payload, code = _mutate_booking(
-        request.user, b, "cancel", (request.data.get("note") or request.data.get("notes") or "").strip()
+        request.user,
+        b,
+        "cancel",
+        (request.data.get("note") or request.data.get("notes") or "").strip(),
     )
     return Response(payload, status=code)
 
@@ -1186,11 +1622,16 @@ def bookings_cancel(request, booking_id: int):
 @permission_classes([IsAuthenticated])
 def bookings_complete(request, booking_id: int):
     try:
-        b = Booking.objects.select_related("service", "provider", "client").get(id=booking_id)
+        b = Booking.objects.select_related(
+            "service", "provider", "client"
+        ).get(id=booking_id)
     except Booking.DoesNotExist:
         return Response({"error": "Booking not found"}, status=404)
     payload, code = _mutate_booking(
-        request.user, b, "complete", (request.data.get("note") or request.data.get("notes") or "").strip()
+        request.user,
+        b,
+        "complete",
+        (request.data.get("note") or request.data.get("notes") or "").strip(),
     )
     return Response(payload, status=code)
 
@@ -1241,4 +1682,131 @@ def user_public_key(request, user_id: int):
         u = User.objects.only("id", "public_key").get(id=user_id)
     except User.DoesNotExist:
         return Response({"error": "User not found"}, status=404)
-    return Response({"id": u.id, "public_key": getattr(u, "public_key", None)}, status=200)
+    return Response(
+        {"id": u.id, "public_key": getattr(u, "public_key", None)}, status=200
+    )
+
+
+# ===========================
+# 📊 ESC ECONOMY STATS
+# ===========================
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def esc_stats(request):
+    """
+    GET /esc/stats/
+
+    Returns aggregate token + neighborhood metrics for the HomeScreen dashboard.
+    Uses live data from User + Transaction + Booking, with sane defaults that
+    line up with your seed_esc_demo.py simulation.
+
+    You can override many of these via Django settings, e.g.:
+
+      ESC_TOTAL_SUPPLY = 1_000_000
+      ESC_PRICE_USD = "0.10"
+      ESC_BURNED_SUPPLY = "10000"
+      ESC_FOUNDER_RESERVE_ESC = "400000"
+      ESC_TREASURY_RESERVE_ESC = "400000"
+      ESC_LP_LOCKED_USD = "2500"
+      ESC_LP_TOKENS = 500
+      ESC_STARTER_ACCOUNTS = 100
+      ESC_STARTER_PER_ACCOUNT = 100
+    """
+    try:
+        now = timezone.now()
+
+        # --- Core supply / config ---
+        total_supply = Decimal(
+            str(getattr(settings, "ESC_TOTAL_SUPPLY", "1000000"))
+        )
+        price_usd = Decimal(str(getattr(settings, "ESC_PRICE_USD", "0.10")))
+        burned_supply = Decimal(
+            str(getattr(settings, "ESC_BURNED_SUPPLY", "0"))
+        )
+
+        founder_reserve_esc = Decimal(
+            str(getattr(settings, "ESC_FOUNDER_RESERVE_ESC", "400000"))
+        )
+        treasury_reserve_esc = Decimal(
+            str(getattr(settings, "ESC_TREASURY_RESERVE_ESC", "400000"))
+        )
+
+        starter_accounts = int(getattr(settings, "ESC_STARTER_ACCOUNTS", 100))
+        starter_per_account = int(getattr(settings, "ESC_STARTER_PER_ACCOUNT", 100))
+        starter_allocation_esc = starter_accounts * starter_per_account
+
+        # --- Circulating + holders from user balances ---
+        user_qs = User.objects.all()
+        circulating_supply = (
+            user_qs.aggregate(total=Sum("esc_balance"))["total"] or Decimal("0")
+        )
+        holders = user_qs.filter(esc_balance__gt=0).count()
+
+        # --- 24h TX stats from Transaction table ---
+        since = now - timedelta(days=1)
+        tx_qs = Transaction.objects.filter(created_at__gte=since)
+        tx_24h = tx_qs.count()
+        volume_24h_esc = tx_qs.aggregate(total=Sum("amount"))["total"] or Decimal("0")
+        volume_24h_usd = volume_24h_esc * price_usd
+
+        # --- LP / pool metrics (from settings or defaults) ---
+        lp_locked_usd = Decimal(str(getattr(settings, "ESC_LP_LOCKED_USD", "2500")))
+        lp_tokens = int(getattr(settings, "ESC_LP_TOKENS", 500))
+
+        # --- Market cap from circulating * price ---
+        market_cap_usd = price_usd * circulating_supply if circulating_supply > 0 else Decimal(
+            "0"
+        )
+
+        # --- Undistributed supply (all reserves + burned + circulating <= total) ---
+        circ_plus_res = (
+            circulating_supply
+            + burned_supply
+            + founder_reserve_esc
+            + treasury_reserve_esc
+        )
+        undistributed_supply = max(total_supply - circ_plus_res, Decimal("0"))
+
+        # --- Simple simulated price history if none provided in settings ---
+        settings_history = getattr(settings, "ESC_PRICE_HISTORY", None)
+        if settings_history and isinstance(settings_history, (list, tuple)):
+            price_history = [float(x) for x in settings_history]
+        else:
+            # Mirror the sim path in HomeScreen: ramp to current price
+            price_history = [
+                0.03,
+                0.04,
+                0.05,
+                0.06,
+                0.07,
+                0.09,
+                float(price_usd),
+            ]
+
+        payload = {
+            "total_supply": float(total_supply),
+            "circulating_supply": float(circulating_supply),
+            "burned_supply": float(burned_supply),
+            "holders": holders,
+            "price_usd": float(price_usd),
+            "price_usdc": float(price_usd),  # assuming 1:1 peg in sim
+            "market_cap_usd": float(market_cap_usd),
+            "tx_24h": tx_24h,
+            "volume_24h_esc": float(volume_24h_esc),
+            "volume_24h_usd": float(volume_24h_usd),
+            "lp_locked_usd": float(lp_locked_usd),
+            "lp_tokens": lp_tokens,
+            "starter_accounts": starter_accounts,
+            "starter_per_account": starter_per_account,
+            "starter_allocation_esc": float(starter_allocation_esc),
+            "founder_reserve_esc": float(founder_reserve_esc),
+            "treasury_reserve_esc": float(treasury_reserve_esc),
+            "undistributed_supply": float(undistributed_supply),
+            "price_history": price_history,
+        }
+
+        return Response(payload, status=200)
+    except Exception as e:
+        print("❌ esc_stats error:", e)
+        # Frontend will fall back to sim if this fails
+        return Response({"error": str(e)}, status=500)

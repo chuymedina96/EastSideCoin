@@ -18,12 +18,14 @@ import {
   RefreshControl,
   Animated,
   Easing,
-  Alert,
+  Dimensions,
 } from "react-native";
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import { SafeAreaView } from "react-native-safe-area-context";
+import { useNavigation } from "@react-navigation/native";
+import { LineChart } from "react-native-chart-kit";
 import { AuthContext } from "../context/AuthProvider";
-import { listServices } from "../utils/api"; // ✅ pulls marketplace items
+import { listServices, listBookings, api } from "../utils/api"; // ✅ services + bookings + wallet + ESC stats
 
 // 60617 (South Chicago / East Side / South Deering nearby)
 const ZIP_60617_LAT = 41.7239;
@@ -46,15 +48,44 @@ const BRIDGES = [
 const QUOTES = [
   { a: "Martin Luther King Jr.", q: "The time is always right to do what is right." },
   { a: "Malcolm X", q: "The future belongs to those who prepare for it today." },
-  { a: "Angela Davis", q: "I am no longer accepting the things I cannot change. I am changing the things I cannot accept." },
-  { a: "Fred Hampton", q: "We’re going to fight racism not with racism, but we’re going to fight with solidarity." },
+  {
+    a: "Angela Davis",
+    q: "I am no longer accepting the things I cannot change. I am changing the things I cannot accept.",
+  },
+  {
+    a: "Fred Hampton",
+    q: "We’re going to fight racism not with racism, but we’re going to fight with solidarity.",
+  },
   { a: "Fannie Lou Hamer", q: "Nobody’s free until everybody’s free." },
-  { a: "James Baldwin", q: "Not everything that is faced can be changed, but nothing can be changed until it is faced." },
+  {
+    a: "James Baldwin",
+    q: "Not everything that is faced can be changed, but nothing can be changed until it is faced.",
+  },
   { a: "Assata Shakur", q: "A wall is just a wall and nothing more at all. It can be broken down." },
   { a: "Audre Lorde", q: "Your silence will not protect you." },
   { a: "Dolores Huerta", q: "Sí, se puede." },
-  { a: "César Chávez", q: "We cannot seek achievement for ourselves and forget about progress and prosperity for our community." },
+  {
+    a: "César Chávez",
+    q: "We cannot seek achievement for ourselves and forget about progress and prosperity for our community.",
+  },
 ];
+
+const { width: SCREEN_WIDTH } = Dimensions.get("window");
+
+const priceChartConfig = {
+  backgroundColor: "#1b1b1f",
+  backgroundGradientFrom: "#1b1b1f",
+  backgroundGradientTo: "#1b1b1f",
+  decimalPlaces: 2,
+  color: (opacity = 1) => `rgba(255, 215, 0, ${opacity})`,
+  labelColor: (opacity = 1) => `rgba(200, 200, 210, ${opacity})`,
+  propsForDots: {
+    r: "3",
+  },
+  propsForBackgroundLines: {
+    strokeDasharray: "3,6",
+  },
+};
 
 // Daily hash to keep quote stable per day
 function pickDailyQuote(dateStr) {
@@ -64,8 +95,18 @@ function pickDailyQuote(dateStr) {
   return QUOTES[idx];
 }
 
+// normalize helper used by dashboard
+const normalizeBookings = (data) => {
+  if (Array.isArray(data)) return data;
+  if (Array.isArray(data?.results)) return data.results;
+  if (Array.isArray(data?.data)) return data.data;
+  if (Array.isArray(data?.bookings)) return data.bookings;
+  return [];
+};
+
 const HomeScreen = () => {
   const { user } = useContext(AuthContext);
+  const navigation = useNavigation();
 
   const [greeting, setGreeting] = useState("Welcome");
   const [weather, setWeather] = useState(null);
@@ -84,6 +125,12 @@ const HomeScreen = () => {
   const [score, setScore] = useState(0);
   const [streak, setStreak] = useState(0);
   const coinAnim = useRef(new Animated.Value(0)).current;
+
+  // Dashboard / economy metrics
+  const [econ, setEcon] = useState(null);
+  const [econLoading, setEconLoading] = useState(false);
+  const [econError, setEconError] = useState("");
+  const [econExpanded, setEconExpanded] = useState(false); // 🔻 dropdown toggle
 
   // Animations
   const fadeIn = useRef(new Animated.Value(0)).current;
@@ -179,7 +226,10 @@ const HomeScreen = () => {
         const pm25 = json?.hourly?.pm2_5?.[i];
         const pm10 = json?.hourly?.pm10?.[i];
         setAir({ aqi, pm25, pm10 });
-        await AsyncStorage.setItem("home_air_cache", JSON.stringify({ aqi, pm25, pm10, t: Date.now() }));
+        await AsyncStorage.setItem(
+          "home_air_cache",
+          JSON.stringify({ aqi, pm25, pm10, t: Date.now() })
+        );
       } else {
         setAir(null);
       }
@@ -288,21 +338,30 @@ const HomeScreen = () => {
     if (raw) {
       const { score: s = 0, streak: st = 0, lastDate = "" } = JSON.parse(raw) || {};
       const today = new Date().toISOString().slice(0, 10);
-      const newStreak = lastDate === today ? st : (lastDate ? st + 1 : 1);
+      const newStreak = lastDate === today ? st : lastDate ? st + 1 : 1;
       setScore(s);
       setStreak(newStreak);
-      await AsyncStorage.setItem("home_coin_game", JSON.stringify({ score: s, streak: newStreak, lastDate: today }));
+      await AsyncStorage.setItem(
+        "home_coin_game",
+        JSON.stringify({ score: s, streak: newStreak, lastDate: today })
+      );
     } else {
       const today = new Date().toISOString().slice(0, 10);
       setScore(0);
       setStreak(1);
-      await AsyncStorage.setItem("home_coin_game", JSON.stringify({ score: 0, streak: 1, lastDate: today }));
+      await AsyncStorage.setItem(
+        "home_coin_game",
+        JSON.stringify({ score: 0, streak: 1, lastDate: today })
+      );
     }
   }, []);
 
   const saveGame = useCallback(async (s, st) => {
     const today = new Date().toISOString().slice(0, 10);
-    await AsyncStorage.setItem("home_coin_game", JSON.stringify({ score: s, streak: st, lastDate: today }));
+    await AsyncStorage.setItem(
+      "home_coin_game",
+      JSON.stringify({ score: s, streak: st, lastDate: today })
+    );
   }, []);
 
   const tapCoin = useCallback(() => {
@@ -322,6 +381,215 @@ const HomeScreen = () => {
   const coinScale = coinAnim.interpolate({ inputRange: [0, 1], outputRange: [1, 1.16] });
   const coinUp = coinAnim.interpolate({ inputRange: [0, 1], outputRange: [0, -4] });
 
+  // ---------- ECONOMY DASHBOARD ----------
+  const loadEconomy = useCallback(async () => {
+    setEconLoading(true);
+    setEconError("");
+    try {
+      const now = new Date();
+      const fromDate = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000);
+      const fromISO = fromDate.toISOString().slice(0, 10) + "T00:00:00";
+      const toISO = now.toISOString();
+
+      const [walletPayload, providerRes, clientRes, servicesRes, escStatsPayload] =
+        await Promise.all([
+          api.get("/wallet/balance/").catch(() => ({})),
+          listBookings({
+            role: "provider",
+            status: "completed",
+            from: fromISO,
+            to: toISO,
+            limit: 200,
+            page: 1,
+          }).catch(() => []),
+          listBookings({
+            role: "client",
+            status: "completed",
+            from: fromISO,
+            to: toISO,
+            limit: 200,
+            page: 1,
+          }).catch(() => []),
+          listServices({ limit: 500 }).catch(() => []),
+          api.get("/esc/stats/").catch(() => null), // ✅ pulls from ESC stats endpoint
+        ]);
+
+      const walletBalance = Number(walletPayload?.balance ?? 0);
+
+      const providerBookings = normalizeBookings(providerRes);
+      const clientBookings = normalizeBookings(clientRes);
+
+      const earnedAsProvider = providerBookings.reduce(
+        (sum, b) => sum + Number(b.price_snapshot ?? 0),
+        0
+      );
+      const spentAsClient = clientBookings.reduce(
+        (sum, b) => sum + Number(b.price_snapshot ?? 0),
+        0
+      );
+
+      const allCompleted = [...providerBookings, ...clientBookings];
+      const totalVolume = allCompleted.reduce(
+        (sum, b) => sum + Number(b.price_snapshot ?? 0),
+        0
+      );
+      const avgBookingPrice =
+        allCompleted.length > 0 ? totalVolume / allCompleted.length : 0;
+
+      const svcList = Array.isArray(servicesRes?.results)
+        ? servicesRes.results
+        : Array.isArray(servicesRes)
+        ? servicesRes
+        : [];
+      const totalServices = svcList.length;
+      const foodServices = svcList.filter((s) =>
+        (s.category || "").toLowerCase().includes("food")
+      ).length;
+
+      // ---- token / on-chain style stats (from /esc/stats/) ----
+      let stats = escStatsPayload || {};
+
+      // 🔸 Seed sim if backend not ready
+      if (!stats || Object.keys(stats).length === 0) {
+        const starterAccounts = 100;
+        const starterPerAccount = 100;
+        const starterAllocationESC = starterAccounts * starterPerAccount; // 10,000 ESC
+
+        const totalSupplySim = 1_000_000;
+        const circulatingSim = 50_000;
+        const founderReserveSim = 400_000;
+        const treasuryReserveSim = 400_000;
+        const burnedSim = 10_000;
+        const circPlusRes =
+          circulatingSim + founderReserveSim + treasuryReserveSim + burnedSim;
+        const undistributedSim = Math.max(totalSupplySim - circPlusRes, 0);
+
+        const priceSim = 0.1; // $0.10 / ESC
+        const volume24hESC = 5000;
+        const tx24h = 120;
+        const lpLockedUSD = 2500;
+        const lpTokens = 500;
+
+        const priceHistory = [0.03, 0.04, 0.05, 0.06, 0.07, 0.09, 0.1];
+
+        stats = {
+          total_supply: totalSupplySim,
+          circulating_supply: circulatingSim,
+          burned_supply: burnedSim,
+          holders: starterAccounts,
+          price_usd: priceSim,
+          price_usdc: priceSim,
+          market_cap_usd: priceSim * circulatingSim,
+          tx_24h: tx24h,
+          volume_24h_esc: volume24hESC,
+          volume_24h_usd: volume24hESC * priceSim,
+          lp_locked_usd: lpLockedUSD,
+          lp_tokens: lpTokens,
+          starter_accounts: starterAccounts,
+          starter_per_account: starterPerAccount,
+          starter_allocation_esc: starterAllocationESC,
+          founder_reserve_esc: founderReserveSim,
+          treasury_reserve_esc: treasuryReserveSim,
+          undistributed_supply: undistributedSim,
+          price_history: priceHistory,
+        };
+      }
+
+      const totalSupply = Number(stats.total_supply ?? stats.totalSupply ?? 0);
+      const circulatingSupply = Number(
+        stats.circulating_supply ?? stats.circulating ?? stats.circulatingSupply ?? 0
+      );
+      const burnedSupply = Number(stats.burned_supply ?? stats.burned ?? 0);
+      const holders = Number(stats.holders ?? stats.unique_holders ?? 0);
+
+      const priceUSD = Number(stats.price_usd ?? stats.priceUsd ?? stats.price ?? 0);
+      const priceUSDC =
+        Number(stats.price_usdc ?? stats.priceUsdc ?? 0) || priceUSD;
+
+      const marketCapUSD = Number(
+        stats.market_cap_usd ??
+          stats.marketCapUsd ??
+          (priceUSD && circulatingSupply ? priceUSD * circulatingSupply : 0)
+      );
+
+      const tx24h = Number(stats.tx_24h ?? stats.transactions_24h ?? 0);
+      const volume24hESC = Number(stats.volume_24h_esc ?? stats.volume24hEsc ?? 0);
+      const volume24hUSD = Number(stats.volume_24h_usd ?? stats.volume24hUsd ?? 0);
+
+      const lpLockedUSD = Number(stats.lp_locked_usd ?? stats.lpLockedUsd ?? 0);
+      const lpTokens = Number(stats.lp_tokens ?? stats.lpTokens ?? 0);
+
+      const starterAccounts =
+        Number(stats.starter_accounts ?? stats.starterAccounts ?? 0) || 0;
+      const starterPerAccount =
+        Number(stats.starter_per_account ?? stats.starterPerAccount ?? 0) || 0;
+      const starterAllocationESC =
+        Number(stats.starter_allocation_esc ?? stats.starterAllocationEsc ?? 0) || 0;
+
+      const founderReserveESC = Number(
+        stats.founder_reserve_esc ?? stats.founderReserveEsc ?? 0
+      );
+      const treasuryReserveESC = Number(
+        stats.treasury_reserve_esc ?? stats.treasuryReserveEsc ?? 0
+      );
+      const undistributedSupply = Number(
+        stats.undistributed_supply ?? stats.undistributedSupply ?? 0
+      );
+
+      const priceHistory = Array.isArray(stats.price_history ?? stats.priceHistory)
+        ? stats.price_history ?? stats.priceHistory
+        : [];
+
+      const founderReserveUSD = priceUSD * founderReserveESC;
+      const treasuryReserveUSD = priceUSD * treasuryReserveESC;
+
+      const circulatingPct =
+        totalSupply > 0 ? (circulatingSupply / totalSupply) * 100 : null;
+
+      setEcon({
+        // on-chain style token stats
+        totalSupply,
+        circulatingSupply,
+        burnedSupply,
+        holders,
+        priceUSD,
+        priceUSDC,
+        marketCapUSD,
+        tx24h,
+        volume24hESC,
+        volume24hUSD,
+        lpLockedUSD,
+        lpTokens,
+        circulatingPct,
+        starterAccounts,
+        starterPerAccount,
+        starterAllocationESC,
+        founderReserveESC,
+        founderReserveUSD,
+        treasuryReserveESC,
+        treasuryReserveUSD,
+        undistributedSupply,
+        priceHistory,
+
+        // wallet + marketplace flow (last 30 days)
+        walletBalance,
+        completedAsProvider: providerBookings.length,
+        completedAsClient: clientBookings.length,
+        earnedAsProvider,
+        spentAsClient,
+        totalVolume,
+        avgBookingPrice,
+        totalServices,
+        foodServices,
+      });
+    } catch (e) {
+      console.warn("Economy load error:", e?.message || e);
+      setEconError("Couldn’t load ESC metrics right now.");
+    } finally {
+      setEconLoading(false);
+    }
+  }, []);
+
   // ---------- boot ----------
   useEffect(() => {
     (async () => {
@@ -335,16 +603,45 @@ const HomeScreen = () => {
         loadTraffic(),
         loadEscSpots(),
         loadGame(),
+        loadEconomy(), // ✅ include econ on boot
       ]);
       setLoading(false);
     })();
-  }, [loadQuote, loadWeather, loadAir, loadNews, loadBridgeInfo, loadTraffic, loadEscSpots, loadGame]);
+  }, [
+    loadQuote,
+    loadWeather,
+    loadAir,
+    loadNews,
+    loadBridgeInfo,
+    loadTraffic,
+    loadEscSpots,
+    loadGame,
+    loadEconomy,
+  ]);
 
   const onRefresh = useCallback(async () => {
     setRefreshing(true);
-    await Promise.all([loadQuote(), loadWeather(), loadAir(), loadNews(), loadBridgeInfo(), loadTraffic(), loadEscSpots()]);
+    await Promise.all([
+      loadQuote(),
+      loadWeather(),
+      loadAir(),
+      loadNews(),
+      loadBridgeInfo(),
+      loadTraffic(),
+      loadEscSpots(),
+      loadEconomy(), // ✅ refresh econ as well
+    ]);
     setRefreshing(false);
-  }, [loadQuote, loadWeather, loadAir, loadNews, loadBridgeInfo, loadTraffic, loadEscSpots]);
+  }, [
+    loadQuote,
+    loadWeather,
+    loadAir,
+    loadNews,
+    loadBridgeInfo,
+    loadTraffic,
+    loadEscSpots,
+    loadEconomy,
+  ]);
 
   // ---------- helpers ----------
   const weatherLabel = useMemo(() => {
@@ -370,6 +667,23 @@ const HomeScreen = () => {
     if (a <= 300) return { label: "Very Unhealthy", color: "#7b3dc9" };
     return { label: "Hazardous", color: "#7d0022" };
   }, [air]);
+
+  const tokenDistribution = useMemo(() => {
+    if (!econ || !econ.totalSupply) return null;
+    const total = econ.totalSupply || 1;
+    const circ = Math.max(0, econ.circulatingSupply || 0);
+    const burned = Math.max(0, econ.burnedSupply || 0);
+    const reserves = Math.max(
+      0,
+      (econ.founderReserveESC || 0) +
+        (econ.treasuryReserveESC || 0) +
+        (econ.undistributedSupply || 0)
+    );
+    const circPct = (circ / total) * 100;
+    const burnedPct = (burned / total) * 100;
+    const reservesPct = (reserves / total) * 100;
+    return { circPct, burnedPct, reservesPct, circ, burned, reserves };
+  }, [econ]);
 
   const NewsCard = ({ item, idx }) => (
     <TouchableOpacity
@@ -411,6 +725,24 @@ const HomeScreen = () => {
     day: "numeric",
   });
 
+  const fmtEsc = (n) =>
+    typeof n === "number"
+      ? n.toLocaleString(undefined, { maximumFractionDigits: 2 })
+      : "0.00";
+
+  const fmtUSD = (n) =>
+    typeof n === "number"
+      ? "$" + n.toLocaleString(undefined, { maximumFractionDigits: 2 })
+      : "$0.00";
+
+  const fmtInt = (n) =>
+    typeof n === "number" ? n.toLocaleString(undefined) : "0";
+
+  const fmtPct = (n) =>
+    typeof n === "number"
+      ? n.toLocaleString(undefined, { maximumFractionDigits: 1 }) + "%"
+      : "—";
+
   return (
     <SafeAreaView style={styles.safe}>
       {/* background accents */}
@@ -423,7 +755,11 @@ const HomeScreen = () => {
         <ScrollView
           contentContainerStyle={styles.scrollContent}
           refreshControl={
-            <RefreshControl refreshing={refreshing} onRefresh={onRefresh} tintColor="#FFD700" />
+            <RefreshControl
+              refreshing={refreshing}
+              onRefresh={onRefresh}
+              tintColor="#FFD700"
+            />
           }
         >
           {/* Header / Greeting */}
@@ -435,6 +771,292 @@ const HomeScreen = () => {
             <Text style={styles.title}>EastSide Coin</Text>
             <Text style={styles.subtleDate}>{today} • America/Chicago</Text>
           </Animated.View>
+
+          {/* ESC ECONOMY DASHBOARD (dropdown) */}
+          <View style={styles.card}>
+            <TouchableOpacity
+              style={styles.cardHeaderRow}
+              onPress={() => setEconExpanded((prev) => !prev)}
+              activeOpacity={0.8}
+            >
+              <View style={styles.headerLeft}>
+                <Text style={styles.cardHeader}>Neighborhood Economy • Dashboard</Text>
+                <Text style={styles.caret}>{econExpanded ? "▾" : "▸"}</Text>
+              </View>
+              {econLoading ? <ActivityIndicator size="small" color="#FFD700" /> : null}
+            </TouchableOpacity>
+
+            <Text style={styles.econSubtitle}>Live ESC stats + last 30 days of bookings</Text>
+            {econError ? <Text style={styles.errorText}>{econError}</Text> : null}
+
+            {econ ? (
+              <>
+                {/* Always-on mini strip so people see key stats even when collapsed */}
+                <View style={styles.collapsedRow}>
+                  <View style={styles.collapsedMetric}>
+                    <Text style={styles.metricLabel}>Price</Text>
+                    <Text style={styles.metricValueSm}>
+                      {econ.priceUSD ? fmtUSD(econ.priceUSD) : "—"}
+                    </Text>
+                  </View>
+                  <View style={styles.collapsedMetric}>
+                    <Text style={styles.metricLabel}>Accounts</Text>
+                    <Text style={styles.metricValueSm}>{fmtInt(econ.holders)}</Text>
+                  </View>
+                  <View style={styles.collapsedMetric}>
+                    <Text style={styles.metricLabel}>Mkt cap</Text>
+                    <Text style={styles.metricValueSm}>
+                      {econ.marketCapUSD ? fmtUSD(econ.marketCapUSD) : "—"}
+                    </Text>
+                  </View>
+                </View>
+
+                {econExpanded && (
+                  <>
+                    {/* On-chain style metrics */}
+                    <View style={styles.metricsGrid}>
+                      <View style={styles.metricBoxWide}>
+                        <Text style={styles.metricLabel}>Price</Text>
+                        <Text style={styles.metricValue}>
+                          {fmtUSD(econ.priceUSD)}{" "}
+                          <Text style={styles.metricTinyInline}>per ESC</Text>
+                        </Text>
+                        <Text style={styles.metricTiny}>
+                          Pair: ESC / USDC ~ {fmtUSD(econ.priceUSDC)}
+                        </Text>
+                      </View>
+
+                      <View style={styles.metricBox}>
+                        <Text style={styles.metricLabel}>Circulating supply</Text>
+                        <Text style={styles.metricValue}>
+                          {fmtInt(econ.circulatingSupply)}
+                        </Text>
+                        <Text style={styles.metricTiny}>
+                          {econ.circulatingPct != null
+                            ? fmtPct(econ.circulatingPct) + " of total"
+                            : "of total supply"}
+                        </Text>
+                      </View>
+
+                      <View style={styles.metricBox}>
+                        <Text style={styles.metricLabel}>Total / Burned</Text>
+                        <Text style={styles.metricValue}>{fmtInt(econ.totalSupply)}</Text>
+                        <Text style={styles.metricTiny}>
+                          Burned: {fmtInt(econ.burnedSupply)}
+                        </Text>
+                      </View>
+
+                      <View style={styles.metricBox}>
+                        <Text style={styles.metricLabel}>Market cap</Text>
+                        <Text style={styles.metricValue}>{fmtUSD(econ.marketCapUSD)}</Text>
+                        <Text style={styles.metricTiny}>
+                          {fmtInt(econ.holders)} holder
+                          {econ.holders === 1 ? "" : "s"}
+                        </Text>
+                      </View>
+
+                      <View style={styles.metricBox}>
+                        <Text style={styles.metricLabel}>24h activity</Text>
+                        <Text style={styles.metricValue}>{fmtInt(econ.tx24h)}</Text>
+                        <Text style={styles.metricTiny}>
+                          {fmtEsc(econ.volume24hESC)} ESC / {fmtUSD(econ.volume24hUSD)}
+                        </Text>
+                      </View>
+
+                      <View style={styles.metricBox}>
+                        <Text style={styles.metricLabel}>LP locked</Text>
+                        <Text style={styles.metricValue}>{fmtUSD(econ.lpLockedUSD)}</Text>
+                        <Text style={styles.metricTiny}>
+                          LP tokens: {fmtInt(econ.lpTokens)}
+                        </Text>
+                      </View>
+                    </View>
+
+                    {/* Reserve callout for your 400k */}
+                    {econ.founderReserveESC ? (
+                      <View style={styles.reserveRow}>
+                        <Text style={styles.reserveLabel}>
+                          Your 400k reserve (off-market stabilizer)
+                        </Text>
+                        <Text style={styles.reserveValue}>
+                          {fmtEsc(econ.founderReserveESC)} ESC ·{" "}
+                          {fmtUSD(econ.founderReserveUSD)}
+                        </Text>
+                        <Text style={styles.metricTiny}>
+                          Not counted in market cap — can be dripped in later to stabilize the
+                          neighborhood economy.
+                        </Text>
+                      </View>
+                    ) : null}
+
+                    {/* Simple “chart” — price history + token distribution */}
+                    {(econ.priceHistory && econ.priceHistory.length > 1) || tokenDistribution ? (
+                      <View style={styles.chartSection}>
+                        {econ.priceHistory && econ.priceHistory.length > 1 && (
+                          <>
+                            <Text style={styles.chartTitle}>
+                              Price path to $0.10 / ESC (sim)
+                            </Text>
+                            <Text style={styles.chartSubtitle}>
+                              100 accounts trading, starter scarcity + bookings pushing price up.
+                            </Text>
+                            <LineChart
+                              data={{
+                                labels: ["D-6", "D-5", "D-4", "D-3", "D-2", "D-1", "Now"],
+                                datasets: [{ data: econ.priceHistory }],
+                              }}
+                              width={SCREEN_WIDTH - 64}
+                              height={160}
+                              chartConfig={priceChartConfig}
+                              withInnerLines={false}
+                              withOuterLines={false}
+                              bezier
+                              style={styles.chartKit}
+                            />
+                          </>
+                        )}
+
+                        {tokenDistribution && (
+                          <>
+                            <Text style={[styles.chartTitle, { marginTop: 10 }]}>
+                              Token distribution
+                            </Text>
+                            <View style={styles.chartBar}>
+                              <View
+                                style={[
+                                  styles.chartSegmentCirculating,
+                                  { flex: Math.max(tokenDistribution.circPct, 1) },
+                                ]}
+                              />
+                              <View
+                                style={[
+                                  styles.chartSegmentBurned,
+                                  { flex: Math.max(tokenDistribution.burnedPct, 0.5) },
+                                ]}
+                              />
+                              <View
+                                style={[
+                                  styles.chartSegmentTreasury,
+                                  { flex: Math.max(tokenDistribution.reservesPct, 0.5) },
+                                ]}
+                              />
+                            </View>
+                            <View style={styles.chartLegendRow}>
+                              <View style={styles.chartLegendItem}>
+                                <View
+                                  style={[styles.chartLegendDot, styles.dotCirculating]}
+                                />
+                                <Text style={styles.chartLegendText}>
+                                  Circulating · {fmtPct(tokenDistribution.circPct)} (
+                                  {fmtInt(tokenDistribution.circ)})
+                                </Text>
+                              </View>
+                              <View style={styles.chartLegendItem}>
+                                <View style={[styles.chartLegendDot, styles.dotBurned]} />
+                                <Text style={styles.chartLegendText}>
+                                  Burned · {fmtPct(tokenDistribution.burnedPct)} (
+                                  {fmtInt(tokenDistribution.burned)})
+                                </Text>
+                              </View>
+                              <View style={styles.chartLegendItem}>
+                                <View
+                                  style={[styles.chartLegendDot, styles.dotTreasury]}
+                                />
+                                <Text style={styles.chartLegendText}>
+                                  Reserves (you + treasury + undistributed) ·{" "}
+                                  {fmtPct(tokenDistribution.reservesPct)}
+                                </Text>
+                              </View>
+                            </View>
+                          </>
+                        )}
+                      </View>
+                    ) : null}
+
+                    <View style={styles.sectionDivider} />
+
+                    {/* Local booking / marketplace metrics */}
+                    <Text style={styles.subSectionTitle}>
+                      Neighborhood bookings · last 30 days
+                    </Text>
+                    <View style={styles.metricsGrid}>
+                      <View style={styles.metricBox}>
+                        <Text style={styles.metricLabel}>Wallet balance</Text>
+                        <Text style={styles.metricValue}>
+                          {fmtEsc(econ.walletBalance)} ESC
+                        </Text>
+                      </View>
+
+                      <View style={styles.metricBox}>
+                        <Text style={styles.metricLabel}>Earned as provider</Text>
+                        <Text style={styles.metricValue}>
+                          {fmtEsc(econ.earnedAsProvider)} ESC
+                        </Text>
+                        <Text style={styles.metricTiny}>
+                          {econ.completedAsProvider} completed booking
+                          {econ.completedAsProvider === 1 ? "" : "s"}
+                        </Text>
+                      </View>
+
+                      <View style={styles.metricBox}>
+                        <Text style={styles.metricLabel}>Spent as client</Text>
+                        <Text style={styles.metricValue}>
+                          {fmtEsc(econ.spentAsClient)} ESC
+                        </Text>
+                        <Text style={styles.metricTiny}>
+                          {econ.completedAsClient} completed booking
+                          {econ.completedAsClient === 1 ? "" : "s"}
+                        </Text>
+                      </View>
+
+                      <View style={styles.metricBox}>
+                        <Text style={styles.metricLabel}>Total ESC flow</Text>
+                        <Text style={styles.metricValue}>
+                          {fmtEsc(econ.totalVolume)} ESC
+                        </Text>
+                        <Text style={styles.metricTiny}>
+                          Avg. {fmtEsc(econ.avgBookingPrice)} ESC / booking
+                        </Text>
+                      </View>
+
+                      <View style={styles.metricBox}>
+                        <Text style={styles.metricLabel}>Services live</Text>
+                        <Text style={styles.metricValue}>{econ.totalServices}</Text>
+                        <Text style={styles.metricTiny}>
+                          {econ.foodServices} Food / Restaurants
+                        </Text>
+                      </View>
+                    </View>
+
+                    <View style={styles.metricFooterRow}>
+                      <TouchableOpacity
+                        style={styles.metricBtn}
+                        onPress={() => navigation.navigate("Wallet")}
+                      >
+                        <Text style={styles.metricBtnText}>View Wallet</Text>
+                      </TouchableOpacity>
+                      <TouchableOpacity
+                        style={styles.metricBtnAlt}
+                        onPress={() => navigation.navigate("Bookings")}
+                      >
+                        <Text style={styles.metricBtnAltText}>View Bookings</Text>
+                      </TouchableOpacity>
+                    </View>
+                    <Text style={styles.metricNote}>
+                      On-chain numbers come from the ESC contract / LP (or the seeded sim
+                      while testing). Neighborhood stats come from completed bookings and
+                      wallet activity.
+                    </Text>
+                  </>
+                )}
+              </>
+            ) : !econLoading ? (
+              <Text style={styles.empty}>
+                No booking or token data yet. Seed ESC stats and complete a service to see
+                activity.
+              </Text>
+            ) : null}
+          </View>
 
           {/* Quote of the Day */}
           <View style={styles.card}>
@@ -483,10 +1105,16 @@ const HomeScreen = () => {
                 {air ? (
                   <>
                     <View style={[styles.aqiBadge, { borderColor: aqiBadge.color }]}>
-                      <Text style={[styles.aqiBadgeText, { color: aqiBadge.color }]}>{aqiBadge.label}</Text>
+                      <Text style={[styles.aqiBadgeText, { color: aqiBadge.color }]}>
+                        {aqiBadge.label}
+                      </Text>
                     </View>
-                    <Text style={styles.aqiMeta}>US AQI {Math.round(air.aqi ?? 0)}</Text>
-                    <Text style={styles.aqiMeta}>PM2.5 {Math.round(air.pm25 ?? 0)} µg/m³</Text>
+                    <Text style={styles.aqiMeta}>
+                      US AQI {Math.round(air.aqi ?? 0)}
+                    </Text>
+                    <Text style={styles.aqiMeta}>
+                      PM2.5 {Math.round(air.pm25 ?? 0)} µg/m³
+                    </Text>
                   </>
                 ) : (
                   <Text style={styles.aqiMeta}>—</Text>
@@ -501,7 +1129,11 @@ const HomeScreen = () => {
             {loading && news.length === 0 ? (
               <ActivityIndicator style={{ marginTop: 12 }} />
             ) : news.length ? (
-              <ScrollView horizontal showsHorizontalScrollIndicator={false} style={{ marginTop: 8 }}>
+              <ScrollView
+                horizontal
+                showsHorizontalScrollIndicator={false}
+                style={{ marginTop: 8 }}
+              >
                 {news.map((item, idx) => (
                   <NewsCard item={item} idx={idx} key={`${idx}-${item.title}`} />
                 ))}
@@ -520,7 +1152,9 @@ const HomeScreen = () => {
             {escSpots.length ? (
               escSpots.map((s) => <Spot key={s.id} s={s} />)
             ) : (
-              <Text style={styles.empty}>No listings yet. Add your spot in Marketplace → Create Service.</Text>
+              <Text style={styles.empty}>
+                No listings yet. Add your spot in Marketplace → Create Service.
+              </Text>
             )}
           </View>
 
@@ -569,7 +1203,8 @@ const HomeScreen = () => {
               ))
             )}
             <Text style={styles.note}>
-              We’re prototyping AIS-based predictions for East Side bridges (95th, 100th, 106th, 92nd/Ewing).
+              We’re prototyping AIS-based predictions for East Side bridges (95th, 100th,
+              106th, 92nd/Ewing).
             </Text>
           </View>
 
@@ -608,14 +1243,18 @@ const HomeScreen = () => {
               <Text style={styles.cardHeader}>Mini Game • Coin Tap</Text>
               <Text style={styles.tag}>Just for fun</Text>
             </View>
-            <Text style={styles.gameMeta}>Daily streak: {streak} day{streak === 1 ? "" : "s"}</Text>
+            <Text style={styles.gameMeta}>
+              Daily streak: {streak} day{streak === 1 ? "" : "s"}
+            </Text>
             <Text style={styles.gameMeta}>Score: {score}</Text>
             <Animated.View style={{ transform: [{ scale: coinScale }, { translateY: coinUp }] }}>
               <TouchableOpacity onPress={tapCoin} style={styles.coinBtn} activeOpacity={0.8}>
                 <Text style={styles.coinBtnText}>🪙 Tap</Text>
               </TouchableOpacity>
             </Animated.View>
-            <Text style={styles.note}>Tap to collect coins. It’s silly on purpose. 😄</Text>
+            <Text style={styles.note}>
+              Tap to collect coins. It’s silly on purpose. 😄
+            </Text>
           </View>
 
           {/* Footer */}
@@ -669,6 +1308,16 @@ const styles = StyleSheet.create({
     justifyContent: "space-between",
     marginBottom: 6,
   },
+  headerLeft: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 6,
+  },
+  caret: {
+    color: "#FFD700",
+    fontSize: 16,
+    marginTop: 1,
+  },
   tag: {
     color: "#FFD700",
     fontSize: 12,
@@ -677,6 +1326,160 @@ const styles = StyleSheet.create({
     paddingHorizontal: 8,
     paddingVertical: 2,
     borderRadius: 999,
+  },
+
+  // ECON DASHBOARD
+  econSubtitle: { color: "#9a9aa1", fontSize: 12, marginBottom: 6 },
+  metricsGrid: {
+    flexDirection: "row",
+    flexWrap: "wrap",
+    marginTop: 4,
+    marginHorizontal: -4,
+  },
+  metricBox: {
+    width: "50%",
+    paddingHorizontal: 4,
+    paddingVertical: 6,
+  },
+  metricBoxWide: {
+    width: "100%",
+    paddingHorizontal: 4,
+    paddingVertical: 6,
+  },
+  metricLabel: { color: "#9a9aa1", fontSize: 11, marginBottom: 2 },
+  metricValue: { color: "#FFD700", fontSize: 18, fontWeight: "800" },
+  metricTiny: { color: "#bfbfc6", fontSize: 11, marginTop: 2 },
+  metricTinyInline: { color: "#bfbfc6", fontSize: 12, fontWeight: "400" },
+  metricFooterRow: {
+    flexDirection: "row",
+    gap: 8,
+    marginTop: 10,
+  },
+  metricBtn: {
+    flex: 1,
+    backgroundColor: "#FFD700",
+    paddingVertical: 10,
+    borderRadius: 999,
+    alignItems: "center",
+  },
+  metricBtnText: { color: "#101012", fontWeight: "800", fontSize: 14 },
+  metricBtnAlt: {
+    flex: 1,
+    borderRadius: 999,
+    paddingVertical: 10,
+    alignItems: "center",
+    borderWidth: 1,
+    borderColor: "#3a3a3a",
+    backgroundColor: "#24242a",
+  },
+  metricBtnAltText: { color: "#EEE", fontWeight: "800", fontSize: 14 },
+  metricNote: { color: "#7a7a7a", fontSize: 11, marginTop: 8 },
+  errorText: { color: "#ff6b6b", fontSize: 12, marginTop: 4 },
+  subSectionTitle: {
+    color: "#c7c7ce",
+    fontSize: 13,
+    fontWeight: "700",
+    marginTop: 10,
+    marginBottom: 2,
+  },
+  sectionDivider: {
+    height: 1,
+    backgroundColor: "#2a2a2e",
+    marginTop: 8,
+    marginBottom: 4,
+    opacity: 0.8,
+  },
+
+  collapsedRow: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    marginTop: 4,
+  },
+  collapsedMetric: {
+    flex: 1,
+    paddingRight: 8,
+  },
+  metricValueSm: {
+    color: "#FFD700",
+    fontSize: 14,
+    fontWeight: "700",
+  },
+
+  reserveRow: {
+    marginTop: 8,
+  },
+  reserveLabel: {
+    color: "#c7c7ce",
+    fontSize: 12,
+    fontWeight: "700",
+  },
+  reserveValue: {
+    color: "#FFD700",
+    fontSize: 14,
+    fontWeight: "800",
+    marginTop: 2,
+  },
+
+  // Simple chart styles
+  chartSection: {
+    marginTop: 10,
+  },
+  chartTitle: {
+    color: "#c7c7ce",
+    fontSize: 13,
+    fontWeight: "700",
+    marginBottom: 4,
+  },
+  chartSubtitle: {
+    color: "#9a9aa1",
+    fontSize: 11,
+    marginBottom: 6,
+  },
+  chartBar: {
+    height: 16,
+    borderRadius: 999,
+    overflow: "hidden",
+    flexDirection: "row",
+    backgroundColor: "#202026",
+  },
+  chartSegmentCirculating: {
+    backgroundColor: "#FFD700",
+  },
+  chartSegmentBurned: {
+    backgroundColor: "#FF7A1B",
+  },
+  chartSegmentTreasury: {
+    backgroundColor: "#4B4BF3",
+  },
+  chartLegendRow: {
+    marginTop: 6,
+  },
+  chartLegendItem: {
+    flexDirection: "row",
+    alignItems: "center",
+    marginTop: 2,
+  },
+  chartLegendDot: {
+    width: 8,
+    height: 8,
+    borderRadius: 999,
+    marginRight: 6,
+  },
+  dotCirculating: {
+    backgroundColor: "#FFD700",
+  },
+  dotBurned: {
+    backgroundColor: "#FF7A1B",
+  },
+  dotTreasury: {
+    backgroundColor: "#4B4BF3",
+  },
+  chartLegendText: {
+    color: "#bfbfc6",
+    fontSize: 11,
+  },
+  chartKit: {
+    borderRadius: 12,
   },
 
   // Quote

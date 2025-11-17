@@ -21,6 +21,7 @@ import * as Clipboard from "expo-clipboard";
 import QRCode from "react-native-qrcode-svg";
 import { SafeAreaView } from "react-native-safe-area-context";
 import { useFocusEffect } from "@react-navigation/native";
+import AsyncStorage from "@react-native-async-storage/async-storage";
 import { AuthContext } from "../context/AuthProvider";
 import { walletBalance, fetchUserPublicKey, fetchMe } from "../utils/api";
 import { API_URL } from "../config";
@@ -38,6 +39,31 @@ const THEME = {
   danger: "#E63946",
   ok: "#2f8f46",
 };
+
+// ⚙️ Match WalletScreen's demo flags
+const DEMO_MODE = true;
+const DEMO_LEDGER_KEY = "esc_demo_ledger_v1";
+
+// ---- demo ledger helpers (same behavior as WalletScreen) ----
+async function getDemoLedger() {
+  try {
+    const raw = await AsyncStorage.getItem(DEMO_LEDGER_KEY);
+    if (!raw) return {};
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === "object" ? parsed : {};
+  } catch (e) {
+    console.warn("Profile demo ledger load error:", e?.message || e);
+    return {};
+  }
+}
+
+async function saveDemoLedger(ledger) {
+  try {
+    await AsyncStorage.setItem(DEMO_LEDGER_KEY, JSON.stringify(ledger || {}));
+  } catch (e) {
+    console.warn("Profile demo ledger save error:", e?.message || e);
+  }
+}
 
 // Helper: absolute URL + cache-bust
 function resolveAvatarUri(me, fallback) {
@@ -125,16 +151,58 @@ const ProfileScreen = () => {
     try {
       setLoadingBalance(true);
       const data = await walletBalance();
-      setAddress(data?.address || me?.wallet_address || authUser?.wallet_address || "");
-      const b = typeof data?.balance === "number" ? data.balance : Number(data?.balance ?? 0);
-      setBalance(Number.isFinite(b) ? b : 0);
+
+      // Mirror WalletScreen's address fallback
+      let addr = data?.address || data?.wallet_address || "";
+      if (!addr && DEMO_MODE) {
+        addr = "esc_demo_wallet_local";
+      }
+      if (!addr) {
+        setAddress("");
+        setBalance(0);
+        return;
+      }
+
+      // Base numeric balance from backend
+      let balNum = Number(data?.balance);
+      if (!Number.isFinite(balNum) || balNum < 0) balNum = 0;
+
+      if (DEMO_MODE) {
+        const ledger = await getDemoLedger();
+        if (ledger[addr] == null) {
+          // Seed to backend value if >0, else 100 — same as WalletScreen
+          const seed = balNum > 0 ? balNum : 100;
+          ledger[addr] = seed;
+          await saveDemoLedger(ledger);
+          balNum = seed;
+        } else {
+          balNum = Number(ledger[addr]);
+          if (!Number.isFinite(balNum) || balNum < 0) balNum = 0;
+        }
+      }
+
+      setAddress(addr);
+      setBalance(balNum);
     } catch (e) {
-      console.warn("Balance fetch error:", e?.data || e?.message || e);
-      setBalance((prev) => (prev == null ? 0 : prev));
+      console.warn("Balance fetch error (Profile):", e?.data || e?.message || e);
+      if (DEMO_MODE) {
+        const addr = address || "esc_demo_wallet_local";
+        try {
+          const ledger = await getDemoLedger();
+          let b = Number(ledger[addr]);
+          if (!Number.isFinite(b) || b < 0) b = 100; // sane fallback
+          setAddress(addr);
+          setBalance(b);
+        } catch {
+          setBalance((prev) => (prev == null ? 100 : prev));
+        }
+      } else {
+        setBalance((prev) => (prev == null ? 0 : prev));
+      }
     } finally {
       setLoadingBalance(false);
     }
-  }, [me?.wallet_address, authUser?.wallet_address]);
+  }, [address]);
 
   // 🔑 fetch latest key status from server (dedicated)
   const refreshKeyStatus = useCallback(async () => {
@@ -202,14 +270,18 @@ const ProfileScreen = () => {
     try {
       await Clipboard.setStringAsync(address);
       Alert.alert("Copied", "Wallet address copied to clipboard.");
-    } catch { /* noop */ }
+    } catch {
+      /* noop */
+    }
   };
 
   const handleShare = async () => {
     if (!address) return;
     try {
       await Share.share({ message: `My ESC address: ${address}` });
-    } catch { /* noop */ }
+    } catch {
+      /* noop */
+    }
   };
 
   const handleLogout = async () => {
@@ -380,7 +452,9 @@ const ProfileScreen = () => {
 
           <View style={styles.balanceRow}>
             <Text style={styles.balanceNumber}>
-              {loadingBalance ? "—" : (Number(balance) || 0).toLocaleString(undefined, { maximumFractionDigits: 4 })}
+              {loadingBalance
+                ? "—"
+                : (Number(balance) || 0).toLocaleString(undefined, { maximumFractionDigits: 4 })}
             </Text>
             <Text style={styles.balanceTicker}> ESC</Text>
           </View>
@@ -425,7 +499,11 @@ const ProfileScreen = () => {
             disabled={anyBusy}
             accessibilityLabel="Delete account"
           >
-            {isDeleting ? <ActivityIndicator color="#FFF" /> : <Text style={styles.primaryBtnText}>Delete Account</Text>}
+            {isDeleting ? (
+              <ActivityIndicator color="#FFF" />
+            ) : (
+              <Text style={styles.primaryBtnText}>Delete Account</Text>
+            )}
           </TouchableOpacity>
 
           <Text style={styles.disclaimer}>
@@ -472,7 +550,7 @@ const styles = StyleSheet.create({
   scrollContent: { padding: 16, paddingBottom: 40 },
 
   // accents
-  accent: { position: "absolute", width: 340, height: 340, borderRadius: 999, opacity: 0.10, zIndex: -1 },
+  accent: { position: "absolute", width: 340, height: 340, borderRadius: 999, opacity: 0.1, zIndex: -1 },
   accentTop: { top: -100, right: -70, backgroundColor: THEME.accentGold },
   accentBottom: { bottom: -120, left: -80, backgroundColor: THEME.accentOrange },
 

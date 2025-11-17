@@ -13,10 +13,11 @@ import HomeScreen from "../screens/HomeScreen";
 import WalletScreen from "../screens/WalletScreen";
 import ChatScreen from "../screens/ChatScreen";
 import ServicesScreen from "../screens/ServicesScreen";
+import BookingsScreen from "../screens/BookingsScreen"; // new
 import ProfileScreen from "../screens/ProfileScreen";
 import KeyScreenSetup from "../screens/KeyScreenSetup";
 import OnboardingScreen from "../screens/OnboardingScreen";
-import UserProfile from "../screens/UserProfile"; // NEW
+import UserProfile from "../screens/UserProfile";
 
 const AuthStack = createNativeStackNavigator();
 const AppStack = createNativeStackNavigator();
@@ -27,6 +28,7 @@ const iconMap = {
   Wallet: "wallet",
   Chat: "chatbubbles",
   Services: "briefcase",
+  Bookings: "calendar",   // new icon
   Profile: "person",
 };
 
@@ -49,14 +51,26 @@ const HomeTabs = () => (
       tabBarActiveTintColor: tabTheme.red,
       tabBarInactiveTintColor: "gray",
       tabBarHideOnKeyboard: true,
-      tabBarStyle: { backgroundColor: tabTheme.card, borderTopColor: tabTheme.border },
+      tabBarStyle: {
+        backgroundColor: tabTheme.card,
+        borderTopColor: tabTheme.border,
+      },
     })}
   >
     <Tab.Screen name="Home" component={HomeScreen} />
     <Tab.Screen name="Wallet" component={WalletScreen} />
     {/* Use the tab name "Chat" when navigating, not "ChatScreen" */}
-    <Tab.Screen name="Chat" component={ChatScreen} options={{ unmountOnBlur: true }} />
+    <Tab.Screen
+      name="Chat"
+      component={ChatScreen}
+      options={{ unmountOnBlur: true }}
+    />
     <Tab.Screen name="Services" component={ServicesScreen} />
+    <Tab.Screen
+      name="Bookings"
+      component={BookingsScreen}
+      options={{ title: "Bookings" }}
+    />
     <Tab.Screen name="Profile" component={ProfileScreen} />
   </Tab.Navigator>
 );
@@ -64,7 +78,11 @@ const HomeTabs = () => (
 const AuthNavigator = () => (
   <AuthStack.Navigator
     initialRouteName="Landing"
-    screenOptions={{ headerShown: false, animation: "fade", contentStyle: { backgroundColor: tabTheme.bg } }}
+    screenOptions={{
+      headerShown: false,
+      animation: "fade",
+      contentStyle: { backgroundColor: tabTheme.bg },
+    }}
   >
     <AuthStack.Screen name="Landing" component={LandingScreen} />
     <AuthStack.Screen name="Login" component={LoginScreen} />
@@ -79,15 +97,19 @@ const AuthNavigator = () => (
 const AppNavigator = () => {
   const { user, keysReady } = useContext(AuthContext);
 
-  // Logged OUT
+  // Logged out
   if (!user) return <AuthNavigator />;
 
-  // Logged IN, but keys not ready → lock to KeyScreenSetup
+  // Logged in, but keys not ready
   if (!keysReady) {
     return (
       <AppStack.Navigator
         key="app-needs-keys"
-        screenOptions={{ headerShown: false, animation: "fade", contentStyle: { backgroundColor: tabTheme.bg } }}
+        screenOptions={{
+          headerShown: false,
+          animation: "fade",
+          contentStyle: { backgroundColor: tabTheme.bg },
+        }}
         initialRouteName="KeyScreenSetup"
       >
         <AppStack.Screen
@@ -99,32 +121,44 @@ const AppNavigator = () => {
     );
   }
 
-  // Logged IN + keys ready → pick Onboarding vs Home
+  // Logged in and keys ready, but onboarding not done
   const needsOnboarding = user?.onboarding_completed !== true;
   if (needsOnboarding) {
     return (
       <AppStack.Navigator
         key="app-needs-onboarding"
-        screenOptions={{ headerShown: false, animation: "fade", contentStyle: { backgroundColor: tabTheme.bg } }}
+        screenOptions={{
+          headerShown: false,
+          animation: "fade",
+          contentStyle: { backgroundColor: tabTheme.bg },
+        }}
         initialRouteName="Onboarding"
       >
-        <AppStack.Screen name="Onboarding" component={OnboardingScreen} options={{ gestureEnabled: false }} />
+        <AppStack.Screen
+          name="Onboarding"
+          component={OnboardingScreen}
+          options={{ gestureEnabled: false }}
+        />
         <AppStack.Screen name="HomeTabs" component={HomeTabs} />
-        {/* Keep UserProfile available during onboarding too (optional) */}
+        {/* User profile still available during onboarding */}
         <AppStack.Screen name="UserProfile" component={UserProfile} />
       </AppStack.Navigator>
     );
   }
 
-  // Fully ready → straight to HomeTabs
+  // Fully ready
   return (
     <AppStack.Navigator
       key="app-home"
-      screenOptions={{ headerShown: false, animation: "fade", contentStyle: { backgroundColor: tabTheme.bg } }}
+      screenOptions={{
+        headerShown: false,
+        animation: "fade",
+        contentStyle: { backgroundColor: tabTheme.bg },
+      }}
       initialRouteName="HomeTabs"
     >
       <AppStack.Screen name="HomeTabs" component={HomeTabs} />
-      {/* NEW: enables navigation.navigate('UserProfile', { userId }) */}
+      {/* Enables navigation.navigate("UserProfile", { userId }) */}
       <AppStack.Screen name="UserProfile" component={UserProfile} />
     </AppStack.Navigator>
   );

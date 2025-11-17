@@ -31,6 +31,7 @@ eth-rlp==2.2.0
 eth-typing==5.1.0
 eth-utils==5.2.0
 eth_abi==5.2.0
+Faker==38.0.0
 filelock==3.17.0
 frozenlist==1.5.0
 future==1.0.0
@@ -73,6 +74,7 @@ Twisted==24.11.0
 txaio==23.1.1
 types-requests==2.32.0.20241016
 typing_extensions==4.12.2
+tzdata==2025.2
 urllib3==2.3.0
 web3==7.8.0
 websockets==13.1

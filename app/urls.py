@@ -27,6 +27,8 @@ from .views import (
     # 💰 Wallet
     wallet_balance,
     check_balance,
+    wallet_pay,
+    wallet_transactions,    
 
     # 🧰 Services
     services_list_create,
@@ -46,6 +48,7 @@ from .views import (
     me_detail_update,
     profile_avatar,
     boot_status,
+    esc_stats
 )
 
 urlpatterns = [
@@ -89,6 +92,11 @@ urlpatterns = [
     path("wallet/balance/", wallet_balance, name="wallet_balance"),
     path("check_balance/<str:wallet_address>/", check_balance, name="check_balance"),
     path("wallet/<str:wallet_address>/balance/", check_balance, name="check_balance_legacy"),
+    
+    path("wallet/balance/", wallet_balance),
+    path("wallet/pay/", wallet_pay),
+    path("wallet/transactions/", wallet_transactions),
+
 
     # ===========================
     # 🧰 Services
@@ -117,4 +125,6 @@ urlpatterns = [
     path("profile/avatar/", profile_avatar, name="profile_avatar"),
     path("users/me/avatar/", profile_avatar, name="users_me_avatar"),
     path("users/me/boot_status/", boot_status, name="boot_status"),
+    
+    path("esc/stats/", esc_stats, name="esc_stats"),
 ]
