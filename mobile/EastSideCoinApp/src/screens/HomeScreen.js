@@ -25,7 +25,7 @@ import { SafeAreaView } from "react-native-safe-area-context";
 import { useNavigation } from "@react-navigation/native";
 import { LineChart } from "react-native-chart-kit";
 import { AuthContext } from "../context/AuthProvider";
-import { listServices, listBookings, api } from "../utils/api"; // ✅ services + bookings + wallet + ESC stats
+import { listServices, listBookings, api } from "../utils/api";
 
 // 60617 (South Chicago / East Side / South Deering nearby)
 const ZIP_60617_LAT = 41.7239;
@@ -72,11 +72,14 @@ const QUOTES = [
 
 const { width: SCREEN_WIDTH } = Dimensions.get("window");
 
+// How many days of price history to ask backend for
+const HISTORY_DAYS = 30;
+
 const priceChartConfig = {
   backgroundColor: "#1b1b1f",
   backgroundGradientFrom: "#1b1b1f",
   backgroundGradientTo: "#1b1b1f",
-  decimalPlaces: 2,
+  decimalPlaces: 4,
   color: (opacity = 1) => `rgba(255, 215, 0, ${opacity})`,
   labelColor: (opacity = 1) => `rgba(200, 200, 210, ${opacity})`,
   propsForDots: {
@@ -387,7 +390,7 @@ const HomeScreen = () => {
     setEconError("");
     try {
       const now = new Date();
-      const fromDate = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000);
+      const fromDate = new Date(now.getTime() - HISTORY_DAYS * 24 * 60 * 60 * 1000);
       const fromISO = fromDate.toISOString().slice(0, 10) + "T00:00:00";
       const toISO = now.toISOString();
 
@@ -411,7 +414,7 @@ const HomeScreen = () => {
             page: 1,
           }).catch(() => []),
           listServices({ limit: 500 }).catch(() => []),
-          api.get("/esc/stats/").catch(() => null), // ✅ pulls from ESC stats endpoint
+          api.get(`/esc/stats/?days=${HISTORY_DAYS}`).catch(() => null), // ✅ backend-driven ESC stats & price history
         ]);
 
       const walletBalance = Number(walletPayload?.balance ?? 0);
@@ -447,77 +450,104 @@ const HomeScreen = () => {
       ).length;
 
       // ---- token / on-chain style stats (from /esc/stats/) ----
-      let stats = escStatsPayload || {};
+      const stats =
+        escStatsPayload && Object.keys(escStatsPayload).length ? escStatsPayload : {};
 
-      // 🔸 Seed sim if backend not ready
-      if (!stats || Object.keys(stats).length === 0) {
-        const starterAccounts = 100;
-        const starterPerAccount = 100;
-        const starterAllocationESC = starterAccounts * starterPerAccount; // 10,000 ESC
-
-        const totalSupplySim = 1_000_000;
-        const circulatingSim = 50_000;
-        const founderReserveSim = 400_000;
-        const treasuryReserveSim = 400_000;
-        const burnedSim = 10_000;
-        const circPlusRes =
-          circulatingSim + founderReserveSim + treasuryReserveSim + burnedSim;
-        const undistributedSim = Math.max(totalSupplySim - circPlusRes, 0);
-
-        const priceSim = 0.1; // $0.10 / ESC
-        const volume24hESC = 5000;
-        const tx24h = 120;
-        const lpLockedUSD = 2500;
-        const lpTokens = 500;
-
-        const priceHistory = [0.03, 0.04, 0.05, 0.06, 0.07, 0.09, 0.1];
-
-        stats = {
-          total_supply: totalSupplySim,
-          circulating_supply: circulatingSim,
-          burned_supply: burnedSim,
-          holders: starterAccounts,
-          price_usd: priceSim,
-          price_usdc: priceSim,
-          market_cap_usd: priceSim * circulatingSim,
-          tx_24h: tx24h,
-          volume_24h_esc: volume24hESC,
-          volume_24h_usd: volume24hESC * priceSim,
-          lp_locked_usd: lpLockedUSD,
-          lp_tokens: lpTokens,
-          starter_accounts: starterAccounts,
-          starter_per_account: starterPerAccount,
-          starter_allocation_esc: starterAllocationESC,
-          founder_reserve_esc: founderReserveSim,
-          treasury_reserve_esc: treasuryReserveSim,
-          undistributed_supply: undistributedSim,
-          price_history: priceHistory,
-        };
-      }
-
-      const totalSupply = Number(stats.total_supply ?? stats.totalSupply ?? 0);
-      const circulatingSupply = Number(
-        stats.circulating_supply ?? stats.circulating ?? stats.circulatingSupply ?? 0
+      const totalSupply = Number(
+        stats.total_supply ??
+          stats.totalSupply ??
+          stats.total_supply_esc ??
+          0
       );
-      const burnedSupply = Number(stats.burned_supply ?? stats.burned ?? 0);
-      const holders = Number(stats.holders ?? stats.unique_holders ?? 0);
 
-      const priceUSD = Number(stats.price_usd ?? stats.priceUsd ?? stats.price ?? 0);
+      const circulatingSupply = Number(
+        stats.circulating_supply ??
+          stats.circulating ??
+          stats.circulatingSupply ??
+          stats.circulating_supply_esc ??
+          stats.circulating_slice_esc ??
+          0
+      );
+
+      const burnedSupply = Number(
+        stats.burned_supply ??
+          stats.burned ??
+          stats.burned_esc ??
+          0
+      );
+
+      const holders = Number(
+        stats.holders ??
+          stats.unique_holders ??
+          stats.holder_count ??
+          0
+      );
+
+      const priceUSD = Number(
+        stats.price_usd ??
+          stats.priceUsd ??
+          stats.price ??
+          stats.price_final_usd ??
+          0
+      );
+
       const priceUSDC =
-        Number(stats.price_usdc ?? stats.priceUsdc ?? 0) || priceUSD;
+        Number(
+          stats.price_usdc ??
+            stats.priceUsdc ??
+            stats.pair_price_usdc ??
+            0
+        ) || priceUSD;
 
       const marketCapUSD = Number(
         stats.market_cap_usd ??
           stats.marketCapUsd ??
+          stats.market_cap ??
+          stats.marketCap ??
           (priceUSD && circulatingSupply ? priceUSD * circulatingSupply : 0)
       );
 
-      const tx24h = Number(stats.tx_24h ?? stats.transactions_24h ?? 0);
-      const volume24hESC = Number(stats.volume_24h_esc ?? stats.volume24hEsc ?? 0);
-      const volume24hUSD = Number(stats.volume_24h_usd ?? stats.volume24hUsd ?? 0);
+      const tx24h = Number(
+        stats.tx_24h ??
+          stats.transactions_24h ??
+          stats.tx_count ??
+          0
+      );
 
-      const lpLockedUSD = Number(stats.lp_locked_usd ?? stats.lpLockedUsd ?? 0);
-      const lpTokens = Number(stats.lp_tokens ?? stats.lpTokens ?? 0);
+      const volume24hESC = Number(
+        stats.volume_24h_esc ??
+          stats.volume24hEsc ??
+          stats.volume_esc ??
+          0
+      );
+
+      const volume24hUSD = Number(
+        stats.volume_24h_usd ??
+          stats.volume24hUsd ??
+          (priceUSD && volume24hESC ? priceUSD * volume24hESC : 0)
+      );
+
+      // LP values – from stats if available, otherwise compute simple USDC * 5x as placeholder
+      const lpEsc = Number(
+        stats.lp_esc ??
+          stats.lpEsc ??
+          0
+      );
+      const lpUsdc = Number(
+        stats.lp_usdc ??
+          stats.lpUsdc ??
+          0
+      );
+      const lpLockedUSD = Number(
+        stats.lp_locked_usd ??
+          stats.lpLockedUsd ??
+          (lpUsdc || priceUSD ? lpUsdc : 0)
+      );
+      const lpTokens = Number(
+        stats.lp_tokens ??
+          stats.lpTokens ??
+          0
+      );
 
       const starterAccounts =
         Number(stats.starter_accounts ?? stats.starterAccounts ?? 0) || 0;
@@ -527,21 +557,45 @@ const HomeScreen = () => {
         Number(stats.starter_allocation_esc ?? stats.starterAllocationEsc ?? 0) || 0;
 
       const founderReserveESC = Number(
-        stats.founder_reserve_esc ?? stats.founderReserveEsc ?? 0
+        stats.founder_reserve_esc ??
+          stats.founderReserveEsc ??
+          0
       );
       const treasuryReserveESC = Number(
-        stats.treasury_reserve_esc ?? stats.treasuryReserveEsc ?? 0
+        stats.treasury_reserve_esc ??
+          stats.treasuryReserveEsc ??
+          0
       );
       const undistributedSupply = Number(
-        stats.undistributed_supply ?? stats.undistributedSupply ?? 0
+        stats.undistributed_supply ??
+          stats.undistributedSupply ??
+          0
       );
 
-      const priceHistory = Array.isArray(stats.price_history ?? stats.priceHistory)
-        ? stats.price_history ?? stats.priceHistory
+      const mintedESC = Number(
+        stats.minted_esc ??
+          stats.minted ??
+          0
+      );
+
+      const rawHistory = stats.price_history ?? stats.priceHistory ?? [];
+      const priceHistory = Array.isArray(rawHistory)
+        ? rawHistory
+            .map((v) => Number(v))
+            .filter((v) => typeof v === "number" && !Number.isNaN(v))
         : [];
+
+      const priceLabels =
+        Array.isArray(stats.price_labels ?? stats.priceLabels) &&
+        (stats.price_labels ?? stats.priceLabels).length === priceHistory.length
+          ? stats.price_labels ?? stats.priceLabels
+          : null;
+
+      const historyDays = Number(stats.history_days ?? stats.historyDays ?? HISTORY_DAYS);
 
       const founderReserveUSD = priceUSD * founderReserveESC;
       const treasuryReserveUSD = priceUSD * treasuryReserveESC;
+      const mintedUSD = priceUSD * mintedESC;
 
       const circulatingPct =
         totalSupply > 0 ? (circulatingSupply / totalSupply) * 100 : null;
@@ -569,9 +623,15 @@ const HomeScreen = () => {
         treasuryReserveESC,
         treasuryReserveUSD,
         undistributedSupply,
-        priceHistory,
+        mintedESC,
+        mintedUSD,
+        lpEsc,
+        lpUsdc,
+        priceHistory, // ✅ backend-driven price history
+        priceLabels, // ✅ optional backend labels for the chart
+        historyDays, // ✅ window of days for the chart
 
-        // wallet + marketplace flow (last 30 days)
+        // wallet + marketplace flow (last N days)
         walletBalance,
         completedAsProvider: providerBookings.length,
         completedAsClient: clientBookings.length,
@@ -685,6 +745,34 @@ const HomeScreen = () => {
     return { circPct, burnedPct, reservesPct, circ, burned, reserves };
   }, [econ]);
 
+  // Price chart labels: prefer backend labels; otherwise auto-generate based on window
+  const priceChartLabels = useMemo(() => {
+    if (!econ || !Array.isArray(econ.priceHistory) || econ.priceHistory.length < 2) {
+      return null;
+    }
+    const len = econ.priceHistory.length;
+
+    if (econ.priceLabels && Array.isArray(econ.priceLabels) && econ.priceLabels.length === len) {
+      return econ.priceLabels;
+    }
+
+    const windowDays = econ.historyDays || HISTORY_DAYS;
+
+    // If backend window matches history length, label as -Xd ... Today
+    if (windowDays && windowDays === len) {
+      return Array.from({ length: len }, (_, idx) => {
+        if (idx === len - 1) return "Now";
+        const daysAgo = len - 1 - idx;
+        return `-${daysAgo}d`;
+      });
+    }
+
+    // Fallback generic labels
+    return Array.from({ length: len }, (_, idx) =>
+      idx === len - 1 ? "Now" : `D-${len - 1 - idx}`
+    );
+  }, [econ]);
+
   const NewsCard = ({ item, idx }) => (
     <TouchableOpacity
       key={`${idx}-${item.title}`}
@@ -727,13 +815,13 @@ const HomeScreen = () => {
 
   const fmtEsc = (n) =>
     typeof n === "number"
-      ? n.toLocaleString(undefined, { maximumFractionDigits: 2 })
-      : "0.00";
+      ? n.toLocaleString(undefined, { maximumFractionDigits: 4 })
+      : "0.0000";
 
   const fmtUSD = (n) =>
     typeof n === "number"
-      ? "$" + n.toLocaleString(undefined, { maximumFractionDigits: 2 })
-      : "$0.00";
+      ? "$" + n.toLocaleString(undefined, { maximumFractionDigits: 4 })
+      : "$0.0000";
 
   const fmtInt = (n) =>
     typeof n === "number" ? n.toLocaleString(undefined) : "0";
@@ -786,7 +874,9 @@ const HomeScreen = () => {
               {econLoading ? <ActivityIndicator size="small" color="#FFD700" /> : null}
             </TouchableOpacity>
 
-            <Text style={styles.econSubtitle}>Live ESC stats + last 30 days of bookings</Text>
+            <Text style={styles.econSubtitle}>
+              ESC on-chain stats + last {econ?.historyDays || HISTORY_DAYS} days of bookings
+            </Text>
             {econError ? <Text style={styles.errorText}>{econError}</Text> : null}
 
             {econ ? (
@@ -847,6 +937,14 @@ const HomeScreen = () => {
                       </View>
 
                       <View style={styles.metricBox}>
+                        <Text style={styles.metricLabel}>Protocol minted</Text>
+                        <Text style={styles.metricValue}>{fmtInt(econ.mintedESC)}</Text>
+                        <Text style={styles.metricTiny}>
+                          ≈ {fmtUSD(econ.mintedUSD || 0)} at current price
+                        </Text>
+                      </View>
+
+                      <View style={styles.metricBox}>
                         <Text style={styles.metricLabel}>Market cap</Text>
                         <Text style={styles.metricValue}>{fmtUSD(econ.marketCapUSD)}</Text>
                         <Text style={styles.metricTiny}>
@@ -872,11 +970,11 @@ const HomeScreen = () => {
                       </View>
                     </View>
 
-                    {/* Reserve callout for your 400k */}
+                    {/* Reserve callout for founder reserve (dynamic, not hard-coded) */}
                     {econ.founderReserveESC ? (
                       <View style={styles.reserveRow}>
                         <Text style={styles.reserveLabel}>
-                          Your 400k reserve (off-market stabilizer)
+                          Founder reserve (off-market stabilizer)
                         </Text>
                         <Text style={styles.reserveValue}>
                           {fmtEsc(econ.founderReserveESC)} ESC ·{" "}
@@ -889,20 +987,20 @@ const HomeScreen = () => {
                       </View>
                     ) : null}
 
-                    {/* Simple “chart” — price history + token distribution */}
+                    {/* Price history chart + token distribution */}
                     {(econ.priceHistory && econ.priceHistory.length > 1) || tokenDistribution ? (
                       <View style={styles.chartSection}>
                         {econ.priceHistory && econ.priceHistory.length > 1 && (
                           <>
                             <Text style={styles.chartTitle}>
-                              Price path to $0.10 / ESC (sim)
+                              ESC price (last {econ.historyDays || HISTORY_DAYS} days)
                             </Text>
                             <Text style={styles.chartSubtitle}>
-                              100 accounts trading, starter scarcity + bookings pushing price up.
+                              Purely from /esc/stats/ — sim + real trades driving up price over this window.
                             </Text>
                             <LineChart
                               data={{
-                                labels: ["D-6", "D-5", "D-4", "D-3", "D-2", "D-1", "Now"],
+                                labels: priceChartLabels || [],
                                 datasets: [{ data: econ.priceHistory }],
                               }}
                               width={SCREEN_WIDTH - 64}
@@ -963,7 +1061,7 @@ const HomeScreen = () => {
                                   style={[styles.chartLegendDot, styles.dotTreasury]}
                                 />
                                 <Text style={styles.chartLegendText}>
-                                  Reserves (you + treasury + undistributed) ·{" "}
+                                  Reserves (founder + treasury + undistributed) ·{" "}
                                   {fmtPct(tokenDistribution.reservesPct)}
                                 </Text>
                               </View>
@@ -977,7 +1075,7 @@ const HomeScreen = () => {
 
                     {/* Local booking / marketplace metrics */}
                     <Text style={styles.subSectionTitle}>
-                      Neighborhood bookings · last 30 days
+                      Neighborhood bookings · last {econ.historyDays || HISTORY_DAYS} days
                     </Text>
                     <View style={styles.metricsGrid}>
                       <View style={styles.metricBox}>
@@ -1043,9 +1141,9 @@ const HomeScreen = () => {
                       </TouchableOpacity>
                     </View>
                     <Text style={styles.metricNote}>
-                      On-chain numbers come from the ESC contract / LP (or the seeded sim
-                      while testing). Neighborhood stats come from completed bookings and
-                      wallet activity.
+                      On-chain numbers and price history come from the ESC stats endpoint.
+                      Neighborhood stats come from completed bookings and wallet activity
+                      over this same window.
                     </Text>
                   </>
                 )}

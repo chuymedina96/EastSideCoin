@@ -29,6 +29,7 @@ from .models import (
     Booking,
     Transaction,
     WalletActivity,
+    EscEconomySnapshot,  # 🔥 new: sim snapshot model
 )  # noqa: F401
 
 User = get_user_model()
@@ -1179,7 +1180,7 @@ def services_categories(request):
     try:
         cats = (
             Service.objects.exclude(category__isnull=True)
-            .exclude(category__exact="")
+            .exclude(category__exact(""))
             .values_list("category", flat=True)
             .distinct()
         )
@@ -1688,8 +1689,31 @@ def user_public_key(request, user_id: int):
 
 
 # ===========================
-# 📊 ESC ECONOMY STATS
+# 📊 ESC ECONOMY STATS (snapshot-aware)
 # ===========================
+def _snap_val(snap, names, default):
+    """
+    Helper: read a field from EscEconomySnapshot, coerce to Decimal.
+    names can be a string or list of strings.
+    """
+    if not snap:
+        return default
+    if isinstance(names, str):
+        names = [names]
+    for n in names:
+        if hasattr(snap, n):
+            v = getattr(snap, n)
+            if v is None:
+                continue
+            if isinstance(v, Decimal):
+                return v
+            try:
+                return Decimal(str(v))
+            except Exception:
+                return default
+    return default
+
+
 @api_view(["GET"])
 @permission_classes([IsAuthenticated])
 def esc_stats(request):
@@ -1697,68 +1721,115 @@ def esc_stats(request):
     GET /esc/stats/
 
     Returns aggregate token + neighborhood metrics for the HomeScreen dashboard.
-    Uses live data from User + Transaction + Booking, with sane defaults that
-    line up with your seed_esc_demo.py simulation.
 
-    You can override many of these via Django settings, e.g.:
-
-      ESC_TOTAL_SUPPLY = 1_000_000
-      ESC_PRICE_USD = "0.10"
-      ESC_BURNED_SUPPLY = "10000"
-      ESC_FOUNDER_RESERVE_ESC = "400000"
-      ESC_TREASURY_RESERVE_ESC = "400000"
-      ESC_LP_LOCKED_USD = "2500"
-      ESC_LP_TOKENS = 500
-      ESC_STARTER_ACCOUNTS = 100
-      ESC_STARTER_PER_ACCOUNT = 100
+    IMPORTANT:
+    - If an EscEconomySnapshot exists, we use its numbers for price, supply,
+      circulating, burned, market cap, etc.
+    - If no snapshot exists yet, we fall back to sane defaults + live DB stats.
     """
     try:
         now = timezone.now()
 
-        # --- Core supply / config ---
-        total_supply = Decimal(
-            str(getattr(settings, "ESC_TOTAL_SUPPLY", "1000000"))
-        )
-        price_usd = Decimal(str(getattr(settings, "ESC_PRICE_USD", "0.10")))
-        burned_supply = Decimal(
-            str(getattr(settings, "ESC_BURNED_SUPPLY", "0"))
-        )
+        # optional ?days= hist window (for price_history length)
+        try:
+            days_param = int(request.query_params.get("days", 7))
+        except (TypeError, ValueError):
+            days_param = 7
+        history_days = max(3, min(days_param, 90))
 
-        founder_reserve_esc = Decimal(
+        # latest snapshot from your sim
+        snap = EscEconomySnapshot.objects.order_by("-window_end", "-id").first()
+        if snap:
+            print(f"📈 esc_stats using EscEconomySnapshot id={snap.id}")
+        else:
+            print("📈 esc_stats: no snapshot found, using fallback config/live data")
+
+        # --- base config defaults (overridden by snapshot where possible) ---
+        cfg_total_supply = Decimal(str(getattr(settings, "ESC_TOTAL_SUPPLY", "1000000")))
+        cfg_price_usd = Decimal(str(getattr(settings, "ESC_PRICE_USD", "0.10")))
+        cfg_burned = Decimal(str(getattr(settings, "ESC_BURNED_SUPPLY", "0")))
+        cfg_founder_reserve = Decimal(
             str(getattr(settings, "ESC_FOUNDER_RESERVE_ESC", "400000"))
         )
-        treasury_reserve_esc = Decimal(
+        cfg_treasury_reserve = Decimal(
             str(getattr(settings, "ESC_TREASURY_RESERVE_ESC", "400000"))
         )
-
         starter_accounts = int(getattr(settings, "ESC_STARTER_ACCOUNTS", 100))
         starter_per_account = int(getattr(settings, "ESC_STARTER_PER_ACCOUNT", 100))
-        starter_allocation_esc = starter_accounts * starter_per_account
+        starter_allocation_esc = Decimal(starter_accounts * starter_per_account)
 
-        # --- Circulating + holders from user balances ---
-        user_qs = User.objects.all()
-        circulating_supply = (
-            user_qs.aggregate(total=Sum("esc_balance"))["total"] or Decimal("0")
+        # --- supply / price pulled from snapshot when present ---
+        total_supply = _snap_val(
+            snap,
+            ["effective_total_supply", "total_supply", "total_supply_esc"],
+            cfg_total_supply,
         )
-        holders = user_qs.filter(esc_balance__gt=0).count()
 
-        # --- 24h TX stats from Transaction table ---
+        price_usd = _snap_val(
+            snap,
+            ["final_price_usd", "final_price", "price_usd"],
+            cfg_price_usd,
+        )
+
+        burned_supply = _snap_val(
+            snap,
+            ["burned_total", "burned_supply"],
+            cfg_burned,
+        )
+
+        # circulating from snapshot if present, otherwise from live user balances
+        user_qs = User.objects.all()
+        live_circulating = user_qs.aggregate(total=Sum("esc_balance"))["total"] or Decimal("0")
+
+        circulating_supply = _snap_val(
+            snap,
+            ["circulating_ex_treasury", "circulating_supply"],
+            live_circulating,
+        )
+
+        holders_snapshot = getattr(snap, "holders", None) if snap else None
+        if holders_snapshot is not None:
+            holders = int(holders_snapshot)
+        else:
+            holders = user_qs.filter(esc_balance__gt=0).count()
+
+        # --- 24h TX stats from Transaction table (still live) ---
         since = now - timedelta(days=1)
         tx_qs = Transaction.objects.filter(created_at__gte=since)
         tx_24h = tx_qs.count()
         volume_24h_esc = tx_qs.aggregate(total=Sum("amount"))["total"] or Decimal("0")
         volume_24h_usd = volume_24h_esc * price_usd
 
-        # --- LP / pool metrics (from settings or defaults) ---
-        lp_locked_usd = Decimal(str(getattr(settings, "ESC_LP_LOCKED_USD", "2500")))
-        lp_tokens = int(getattr(settings, "ESC_LP_TOKENS", 500))
-
-        # --- Market cap from circulating * price ---
-        market_cap_usd = price_usd * circulating_supply if circulating_supply > 0 else Decimal(
-            "0"
+        # --- LP / pool metrics ---
+        lp_locked_usd = _snap_val(
+            snap,
+            ["lp_locked_usd"],
+            Decimal(str(getattr(settings, "ESC_LP_LOCKED_USD", "2500"))),
+        )
+        lp_tokens = int(
+            _snap_val(
+                snap,
+                ["lp_tokens"],
+                Decimal(str(getattr(settings, "ESC_LP_TOKENS", "500"))),
+            )
         )
 
-        # --- Undistributed supply (all reserves + burned + circulating <= total) ---
+        # Approx 50/50 split to show ESC/USDC composition
+        lp_usdc = lp_locked_usd / Decimal("2") if lp_locked_usd > 0 else Decimal("0")
+        lp_esc = lp_usdc / price_usd if price_usd > 0 else Decimal("0")
+
+        # --- reserves / undistributed ---
+        founder_reserve_esc = _snap_val(
+            snap,
+            ["founder_reserve_esc", "founder_reserve"],
+            cfg_founder_reserve,
+        )
+        treasury_reserve_esc = _snap_val(
+            snap,
+            ["treasury_reserve_esc", "treasury_reserve"],
+            cfg_treasury_reserve,
+        )
+
         circ_plus_res = (
             circulating_supply
             + burned_supply
@@ -1767,46 +1838,103 @@ def esc_stats(request):
         )
         undistributed_supply = max(total_supply - circ_plus_res, Decimal("0"))
 
-        # --- Simple simulated price history if none provided in settings ---
+        # minted = everything not undistributed
+        minted_esc = total_supply - undistributed_supply
+        minted_usd = minted_esc * price_usd if minted_esc > 0 else Decimal("0")
+
+        # --- market cap ---
+        market_cap_usd = price_usd * circulating_supply if circulating_supply > 0 else Decimal("0")
+
+        # --- price history ---
+        snap_series = None
+        if snap and hasattr(snap, "price_series"):
+            snap_series = getattr(snap, "price_series")
+
         settings_history = getattr(settings, "ESC_PRICE_HISTORY", None)
-        if settings_history and isinstance(settings_history, (list, tuple)):
+
+        price_history = None
+        if snap_series:
+            if isinstance(snap_series, (list, tuple)):
+                price_history = [float(x) for x in snap_series]
+            else:
+                try:
+                    import json
+
+                    arr = json.loads(snap_series)
+                    if isinstance(arr, (list, tuple)):
+                        price_history = [float(x) for x in arr]
+                except Exception:
+                    price_history = None
+
+        if price_history is None and settings_history and isinstance(settings_history, (list, tuple)):
             price_history = [float(x) for x in settings_history]
-        else:
-            # Mirror the sim path in HomeScreen: ramp to current price
+
+        if price_history is None:
+            # generate a simple ramp from ~30% of current price up to current price
+            if history_days < 2:
+                history_days = 2
+            start_price = float(price_usd) * 0.3
+            end_price = float(price_usd)
+            step = (end_price - start_price) / (history_days - 1)
             price_history = [
-                0.03,
-                0.04,
-                0.05,
-                0.06,
-                0.07,
-                0.09,
-                float(price_usd),
+                round(start_price + step * i, 5) for i in range(history_days)
             ]
+        else:
+            history_days = len(price_history)
+
+        # labels like -6d ... Now
+        price_labels = []
+        for i in range(history_days):
+            if i == history_days - 1:
+                price_labels.append("Now")
+            else:
+                days_ago = history_days - 1 - i
+                price_labels.append(f"-{days_ago}d")
 
         payload = {
+            # core supply & price
             "total_supply": float(total_supply),
             "circulating_supply": float(circulating_supply),
             "burned_supply": float(burned_supply),
+            "burned_esc": float(burned_supply),
             "holders": holders,
             "price_usd": float(price_usd),
-            "price_usdc": float(price_usd),  # assuming 1:1 peg in sim
+            "price_usdc": float(price_usd),  # sim assumes 1:1 with USDC
+
+            # market / activity
             "market_cap_usd": float(market_cap_usd),
             "tx_24h": tx_24h,
             "volume_24h_esc": float(volume_24h_esc),
             "volume_24h_usd": float(volume_24h_usd),
+
+            # LP
             "lp_locked_usd": float(lp_locked_usd),
             "lp_tokens": lp_tokens,
+            "lp_esc": float(lp_esc),
+            "lp_usdc": float(lp_usdc),
+
+            # starter pool
             "starter_accounts": starter_accounts,
             "starter_per_account": starter_per_account,
             "starter_allocation_esc": float(starter_allocation_esc),
+
+            # reserves / undistributed
             "founder_reserve_esc": float(founder_reserve_esc),
             "treasury_reserve_esc": float(treasury_reserve_esc),
             "undistributed_supply": float(undistributed_supply),
+
+            # minted
+            "minted_esc": float(minted_esc),
+            "minted_usd": float(minted_usd),
+
+            # history
             "price_history": price_history,
+            "price_labels": price_labels,
+            "history_days": history_days,
         }
 
         return Response(payload, status=200)
     except Exception as e:
         print("❌ esc_stats error:", e)
-        # Frontend will fall back to sim if this fails
+        # Frontend will fall back to client-side sim if this fails
         return Response({"error": str(e)}, status=500)

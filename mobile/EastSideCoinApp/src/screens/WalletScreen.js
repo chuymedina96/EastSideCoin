@@ -21,21 +21,14 @@ import {
   Platform,
 } from "react-native";
 import debounce from "lodash.debounce";
-import AsyncStorage from "@react-native-async-storage/async-storage";
 import { SafeAreaView } from "react-native-safe-area-context";
 import { useRoute, useNavigation } from "@react-navigation/native";
 import {
-  api, // kept for future live send wiring
+  api,
   listServiceCategories,
   searchUsersSmart,
   walletBalance,
 } from "../utils/api";
-
-// Flip to false when you wire real send API
-const DEMO_MODE = true;
-const DEMO_LEDGER_KEY = "esc_demo_ledger_v1";
-const DEMO_TX_KEY = "esc_demo_tx_v1";
-const DEMO_SEED = 100;
 
 const THEME = {
   bg: "#101012",
@@ -64,63 +57,6 @@ const fmt = (n) =>
 
 const trimAddr = (a, len = 6) =>
   a?.length > 2 * len ? `${a.slice(0, len)}…${a.slice(-len)}` : a || "";
-
-// ---- demo ledger helpers (per-wallet, per-device) ----
-async function getDemoLedger() {
-  try {
-    const raw = await AsyncStorage.getItem(DEMO_LEDGER_KEY);
-    if (!raw) return {};
-    const parsed = JSON.parse(raw);
-    return parsed && typeof parsed === "object" ? parsed : {};
-  } catch (e) {
-    console.warn("Demo ledger load error:", e?.message || e);
-    return {};
-  }
-}
-
-async function saveDemoLedger(ledger) {
-  try {
-    await AsyncStorage.setItem(DEMO_LEDGER_KEY, JSON.stringify(ledger || {}));
-  } catch (e) {
-    console.warn("Demo ledger save error:", e?.message || e);
-  }
-}
-
-// ---- demo tx history helpers (per-wallet, per-device) ----
-async function getDemoTxStore() {
-  try {
-    const raw = await AsyncStorage.getItem(DEMO_TX_KEY);
-    if (!raw) return {};
-    const parsed = JSON.parse(raw);
-    return parsed && typeof parsed === "object" ? parsed : {};
-  } catch (e) {
-    console.warn("Demo tx load error:", e?.message || e);
-    return {};
-  }
-}
-
-async function saveDemoTxStore(store) {
-  try {
-    await AsyncStorage.setItem(DEMO_TX_KEY, JSON.stringify(store || {}));
-  } catch (e) {
-    console.warn("Demo tx save error:", e?.message || e);
-  }
-}
-
-// 🔧 DEV helper to hard-reset all demo balances + txs
-export async function resetDemoLedger() {
-  try {
-    await AsyncStorage.removeItem(DEMO_LEDGER_KEY);
-    await AsyncStorage.removeItem(DEMO_TX_KEY);
-    Alert.alert(
-      "Demo ledger reset",
-      "All demo balances and demo transactions were cleared. Reload wallets to reseed."
-    );
-  } catch (e) {
-    console.warn("Failed to reset demo ledger:", e?.message || e);
-    Alert.alert("Error", "Could not reset demo ledger.");
-  }
-}
 
 const WalletScreen = () => {
   const route = useRoute();
@@ -193,15 +129,11 @@ const WalletScreen = () => {
     outputRange: [0, -3],
   });
 
-  // ---- load wallet basics (with demo ledger seeding) ----
+  // ---- load wallet basics (backend only) ----
   const loadWallet = useCallback(async () => {
     try {
       const data = await walletBalance();
-      let addr = data?.address || data?.wallet_address || "";
-
-      if (!addr && DEMO_MODE) {
-        addr = "esc_demo_wallet_local";
-      }
+      const addr = data?.address || data?.wallet_address || "";
 
       if (!addr) {
         setWalletAddress("");
@@ -212,41 +144,31 @@ const WalletScreen = () => {
       let balNum = Number(data?.balance);
       if (!Number.isFinite(balNum) || balNum < 0) balNum = 0;
 
-      if (DEMO_MODE) {
-        const ledger = await getDemoLedger();
-        if (ledger[addr] == null) {
-          const seed = balNum > 0 ? balNum : DEMO_SEED; // default seed
-          ledger[addr] = seed;
-          await saveDemoLedger(ledger);
-          balNum = seed;
-        } else {
-          balNum = Number(ledger[addr]);
-          if (!Number.isFinite(balNum) || balNum < 0) balNum = 0;
-        }
-      }
-
       setWalletAddress(addr);
       setBalance(balNum);
     } catch (e) {
       console.error("❌ Wallet Fetch Error:", e?.data || e?.message || e);
-      if (DEMO_MODE) {
-        const addr = "esc_demo_wallet_local";
-        const ledger = await getDemoLedger();
-        if (ledger[addr] == null) {
-          ledger[addr] = DEMO_SEED;
-          await saveDemoLedger(ledger);
-        }
-        const stored = Number(ledger[addr]);
-        setWalletAddress(addr);
-        setBalance(
-          Number.isFinite(stored) && stored > 0 ? stored : DEMO_SEED
-        );
-      } else {
-        setWalletAddress("");
-        setBalance(0);
-      }
+      setWalletAddress("");
+      setBalance(0);
     }
   }, []);
+
+  // ---- load recent activity from backend ----
+  const loadRecent = useCallback(async () => {
+    if (!walletAddress) return;
+    try {
+      const payload = await api.get("/wallet/activity/");
+      const list = Array.isArray(payload)
+        ? payload
+        : Array.isArray(payload?.results)
+        ? payload.results
+        : [];
+      setRecent(list);
+    } catch (e) {
+      console.warn("Wallet activity load error:", e?.data || e?.message || e);
+      setRecent([]);
+    }
+  }, [walletAddress]);
 
   // ---- seed categories ----
   const loadCategories = useCallback(async () => {
@@ -271,30 +193,25 @@ const WalletScreen = () => {
 
   const onRefresh = useCallback(async () => {
     setRefreshing(true);
-    await Promise.all([loadWallet()]);
+    await Promise.all([loadWallet(), loadCategories(), loadRecent()]);
     setRefreshing(false);
-  }, [loadWallet]);
+  }, [loadWallet, loadCategories, loadRecent]);
 
   // initial load
   useEffect(() => {
     (async () => {
       setLoading(true);
       await Promise.all([loadWallet(), loadCategories()]);
+      await loadRecent();
       setLoading(false);
     })();
-  }, [loadWallet, loadCategories]);
+  }, [loadWallet, loadCategories, loadRecent]);
 
-  // After we know the wallet address, load its demo history
+  // reload recent whenever wallet address becomes available
   useEffect(() => {
-    if (!DEMO_MODE || !walletAddress) return;
-    (async () => {
-      const store = await getDemoTxStore();
-      const list = Array.isArray(store[walletAddress])
-        ? store[walletAddress]
-        : [];
-      setRecent(list);
-    })();
-  }, [walletAddress]);
+    if (!walletAddress) return;
+    loadRecent();
+  }, [walletAddress, loadRecent]);
 
   // Sync when navigation presets change (while mounted)
   useEffect(() => {
@@ -393,132 +310,47 @@ const WalletScreen = () => {
     setToAddress(rec.wallet);
   };
 
-  // ---- send handler ----
+  // ---- send handler (backend only) ----
   const handleSend = async () => {
     if (!canSend) return;
 
     setSending(true);
     try {
-      if (DEMO_MODE) {
-        if (!walletAddress) {
-          throw new Error("No wallet address for this account");
-        }
+      const recipient = (toAddress || "").trim();
 
-        await new Promise((r) => setTimeout(r, 500));
+      const payloadBody = {
+        to: recipient,
+        amount: parsedAmt,
+        note: service,
+        category: sendCategory,
+      };
 
-        // Load ledger, adjust sender & recipient
-        const ledger = await getDemoLedger();
-        const sender = walletAddress;
-        const recipient = (toAddress || "").trim();
-
-        const rawSenderBal =
-          typeof ledger[sender] === "number" && Number.isFinite(ledger[sender])
-            ? ledger[sender]
-            : typeof balance === "number"
-            ? balance
-            : 0;
-
-        if (!Number.isFinite(parsedAmt) || parsedAmt <= 0) {
-          Alert.alert("Invalid amount", "Enter a valid positive amount.");
-          setSending(false);
-          return;
-        }
-
-        if (parsedAmt > rawSenderBal) {
-          Alert.alert(
-            "Insufficient funds",
-            "This demo wallet doesn’t have enough ESC for that transfer."
-          );
-          setSending(false);
-          return;
-        }
-
-        const newSenderBal = Math.max(0, rawSenderBal - parsedAmt);
-
-        // Recipient gets seeded if first time
-        let rawRecipientBal;
-        if (
-          typeof ledger[recipient] === "number" &&
-          Number.isFinite(ledger[recipient])
-        ) {
-          rawRecipientBal = ledger[recipient];
-        } else {
-          rawRecipientBal = DEMO_SEED;
-          ledger[recipient] = DEMO_SEED;
-        }
-        const newRecipientBal = rawRecipientBal + parsedAmt;
-
-        ledger[sender] = newSenderBal;
-        if (recipient && recipient.length >= 10) {
-          ledger[recipient] = newRecipientBal;
-        }
-
-        await saveDemoLedger(ledger);
-
-        setBalance(newSenderBal);
-
-        const tx = {
-          id: `demo_${Date.now()}`,
-          from: sender,
-          to: recipient,
-          amount: parsedAmt,
-          status: "confirmed",
-          service,
-          category: sendCategory,
-          timestamp: new Date().toISOString(),
-          fromBookingId,
-        };
-
-        // Persist tx history per wallet (sender + recipient)
-        const txStore = await getDemoTxStore();
-        const senderList = Array.isArray(txStore[sender])
-          ? txStore[sender]
-          : [];
-        txStore[sender] = [tx, ...senderList].slice(0, 20);
-
-        if (recipient && recipient.length >= 10) {
-          const recipList = Array.isArray(txStore[recipient])
-            ? txStore[recipient]
-            : [];
-          txStore[recipient] = [tx, ...recipList].slice(0, 20);
-        }
-        await saveDemoTxStore(txStore);
-
-        // Update local recent from sender perspective
-        setRecent((prev) => [tx, ...prev].slice(0, 10));
-
-        Alert.alert(
-          "Sent (Demo)",
-          `Paid ${parsedAmt} ESC to ${trimAddr(
-            query || recipient,
-            6
-          )} for “${service}” (${sendCategory}).`
-        );
-
-        // Let Bookings screen know this booking just got paid (demo)
-        if (fromBookingId && navigation?.navigate) {
-          navigation.navigate("Bookings", {
-            paidBookingId: fromBookingId,
-            paidTx: tx,
-          });
-        }
-
-        // Clear form AFTER using query/toAddress in alert
-        setAmount("");
-        setToAddress("");
-        setService("");
-      } else {
-        // TODO: wire your real endpoint
-        // const payload = await api.post("/wallet/send/", {
-        //   to: toAddress,
-        //   amount: parsedAmt,
-        //   note: service,
-        //   category: sendCategory,
-        //   booking_id: fromBookingId,
-        // });
-        // await loadWallet();
-        // // Optional: update recent from server payload
+      if (fromBookingId) {
+        payloadBody.booking_id = fromBookingId;
       }
+
+      await api.post("/wallet/send/", { body: payloadBody });
+      await loadWallet();
+      await loadRecent();
+
+      Alert.alert(
+        "Sent",
+        `Paid ${parsedAmt} ESC to ${trimAddr(
+          query || recipient,
+          6
+        )} for “${service}” (${sendCategory}).`
+      );
+
+      if (fromBookingId && navigation?.navigate) {
+        navigation.navigate("Bookings", {
+          paidBookingId: fromBookingId,
+        });
+      }
+
+      // Clear form AFTER using query/toAddress in alert
+      setAmount("");
+      setToAddress("");
+      setService("");
     } catch (e) {
       console.error("❌ Send Error:", e?.data || e?.message || e);
       Alert.alert(
@@ -616,11 +448,7 @@ const WalletScreen = () => {
     <View style={styles.card}>
       <View style={styles.cardHeaderRow}>
         <Text style={styles.cardHeader}>Send ESC</Text>
-        {DEMO_MODE ? (
-          <Text style={styles.tag}>Demo</Text>
-        ) : (
-          <Text style={styles.tagAlt}>Live</Text>
-        )}
+        <Text style={styles.tagAlt}>Live</Text>
       </View>
 
       {fromBookingId ? (
@@ -701,9 +529,7 @@ const WalletScreen = () => {
 
       <View style={styles.feeRow}>
         <Text style={styles.feeText}>Network fee</Text>
-        <Text style={styles.feeTextValue}>
-          {DEMO_MODE ? "—" : "estimate…"}
-        </Text>
+        <Text style={styles.feeTextValue}>estimate…</Text>
       </View>
 
       <Pressable
@@ -717,9 +543,7 @@ const WalletScreen = () => {
       </Pressable>
 
       <Text style={styles.disclaimer}>
-        {DEMO_MODE
-          ? "Demo mode updates balances locally per wallet on this device. Connect real transfers when ready."
-          : "Transfers are final. Double-check the recipient, category, and purpose."}
+        Transfers are final. Double-check the recipient, category, and purpose.
       </Text>
     </View>
   );
@@ -825,14 +649,6 @@ const WalletScreen = () => {
             />
           )}
           <Text style={styles.footer}>America/Chicago</Text>
-
-          {/* DEV ONLY: reset demo ledger */}
-          <Pressable
-            onPress={resetDemoLedger}
-            style={[styles.smallBtn, { alignSelf: "center", marginTop: 8 }]}
-          >
-            <Text style={styles.smallBtnText}>Reset Demo Ledger</Text>
-          </Pressable>
         </ScrollView>
       </Animated.View>
     </SafeAreaView>
@@ -889,6 +705,17 @@ const styles = StyleSheet.create({
     borderWidth: 1,
   },
   smallBtnText: { color: THEME.accentGold, fontWeight: "700" },
+
+  tagAlt: {
+    color: THEME.accentGold,
+    fontSize: 11,
+    fontWeight: "800",
+    paddingHorizontal: 10,
+    paddingVertical: 4,
+    borderRadius: 999,
+    borderWidth: 1,
+    borderColor: THEME.accentGold,
+  },
 
   addrLabel: { color: "#b7b7bf", fontSize: 12, marginTop: 8 },
   addrValue: { color: THEME.text, fontSize: 13, marginTop: 2 },

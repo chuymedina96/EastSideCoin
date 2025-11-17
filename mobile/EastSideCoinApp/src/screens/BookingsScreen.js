@@ -205,50 +205,6 @@ const BookingsScreen = ({ navigation }) => {
     }
   };
 
-  // ---------- DEMO PAYMENT RECEIPTS ----------
-
-  const applyDemoReceipt = useCallback((bookingId, tx) => {
-    if (!bookingId || !tx) return;
-    setBkItems((prev) =>
-      prev.map((b) =>
-        String(b.id) === String(bookingId)
-          ? {
-              ...b,
-              paid_demo: true,
-              last_payment_demo: {
-                ...tx,
-                timestamp: tx.timestamp || new Date().toISOString(),
-              },
-            }
-          : b
-      )
-    );
-  }, []);
-
-  // Listen for navigation params from Wallet: { paidBookingId, paidTx }
-  useEffect(() => {
-    const paidId = route?.params?.paidBookingId;
-    const paidTx = route?.params?.paidTx;
-    if (!paidId || !paidTx) return;
-
-    applyDemoReceipt(paidId, paidTx);
-
-    // Clear params so it doesn't re-apply on every re-focus
-    try {
-      navigation?.setParams?.({
-        ...route.params,
-        paidBookingId: undefined,
-        paidTx: undefined,
-      });
-    } catch {}
-  }, [
-    route?.params?.paidBookingId,
-    route?.params?.paidTx,
-    route?.params,
-    navigation,
-    applyDemoReceipt,
-  ]);
-
   // start payment flow for a completed booking
   const startPaymentForBooking = useCallback(
     (booking) => {
@@ -270,8 +226,7 @@ const BookingsScreen = ({ navigation }) => {
       } on ${fmtTime(booking?.start_at)}`;
 
       const category = booking?.service?.category || "General";
-      const amount =
-        booking?.price_snapshot ?? booking?.service?.price ?? 0;
+      const amount = booking?.price_snapshot ?? booking?.service?.price ?? 0;
 
       navigation?.navigate?.("Wallet", {
         fromBookingId: booking.id,
@@ -305,7 +260,6 @@ const BookingsScreen = ({ navigation }) => {
     const mineAsProvider = String(meId) === String(booking?.provider?.id);
     const mineAsClient = String(meId) === String(booking?.client?.id);
     const s = booking?.status;
-    const alreadyPaid = booking?.paid_demo || !!booking?.last_payment_demo;
     const act = [];
 
     if (s === "pending") {
@@ -315,18 +269,16 @@ const BookingsScreen = ({ navigation }) => {
       if (mineAsProvider) act.push("Complete");
       if (mineAsClient || mineAsProvider) act.push("Cancel");
     } else if (s === "completed") {
-      // After completion:
-      // - client can Pay if not yet paid (demo)
-      // - once there's a last_payment_demo, both sides can view the receipt
-      if (mineAsClient && !alreadyPaid) act.push("Pay");
-      if (alreadyPaid && (mineAsClient || mineAsProvider)) act.push("Receipt");
+      // In live mode:
+      // - client can always tap Pay (backend + wallet handle real payment & receipts)
+      if (mineAsClient) act.push("Pay");
     }
     return act;
   };
 
   const postAction = async (id, action) => {
-    // "Pay" and "Receipt" are handled locally (Wallet / modal), no server mutation
-    if (action === "Pay" || action === "Receipt") return;
+    // "Pay" is handled locally (Wallet navigation), no server mutation here
+    if (action === "Pay") return;
 
     const call = {
       Confirm: () => confirmBooking(id),
@@ -374,13 +326,9 @@ const BookingsScreen = ({ navigation }) => {
   };
 
   const confirmBkAction = (b, action) => {
-    // Special handling: Pay → go to Wallet, Receipt → open detail
+    // Special handling: Pay → go to Wallet
     if (action === "Pay") {
       startPaymentForBooking(b);
-      return;
-    }
-    if (action === "Receipt") {
-      openDetail(b);
       return;
     }
 
@@ -442,7 +390,6 @@ const BookingsScreen = ({ navigation }) => {
         : targetUser?.email || "Neighbor";
 
     const avatarUri = resolveAvatarUri(targetUser);
-    const lastPay = item.last_payment_demo;
 
     return (
       <Pressable
@@ -488,21 +435,6 @@ const BookingsScreen = ({ navigation }) => {
           {fmtTime(item.start_at)} → {fmtTimeOnly(item.end_at)}
         </Text>
 
-        {/* Demo receipt block */}
-        {lastPay ? (
-          <View style={styles.receiptBox}>
-            <Text style={styles.receiptTitle}>Last payment (demo)</Text>
-            <Text style={styles.receiptLine}>
-              {`${(lastPay.amount ?? 0).toLocaleString(undefined, {
-                minimumFractionDigits: 2,
-                maximumFractionDigits: 6,
-              })} ESC • ${new Date(
-                lastPay.timestamp
-              ).toLocaleString()}`}
-            </Text>
-          </View>
-        ) : null}
-
         <View className="cardFooter" style={styles.cardFooter}>
           <Text style={styles.price}>
             {(item.price_snapshot ?? 0).toLocaleString(undefined, {
@@ -521,12 +453,9 @@ const BookingsScreen = ({ navigation }) => {
                   a === "Confirm" && styles.actionBtnPrimary,
                   a === "Complete" && styles.actionBtnSuccess,
                   a === "Pay" && styles.actionBtnPay,
-                  a === "Receipt" && styles.actionBtnReceipt,
                 ]}
               >
-                <Text style={styles.actionBtnText}>
-                  {a === "Receipt" ? "View receipt" : a}
-                </Text>
+                <Text style={styles.actionBtnText}>{a}</Text>
               </Pressable>
             ))}
           </View>
@@ -756,6 +685,21 @@ const BookingsScreen = ({ navigation }) => {
     ]);
     setBkRefreshing(false);
   }, [fetchBookingsProxy, refreshMonthAvailability, monthCursor]);
+
+  // When returning from Wallet with a paid booking, refresh from backend
+  useEffect(() => {
+    const paidId = route?.params?.paidBookingId;
+    if (!paidId) return;
+
+    onRefresh();
+
+    try {
+      navigation?.setParams?.({
+        ...route.params,
+        paidBookingId: undefined,
+      });
+    } catch {}
+  }, [route?.params?.paidBookingId, route?.params, navigation, onRefresh]);
 
   const CalendarStrip = () => (
     <ScrollView
@@ -1066,50 +1010,31 @@ const BookingsScreen = ({ navigation }) => {
                   </View>
                 ) : null}
 
-                {detailBk?.last_payment_demo ? (
-                  <View style={[styles.receiptBox, { marginTop: 10 }]}>
-                    <Text style={styles.receiptTitle}>Last payment (demo)</Text>
-                    <Text style={styles.receiptLine}>
-                      {`${(detailBk.last_payment_demo.amount ?? 0).toLocaleString(
-                        undefined,
-                        {
-                          minimumFractionDigits: 2,
-                          maximumFractionDigits: 6,
-                        }
-                      )} ESC • ${new Date(
-                        detailBk.last_payment_demo.timestamp
-                      ).toLocaleString()}`}
-                    </Text>
-                  </View>
-                ) : null}
-
                 <View
                   style={[
                     styles.row,
                     { gap: 8, marginTop: 16, flexWrap: "wrap" },
                   ]}
                 >
-                  {actionsFor(detailBk)
-                    .filter((a) => a !== "Receipt") // already in this modal
-                    .map((a) => (
-                      <Pressable
-                        key={a}
-                        onPress={() => {
-                          closeDetail();
-                          confirmBkAction(detailBk, a);
-                        }}
-                        style={[
-                          styles.primaryBtn,
-                          a === "Confirm" && {
-                            backgroundColor: THEME.accentOrange,
-                          },
-                          a === "Complete" && { backgroundColor: "#1f3b2a" },
-                          a === "Pay" && { backgroundColor: "#1b2a4b" },
-                        ]}
-                      >
-                        <Text style={styles.primaryBtnText}>{a}</Text>
-                      </Pressable>
-                    ))}
+                  {actionsFor(detailBk).map((a) => (
+                    <Pressable
+                      key={a}
+                      onPress={() => {
+                        closeDetail();
+                        confirmBkAction(detailBk, a);
+                      }}
+                      style={[
+                        styles.primaryBtn,
+                        a === "Confirm" && {
+                          backgroundColor: THEME.accentOrange,
+                        },
+                        a === "Complete" && { backgroundColor: "#1f3b2a" },
+                        a === "Pay" && { backgroundColor: "#1b2a4b" },
+                      ]}
+                    >
+                      <Text style={styles.primaryBtnText}>{a}</Text>
+                    </Pressable>
+                  ))}
                   <Pressable onPress={closeDetail} style={styles.secondaryBtn}>
                     <Text style={styles.secondaryBtnText}>Close</Text>
                   </Pressable>
@@ -1300,23 +1225,6 @@ const styles = StyleSheet.create({
 
   desc: { color: THEME.subtext, marginTop: 8, lineHeight: 18 },
 
-  receiptBox: {
-    marginTop: 10,
-    paddingVertical: 8,
-    paddingHorizontal: 10,
-    borderRadius: 10,
-    backgroundColor: "#181d26",
-    borderWidth: 1,
-    borderColor: "#22355f",
-  },
-  receiptTitle: {
-    color: "#cfe0ff",
-    fontWeight: "800",
-    fontSize: 12,
-    marginBottom: 2,
-  },
-  receiptLine: { color: THEME.subtext, fontSize: 12 },
-
   cardFooter: {
     flexDirection: "row",
     gap: 10,
@@ -1349,7 +1257,6 @@ const styles = StyleSheet.create({
   },
   actionBtnSuccess: { backgroundColor: "#1f3b2a", borderColor: "#2c6e49" },
   actionBtnPay: { backgroundColor: "#1b2a4b", borderColor: "#22355f" },
-  actionBtnReceipt: { backgroundColor: "#181d26", borderColor: "#22355f" },
   actionBtnText: { color: "#fff", fontWeight: "800", fontSize: 12 },
 
   emptyWrap: { alignItems: "center", paddingVertical: 48 },
