@@ -124,16 +124,11 @@ const HomeScreen = () => {
   // Quote of the day
   const [quote, setQuote] = useState(null);
 
-  // Mini-game state
-  const [score, setScore] = useState(0);
-  const [streak, setStreak] = useState(0);
-  const coinAnim = useRef(new Animated.Value(0)).current;
-
   // Dashboard / economy metrics
   const [econ, setEcon] = useState(null);
   const [econLoading, setEconLoading] = useState(false);
   const [econError, setEconError] = useState("");
-  const [econExpanded, setEconExpanded] = useState(false); // 🔻 dropdown toggle
+  const [econExpanded, setEconExpanded] = useState(false);
 
   // Animations
   const fadeIn = useRef(new Animated.Value(0)).current;
@@ -322,10 +317,8 @@ const HomeScreen = () => {
   // ---------- ESC-accepting spots (Food) ----------
   const loadEscSpots = useCallback(async () => {
     try {
-      // Filters to Food — adjust category labels as your backend uses them
       const data = await listServices({ category: "Food", limit: 12 });
       const list = Array.isArray(data?.results) ? data.results : Array.isArray(data) ? data : [];
-      // pick the first 6; if later you add accepts_esc flag, filter by it here
       setEscSpots(list.slice(0, 6));
       await AsyncStorage.setItem("home_esc_spots_cache", JSON.stringify(list.slice(0, 12)));
     } catch (e) {
@@ -334,55 +327,6 @@ const HomeScreen = () => {
       if (cached) setEscSpots(JSON.parse(cached).slice(0, 6));
     }
   }, []);
-
-  // ---------- mini-game: load streak/score ----------
-  const loadGame = useCallback(async () => {
-    const raw = await AsyncStorage.getItem("home_coin_game");
-    if (raw) {
-      const { score: s = 0, streak: st = 0, lastDate = "" } = JSON.parse(raw) || {};
-      const today = new Date().toISOString().slice(0, 10);
-      const newStreak = lastDate === today ? st : lastDate ? st + 1 : 1;
-      setScore(s);
-      setStreak(newStreak);
-      await AsyncStorage.setItem(
-        "home_coin_game",
-        JSON.stringify({ score: s, streak: newStreak, lastDate: today })
-      );
-    } else {
-      const today = new Date().toISOString().slice(0, 10);
-      setScore(0);
-      setStreak(1);
-      await AsyncStorage.setItem(
-        "home_coin_game",
-        JSON.stringify({ score: 0, streak: 1, lastDate: today })
-      );
-    }
-  }, []);
-
-  const saveGame = useCallback(async (s, st) => {
-    const today = new Date().toISOString().slice(0, 10);
-    await AsyncStorage.setItem(
-      "home_coin_game",
-      JSON.stringify({ score: s, streak: st, lastDate: today })
-    );
-  }, []);
-
-  const tapCoin = useCallback(() => {
-    const next = score + 1;
-    setScore(next);
-    saveGame(next, streak);
-    // little bounce
-    coinAnim.setValue(0);
-    Animated.timing(coinAnim, {
-      toValue: 1,
-      duration: 240,
-      easing: Easing.out(Easing.quad),
-      useNativeDriver: true,
-    }).start();
-  }, [score, streak, saveGame, coinAnim]);
-
-  const coinScale = coinAnim.interpolate({ inputRange: [0, 1], outputRange: [1, 1.16] });
-  const coinUp = coinAnim.interpolate({ inputRange: [0, 1], outputRange: [0, -4] });
 
   // ---------- ECONOMY DASHBOARD ----------
   const loadEconomy = useCallback(async () => {
@@ -414,7 +358,7 @@ const HomeScreen = () => {
             page: 1,
           }).catch(() => []),
           listServices({ limit: 500 }).catch(() => []),
-          api.get(`/esc/stats/?days=${HISTORY_DAYS}`).catch(() => null), // ✅ backend-driven ESC stats & price history
+          api.get(`/esc/stats/?days=${HISTORY_DAYS}`).catch(() => null),
         ]);
 
       const walletBalance = Number(walletPayload?.balance ?? 0);
@@ -527,7 +471,7 @@ const HomeScreen = () => {
           (priceUSD && volume24hESC ? priceUSD * volume24hESC : 0)
       );
 
-      // LP values – from stats if available, otherwise compute simple USDC * 5x as placeholder
+      // LP / AMM values
       const lpEsc = Number(
         stats.lp_esc ??
           stats.lpEsc ??
@@ -578,6 +522,38 @@ const HomeScreen = () => {
           0
       );
 
+      // AMM / exchange sim stats (from EscEconomySnapshot)
+      const ammInitialPriceUSD = Number(
+        stats.amm_initial_price_usd ??
+          stats.ammInitialPriceUsd ??
+          0
+      );
+      const ammFinalPriceUSD = Number(
+        stats.amm_final_price_usd ??
+          stats.ammFinalPriceUsd ??
+          0
+      );
+      const ammTrades = Number(
+        stats.amm_trades ??
+          stats.ammTrades ??
+          0
+      );
+      const ammTotalUsdcIn = Number(
+        stats.amm_total_usdc_in ??
+          stats.ammTotalUsdcIn ??
+          0
+      );
+      const ammTotalEscOut = Number(
+        stats.amm_total_esc_out ??
+          stats.ammTotalEscOut ??
+          0
+      );
+      const ammImpliedMarketCapUSD = Number(
+        stats.amm_implied_market_cap_usd ??
+          stats.ammImpliedMarketCapUsd ??
+          0
+      );
+
       const rawHistory = stats.price_history ?? stats.priceHistory ?? [];
       const priceHistory = Array.isArray(rawHistory)
         ? rawHistory
@@ -585,10 +561,15 @@ const HomeScreen = () => {
             .filter((v) => typeof v === "number" && !Number.isNaN(v))
         : [];
 
+      const priceLabelsRaw =
+        stats.price_labels ??
+        stats.priceLabels ??
+        null;
+
       const priceLabels =
-        Array.isArray(stats.price_labels ?? stats.priceLabels) &&
-        (stats.price_labels ?? stats.priceLabels).length === priceHistory.length
-          ? stats.price_labels ?? stats.priceLabels
+        Array.isArray(priceLabelsRaw) &&
+        priceLabelsRaw.length === priceHistory.length
+          ? priceLabelsRaw
           : null;
 
       const historyDays = Number(stats.history_days ?? stats.historyDays ?? HISTORY_DAYS);
@@ -627,9 +608,17 @@ const HomeScreen = () => {
         mintedUSD,
         lpEsc,
         lpUsdc,
-        priceHistory, // ✅ backend-driven price history
-        priceLabels, // ✅ optional backend labels for the chart
-        historyDays, // ✅ window of days for the chart
+        priceHistory,
+        priceLabels,
+        historyDays,
+
+        // AMM / LP sim
+        ammInitialPriceUSD,
+        ammFinalPriceUSD,
+        ammTrades,
+        ammTotalUsdcIn,
+        ammTotalEscOut,
+        ammImpliedMarketCapUSD,
 
         // wallet + marketplace flow (last N days)
         walletBalance,
@@ -662,8 +651,7 @@ const HomeScreen = () => {
         loadBridgeInfo(),
         loadTraffic(),
         loadEscSpots(),
-        loadGame(),
-        loadEconomy(), // ✅ include econ on boot
+        loadEconomy(),
       ]);
       setLoading(false);
     })();
@@ -675,7 +663,6 @@ const HomeScreen = () => {
     loadBridgeInfo,
     loadTraffic,
     loadEscSpots,
-    loadGame,
     loadEconomy,
   ]);
 
@@ -689,7 +676,7 @@ const HomeScreen = () => {
       loadBridgeInfo(),
       loadTraffic(),
       loadEscSpots(),
-      loadEconomy(), // ✅ refresh econ as well
+      loadEconomy(),
     ]);
     setRefreshing(false);
   }, [
@@ -745,32 +732,39 @@ const HomeScreen = () => {
     return { circPct, burnedPct, reservesPct, circ, burned, reserves };
   }, [econ]);
 
-  // Price chart labels: prefer backend labels; otherwise auto-generate based on window
+  // Price chart labels: downsample to keep x-axis clean
   const priceChartLabels = useMemo(() => {
     if (!econ || !Array.isArray(econ.priceHistory) || econ.priceHistory.length < 2) {
-      return null;
+      return [];
     }
     const len = econ.priceHistory.length;
 
+    let base;
     if (econ.priceLabels && Array.isArray(econ.priceLabels) && econ.priceLabels.length === len) {
-      return econ.priceLabels;
+      base = econ.priceLabels;
+    } else {
+      const windowDays = econ.historyDays || HISTORY_DAYS;
+      if (windowDays && windowDays === len) {
+        base = Array.from({ length: len }, (_, idx) => {
+          if (idx === len - 1) return "Now";
+          const daysAgo = len - 1 - idx;
+          return `-${daysAgo}d`;
+        });
+      } else {
+        base = Array.from({ length: len }, (_, idx) =>
+          idx === len - 1 ? "Now" : `D-${len - 1 - idx}`
+        );
+      }
     }
 
-    const windowDays = econ.historyDays || HISTORY_DAYS;
+    const MAX_LABELS = 7;
+    if (base.length <= MAX_LABELS) return base;
 
-    // If backend window matches history length, label as -Xd ... Today
-    if (windowDays && windowDays === len) {
-      return Array.from({ length: len }, (_, idx) => {
-        if (idx === len - 1) return "Now";
-        const daysAgo = len - 1 - idx;
-        return `-${daysAgo}d`;
-      });
-    }
-
-    // Fallback generic labels
-    return Array.from({ length: len }, (_, idx) =>
-      idx === len - 1 ? "Now" : `D-${len - 1 - idx}`
-    );
+    const step = Math.max(1, Math.floor((base.length - 1) / (MAX_LABELS - 1)));
+    return base.map((label, idx) => {
+      if (idx === base.length - 1) return "Now";
+      return idx % step === 0 ? label : "";
+    });
   }, [econ]);
 
   const NewsCard = ({ item, idx }) => (
@@ -856,7 +850,16 @@ const HomeScreen = () => {
               {greeting}
               {user?.first_name ? `, ${user.first_name}` : ""}
             </Text>
-            <Text style={styles.title}>EastSide Coin</Text>
+
+            {/* Easter egg: long press the title to open the Flappy ESC game */}
+            <TouchableOpacity
+              activeOpacity={0.8}
+              onLongPress={() => navigation.navigate("FlappyESC")}
+              delayLongPress={800} // hold for 0.8s so it feels intentional
+            >
+              <Text style={styles.title}>EastSide Coin</Text>
+            </TouchableOpacity>
+
             <Text style={styles.subtleDate}>{today} • America/Chicago</Text>
           </Animated.View>
 
@@ -968,6 +971,36 @@ const HomeScreen = () => {
                           LP tokens: {fmtInt(econ.lpTokens)}
                         </Text>
                       </View>
+
+                      {/* AMM / exchange sim metrics */}
+                      <View style={styles.metricBox}>
+                        <Text style={styles.metricLabel}>AMM sim price</Text>
+                        <Text style={styles.metricValue}>
+                          {fmtUSD(econ.ammFinalPriceUSD || 0)}
+                        </Text>
+                        <Text style={styles.metricTiny}>
+                          Start {fmtUSD(econ.ammInitialPriceUSD || 0)}
+                        </Text>
+                      </View>
+
+                      <View style={styles.metricBox}>
+                        <Text style={styles.metricLabel}>AMM trades</Text>
+                        <Text style={styles.metricValue}>{fmtInt(econ.ammTrades || 0)}</Text>
+                        <Text style={styles.metricTiny}>
+                          In: {fmtUSD(econ.ammTotalUsdcIn || 0)} · Out:{" "}
+                          {fmtEsc(econ.ammTotalEscOut || 0)} ESC
+                        </Text>
+                      </View>
+
+                      <View style={styles.metricBox}>
+                        <Text style={styles.metricLabel}>AMM implied cap</Text>
+                        <Text style={styles.metricValue}>
+                          {fmtUSD(econ.ammImpliedMarketCapUSD || 0)}
+                        </Text>
+                        <Text style={styles.metricTiny}>
+                          Based on AMM circulating slice
+                        </Text>
+                      </View>
                     </View>
 
                     {/* Reserve callout for founder reserve (dynamic, not hard-coded) */}
@@ -981,8 +1014,8 @@ const HomeScreen = () => {
                           {fmtUSD(econ.founderReserveUSD)}
                         </Text>
                         <Text style={styles.metricTiny}>
-                          Not counted in market cap — can be dripped in later to stabilize the
-                          neighborhood economy.
+                          Not counted in market cap — can be dripped in later to
+                          stabilize the neighborhood economy.
                         </Text>
                       </View>
                     ) : null}
@@ -996,11 +1029,11 @@ const HomeScreen = () => {
                               ESC price (last {econ.historyDays || HISTORY_DAYS} days)
                             </Text>
                             <Text style={styles.chartSubtitle}>
-                              Purely from /esc/stats/ — sim + real trades driving up price over this window.
+                              Driven by ESC stats and the latest simulation window.
                             </Text>
                             <LineChart
                               data={{
-                                labels: priceChartLabels || [],
+                                labels: priceChartLabels,
                                 datasets: [{ data: econ.priceHistory }],
                               }}
                               width={SCREEN_WIDTH - 64}
@@ -1335,26 +1368,6 @@ const HomeScreen = () => {
             </Text>
           </View>
 
-          {/* Mini Retro Game: Coin Tap */}
-          <View style={styles.card}>
-            <View style={styles.cardHeaderRow}>
-              <Text style={styles.cardHeader}>Mini Game • Coin Tap</Text>
-              <Text style={styles.tag}>Just for fun</Text>
-            </View>
-            <Text style={styles.gameMeta}>
-              Daily streak: {streak} day{streak === 1 ? "" : "s"}
-            </Text>
-            <Text style={styles.gameMeta}>Score: {score}</Text>
-            <Animated.View style={{ transform: [{ scale: coinScale }, { translateY: coinUp }] }}>
-              <TouchableOpacity onPress={tapCoin} style={styles.coinBtn} activeOpacity={0.8}>
-                <Text style={styles.coinBtnText}>🪙 Tap</Text>
-              </TouchableOpacity>
-            </Animated.View>
-            <Text style={styles.note}>
-              Tap to collect coins. It’s silly on purpose. 😄
-            </Text>
-          </View>
-
           {/* Footer */}
           <Text style={styles.footer}>America/Chicago</Text>
         </ScrollView>
@@ -1669,20 +1682,6 @@ const styles = StyleSheet.create({
   // Traffic
   trafficLine: { color: "#BEBEBE", fontSize: 13, marginTop: 3 },
   bold: { color: "#EEE", fontWeight: "700" },
-
-  // Mini-game
-  gameMeta: { color: "#BEBEBE", fontSize: 12, marginBottom: 6 },
-  coinBtn: {
-    alignSelf: "center",
-    backgroundColor: "#FF7A1B",
-    paddingVertical: 12,
-    paddingHorizontal: 26,
-    borderRadius: 999,
-    borderWidth: 2,
-    borderColor: "#FFB067",
-    marginTop: 6,
-  },
-  coinBtnText: { color: "#fff", fontSize: 18, fontWeight: "900", letterSpacing: 0.5 },
 
   // Common
   smallBtn: {

@@ -460,11 +460,13 @@ class EscEconomySnapshot(models.Model):
     """
     High-level summary of the ESC economy for a given simulation or time window.
     Used so the app / dashboard can show:
-      - price change
-      - volume
-      - tx counts
+      - neighborhood price change
+      - volume + tx counts
       - circulating supply
       - on-ramp stats
+      - AMM behavior for the LP
+      - zero-wallet DEX refill analytics
+      - hypothetical extra-mint behavior
     """
 
     label = models.CharField(
@@ -472,7 +474,7 @@ class EscEconomySnapshot(models.Model):
         help_text="Short label for this snapshot (e.g. 'demo_20251116_1200').",
     )
 
-    # Core tokenomics
+    # Core tokenomics (base)
     total_supply_esc = models.DecimalField(
         max_digits=20, decimal_places=4, default=Decimal("0")
     )
@@ -489,7 +491,23 @@ class EscEconomySnapshot(models.Model):
         max_digits=20, decimal_places=4, default=Decimal("0")
     )
 
-    # Prices
+    # Effective supply after Sarafu-style protocol mint inside the neighborhood sim
+    effective_total_supply_esc = models.DecimalField(
+        max_digits=20, decimal_places=4, default=Decimal("0")
+    )
+    minted_esc = models.DecimalField(
+        max_digits=20, decimal_places=4, default=Decimal("0")
+    )
+
+    # 🧪 Hypothetical extra-mint scenario (e.g. +9M ESC to treasury)
+    extra_mint_esc = models.DecimalField(
+        max_digits=20, decimal_places=4, default=Decimal("0")
+    )
+    hypothetical_total_supply_esc = models.DecimalField(
+        max_digits=20, decimal_places=4, default=Decimal("0")
+    )
+
+    # Neighborhood reference prices (curve-based)
     price_initial_usd = models.DecimalField(
         max_digits=20, decimal_places=6, default=Decimal("0")
     )
@@ -497,7 +515,7 @@ class EscEconomySnapshot(models.Model):
         max_digits=20, decimal_places=6, default=Decimal("0")
     )
 
-    # Activity over the window
+    # Neighborhood activity over the window
     burned_esc = models.DecimalField(
         max_digits=20, decimal_places=4, default=Decimal("0")
     )
@@ -514,11 +532,38 @@ class EscEconomySnapshot(models.Model):
         max_digits=20, decimal_places=4, default=Decimal("0")
     )
 
-    # Snapshot of circulating state at end of window
+    # Snapshot of circulating state at end of window (all wallets)
     circulating_supply_esc = models.DecimalField(
         max_digits=20, decimal_places=4, default=Decimal("0")
     )
     holder_count = models.PositiveIntegerField(default=0)
+
+    # 🔁 AMM / LP stats (for sim of ESC/USDC constant-product pool)
+    amm_initial_price_usd = models.DecimalField(
+        max_digits=20, decimal_places=6, default=Decimal("0")
+    )
+    amm_final_price_usd = models.DecimalField(
+        max_digits=20, decimal_places=6, default=Decimal("0")
+    )
+    amm_trades = models.PositiveIntegerField(default=0)
+    amm_total_usdc_in = models.DecimalField(
+        max_digits=20, decimal_places=4, default=Decimal("0")
+    )
+    amm_total_esc_out = models.DecimalField(
+        max_digits=20, decimal_places=4, default=Decimal("0")
+    )
+    amm_implied_market_cap_usd = models.DecimalField(
+        max_digits=20, decimal_places=4, default=Decimal("0")
+    )
+
+    # 🏦 DEX refill analytics (zero-balance wallets)
+    dex_zero_wallets = models.PositiveIntegerField(default=0)
+    dex_refill_esc = models.DecimalField(
+        max_digits=20, decimal_places=4, default=Decimal("0")
+    )
+    dex_refill_usdc = models.DecimalField(
+        max_digits=20, decimal_places=4, default=Decimal("0")
+    )
 
     # Time window this summary covers
     window_start = models.DateTimeField()

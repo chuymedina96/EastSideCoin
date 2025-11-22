@@ -13,11 +13,12 @@ import HomeScreen from "../screens/HomeScreen";
 import WalletScreen from "../screens/WalletScreen";
 import ChatScreen from "../screens/ChatScreen";
 import ServicesScreen from "../screens/ServicesScreen";
-import BookingsScreen from "../screens/BookingsScreen"; // new
+import BookingsScreen from "../screens/BookingsScreen";
 import ProfileScreen from "../screens/ProfileScreen";
 import KeyScreenSetup from "../screens/KeyScreenSetup";
 import OnboardingScreen from "../screens/OnboardingScreen";
 import UserProfile from "../screens/UserProfile";
+import FlappyEscScreen from "../screens/FlappyEscScreen"; // Flappy ESC game
 
 const AuthStack = createNativeStackNavigator();
 const AppStack = createNativeStackNavigator();
@@ -28,7 +29,7 @@ const iconMap = {
   Wallet: "wallet",
   Chat: "chatbubbles",
   Services: "briefcase",
-  Bookings: "calendar",   // new icon
+  Bookings: "calendar",
   Profile: "person",
 };
 
@@ -59,7 +60,6 @@ const HomeTabs = () => (
   >
     <Tab.Screen name="Home" component={HomeScreen} />
     <Tab.Screen name="Wallet" component={WalletScreen} />
-    {/* Use the tab name "Chat" when navigating, not "ChatScreen" */}
     <Tab.Screen
       name="Chat"
       component={ChatScreen}
@@ -91,8 +91,7 @@ const AuthNavigator = () => (
 );
 
 /**
- * We render distinct trees so the correct initial route is guaranteed.
- * No imperative resets needed from AuthProvider for normal flows.
+ * Distinct trees so the correct initial route is guaranteed.
  */
 const AppNavigator = () => {
   const { user, keysReady } = useContext(AuthContext);
@@ -140,8 +139,16 @@ const AppNavigator = () => {
           options={{ gestureEnabled: false }}
         />
         <AppStack.Screen name="HomeTabs" component={HomeTabs} />
-        {/* User profile still available during onboarding */}
         <AppStack.Screen name="UserProfile" component={UserProfile} />
+        {/* Easter egg game available even during onboarding if you navigate to it */}
+        <AppStack.Screen
+          name="FlappyESC"
+          component={FlappyEscScreen}
+          options={{
+            headerShown: false,
+            animation: "slide_from_right",
+          }}
+        />
       </AppStack.Navigator>
     );
   }
@@ -158,8 +165,16 @@ const AppNavigator = () => {
       initialRouteName="HomeTabs"
     >
       <AppStack.Screen name="HomeTabs" component={HomeTabs} />
-      {/* Enables navigation.navigate("UserProfile", { userId }) */}
       <AppStack.Screen name="UserProfile" component={UserProfile} />
+      {/* Hidden route for Flappy ESC game */}
+      <AppStack.Screen
+        name="FlappyESC"
+        component={FlappyEscScreen}
+        options={{
+          headerShown: false,
+          animation: "slide_from_right",
+        }}
+      />
     </AppStack.Navigator>
   );
 };

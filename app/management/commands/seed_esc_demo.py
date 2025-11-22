@@ -1,8 +1,10 @@
 import random
 import uuid
 from datetime import timedelta
-from decimal import Decimal
+from decimal import Decimal, getcontext
 from collections import defaultdict
+import csv
+import os
 
 from django.core.management.base import BaseCommand
 from django.utils import timezone
@@ -25,6 +27,9 @@ from app.models import (
     WalletTransaction,
 )
 
+# 🔹 High precision for AMM math
+getcontext().prec = 28
+
 fake = Faker("en_US")
 
 # ================================================================
@@ -36,22 +41,22 @@ FOUNDER_RESERVE_ESC = Decimal("400000")    # long-term founder / movement reserv
 
 # For phase 1 we conceptually want:
 #  - 50,000 ESC in the LP (vs USDC)
-#  - 100,000 ESC available for starter airdrops (1000×100 ESC)
-#  → 150,000 ESC early circulating slice (LP + airdrops)
+#  - 50,000 ESC available for starter airdrops (1000×50 ESC capacity)
+#  → 100,000 ESC early circulating slice (LP + airdrops capacity)
 LP_ESC = Decimal("50000")                  # LP side
 STARTER_ACCOUNTS = 1000
-STARTER_PER_ACCOUNT_ESC = Decimal("100")
-STARTER_ALLOCATION_ESC = STARTER_PER_ACCOUNT_ESC * STARTER_ACCOUNTS  # 100,000 ESC
+STARTER_PER_ACCOUNT_ESC = Decimal("50")
+STARTER_ALLOCATION_ESC = STARTER_PER_ACCOUNT_ESC * STARTER_ACCOUNTS  # 50,000 ESC
 
-CIRCULATING_SLICE_ESC = LP_ESC + STARTER_ALLOCATION_ESC  # 150,000 ESC
+CIRCULATING_SLICE_ESC = LP_ESC + STARTER_ALLOCATION_ESC  # 100,000 ESC
 
 # Treasury supply (before we park the starter pool there for distribution)
 TREASURY_SUPPLY_ESC = TOTAL_SUPPLY_ESC - FOUNDER_RESERVE_ESC - CIRCULATING_SLICE_ESC
-# = 1,000,000 - 400,000 - 150,000 = 450,000 ESC
+# = 1,000,000 - 400,000 - 100,000 = 500,000 ESC
 
 # For the DB sim, the treasury wallet actually holds:
-#  - Treasury supply (450,000 ESC)
-#  - Plus the starter airdrop pool (100,000 ESC) which will be streamed out
+#  - Treasury supply (500,000 ESC)
+#  - Plus the starter airdrop pool (50,000 ESC) which will be streamed out
 TREASURY_WALLET_INITIAL_ESC = TREASURY_SUPPLY_ESC + STARTER_ALLOCATION_ESC  # 550,000 ESC
 
 # LP: 50,000 ESC vs 500 USDC ⇒ $0.01 / ESC
@@ -64,22 +69,15 @@ ALLOW_TREASURY_MINT = True
 TREASURY_MINT_BUFFER_MULTIPLIER = Decimal("1.5")  # mint a bit more than "needed" for cushion
 
 # ================================================================
-# 📈 Price curve tuning
+# 📈 Price curve tuning (neighborhood / toy curve)
 # ================================================================
-# price = base * (1 + SLOPE * min(volume / circulating_slice, CAP))
-#
-# With these defaults:
-#   base = 0.01
-#   SLOPE = 6
-#   CAP   = 20
-#
-# → factor_max = 1 + 6 * 20 = 121
-# → max_price ≈ 0.01 * 121 = $1.21
-#
-# So as you crank trades, you can *actually* see the sim push toward and past $1.
-# If you want even crazier upside, bump CAP or SLOPE.
+# This is the internal neighborhood “reference price”.
+# The AMM section below uses real constant-product math for LP.
 PRICE_VOLUME_SLOPE = Decimal("6")
 PRICE_VOLUME_CAP = Decimal("20")
+
+# 🔥 Wallet top-up threshold: trigger simulated DEX buys when wallet ≤ this
+WALLET_TOPUP_THRESHOLD_ESC = Decimal("15")
 
 # To avoid hammering randomuser.me on huge seeds
 MAX_AVATAR_SEED_USERS = 2000      # only attempt avatars for the first N users
@@ -90,8 +88,10 @@ print(f"  Total supply (base)        : {TOTAL_SUPPLY_ESC} ESC")
 print(f"  Founder reserve            : {FOUNDER_RESERVE_ESC} ESC")
 print(f"  Early circulating slice    : {CIRCULATING_SLICE_ESC} ESC")
 print(f"    ↳ LP ESC side            : {LP_ESC} ESC vs {LP_USDC} USDC → ${ESC_INITIAL_PRICE_USD} / ESC")
-print(f"    ↳ Starter pool           : {STARTER_ALLOCATION_ESC} ESC "
-      f"({STARTER_PER_ACCOUNT_ESC} ESC × {STARTER_ACCOUNTS} wallets)")
+print(
+    f"    ↳ Starter pool           : {STARTER_ALLOCATION_ESC} ESC "
+    f"({STARTER_PER_ACCOUNT_ESC} ESC × {STARTER_ACCOUNTS} wallets capacity)"
+)
 print(f"  Treasury supply (protocol) : {TREASURY_SUPPLY_ESC} ESC")
 print(f"  Treasury wallet DB balance : {TREASURY_WALLET_INITIAL_ESC} ESC (treasury + starter pool)")
 print("--------------------------------------------------------------")
@@ -389,7 +389,7 @@ def _fetch_avatar_content(gender_slug=None):
     gender_slug ∈ {"men", "women"} to keep pics aligned with names.
 
     We keep this best-effort and skip on any error/timeout so large seeds
-    don't crash just because avatars flaked.
+    do not crash just because avatars flaked.
     """
     try:
         if gender_slug not in ("men", "women"):
@@ -431,11 +431,11 @@ def _create_treasury_user():
     """
     Treasury user for the sim.
 
-    Conceptual breakdown (on-chain story):
-      - Founder reserve:           400,000 ESC   (off-market; not a DB wallet)
+    Conceptual breakdown (on chain story):
+      - Founder reserve:           400,000 ESC   (off market; not a DB wallet)
       - LP ESC side:                50,000 ESC   (in AMM vs 500 USDC)
-      - Treasury supply:           450,000 ESC   (protocol / DAO)
-      - Starter airdrop pool:     100,000 ESC    (subset of circulating, held by treasury for now)
+      - Treasury supply:           500,000 ESC   (protocol / DAO)
+      - Starter airdrop pool:      50,000 ESC    (subset of circulating, held by treasury for now)
 
     For the DB sim, this wallet holds:
       TREASURY_WALLET_INITIAL_ESC = TREASURY_SUPPLY_ESC + STARTER_ALLOCATION_ESC
@@ -555,9 +555,13 @@ def _airdrop_esc_to_users(treasury, users):
     """
     Airdrop the starter pool:
 
-      - Target: 100 ESC to up to 1000 wallets = 100,000 ESC
+      - Target: 50 ESC to up to 1000 wallets = 50,000 ESC capacity
       - Uses ESC_INITIAL_PRICE_USD for USD context
       - Stops once STARTER_ALLOCATION_ESC is exhausted
+
+    Note:
+      If you seed fewer users than STARTER_ACCOUNTS (for example --users=100),
+      the remaining starter allocation simply stays in the treasury.
     """
     remaining = STARTER_ALLOCATION_ESC
     price_usd = ESC_INITIAL_PRICE_USD
@@ -638,7 +642,7 @@ def _airdrop_esc_to_users(treasury, users):
 
     print(
         f"✅ Starter airdrop complete: {total_airdropped} ESC to {recipients} wallets "
-        f"(pool {STARTER_ALLOCATION_ESC} ESC)."
+        f"(pool capacity {STARTER_ALLOCATION_ESC} ESC)."
     )
 
 
@@ -712,7 +716,7 @@ def _create_services_for_users(users, max_services_per_user=3):
 
 def _update_price_from_volume(sim_state):
     """
-    Toy price curve for the sim:
+    Toy price curve for the neighborhood sim (internal reference only):
 
       price = ESC_INITIAL_PRICE_USD * (1 + SLOPE * min(volume / circulating_slice, CAP))
     """
@@ -735,7 +739,10 @@ def _update_price_from_volume(sim_state):
 def _ensure_liquidity_for_payment(treasury, client, amount, price_usd, sim_state):
     """
     Ensure the client has enough ESC for a payment by simulating a purchase
-    from the treasury if needed (with optional Sarafu-style mint).
+    from the treasury if needed (with optional Sarafu style mint).
+
+    NOTE: This represents off chain / DAO controlled liquidity.
+    The on chain AMM math is handled separately below for analytics.
     """
     needed = amount - client.esc_balance
     if needed <= 0:
@@ -746,7 +753,7 @@ def _ensure_liquidity_for_payment(treasury, client, amount, price_usd, sim_state
     )
     client_wallet = _get_or_create_wallet_for_user(client)
 
-    # If the treasury doesn't have enough, optionally mint more
+    # If the treasury does not have enough, optionally mint more
     if treasury.esc_balance < needed:
         if ALLOW_TREASURY_MINT:
             shortfall = needed - treasury.esc_balance
@@ -779,7 +786,7 @@ def _ensure_liquidity_for_payment(treasury, client, amount, price_usd, sim_state
     treasury_wallet.save(update_fields=["balance"])
     client_wallet.save(update_fields=["balance"])
 
-    # Simulated on-ramp
+    # Simulated on ramp
     tx_hash = f"onramp-{uuid.uuid4().hex}"
     WalletTransaction.objects.create(
         from_wallet=treasury_wallet,
@@ -807,6 +814,89 @@ def _ensure_liquidity_for_payment(treasury, client, amount, price_usd, sim_state
     sim_state["onramp_usd"] += (needed * price_usd).quantize(Decimal("0.0000"))
 
 
+def _simulate_dex_topup_for_user(user, sim_state, _price_usd_unused, target_esc_amount):
+    """
+    When a user's wallet balance falls to or below the configured threshold,
+    simulate one or more constant-product AMM buys in fixed USDC chunks
+    (for example 5 USD each) until we roughly hit `target_esc_amount`
+    of new ESC for that user.
+
+    This uses an internal AMM pool stored in sim_state:
+
+      - dex_amm_esc_reserve
+      - dex_amm_usdc_reserve
+      - dex_amm_k
+
+    It updates that pool as if users are really buying from the DEX.
+    Treasury balances are not touched here.
+    """
+    if target_esc_amount <= 0:
+        return
+
+    wallet = _get_or_create_wallet_for_user(user)
+
+    # If they are already comfortably above threshold + target, skip
+    if wallet.balance >= WALLET_TOPUP_THRESHOLD_ESC + target_esc_amount:
+        return
+
+    esc_reserve = sim_state.get("dex_amm_esc_reserve", LP_ESC)
+    usdc_reserve = sim_state.get("dex_amm_usdc_reserve", LP_USDC)
+    k = sim_state.get("dex_amm_k", esc_reserve * usdc_reserve)
+
+    dex_trade_size_usd = sim_state.get("dex_trade_size_usd", Decimal("5"))
+    if dex_trade_size_usd <= 0:
+        dex_trade_size_usd = Decimal("5")
+
+    total_esc_bought = Decimal("0.0")
+    total_usdc_spent = Decimal("0.0")
+
+    MAX_TRADES_PER_TOPUP = 40  # keep one drained wallet from eating the whole pool
+
+    for _ in range(MAX_TRADES_PER_TOPUP):
+        if total_esc_bought >= target_esc_amount:
+            break
+        if wallet.balance >= WALLET_TOPUP_THRESHOLD_ESC + target_esc_amount:
+            break
+
+        if esc_reserve <= 0 or usdc_reserve <= 0:
+            break
+
+        current_price = usdc_reserve / esc_reserve
+        if current_price <= 0:
+            break
+
+        usdc_in = dex_trade_size_usd
+        new_usdc_reserve = usdc_reserve + usdc_in
+        new_esc_reserve = k / new_usdc_reserve
+        esc_out = esc_reserve - new_esc_reserve
+
+        if esc_out <= 0:
+            break
+
+        # Update pool
+        esc_reserve = new_esc_reserve
+        usdc_reserve = new_usdc_reserve
+        k = esc_reserve * usdc_reserve
+
+        # Credit user
+        user.esc_balance += esc_out
+        wallet.balance += esc_out
+        user.save(update_fields=["esc_balance"])
+        wallet.save(update_fields=["balance"])
+
+        total_esc_bought += esc_out
+        total_usdc_spent += usdc_in
+
+        sim_state["dex_topups_count"] = sim_state.get("dex_topups_count", 0) + 1
+        sim_state["dex_topups_esc"] = sim_state.get("dex_topups_esc", Decimal("0.0")) + esc_out
+        sim_state["dex_topups_usdc"] = sim_state.get("dex_topups_usdc", Decimal("0.0")) + usdc_in
+
+    # Save updated pool back to sim_state for later topups
+    sim_state["dex_amm_esc_reserve"] = esc_reserve
+    sim_state["dex_amm_usdc_reserve"] = usdc_reserve
+    sim_state["dex_amm_k"] = k
+
+
 def _create_bookings_and_payments(
     services,
     users,
@@ -819,9 +909,13 @@ def _create_bookings_and_payments(
     """
     Create bookings between neighbors and simulate payments.
 
-    If `until_target=True` and sim_state["target_price_usd"] > 0,
-    we keep going until the target price is hit, or until we exhaust
-    the safety cap based on `target_payments`.
+    This uses the toy neighborhood price curve. The real AMM math
+    is computed separately after this via `_run_amm_price_sim`.
+
+    Extra behavior:
+      - Track wallets that fall below the configured threshold
+      - When a wallet hits that threshold, simulate a DEX buy to top it back up
+        using a constant-product AMM pool living in sim_state.
     """
     if not services or len(users) < 2:
         print("⚠️ Not enough services/users to create bookings.")
@@ -833,9 +927,8 @@ def _create_bookings_and_payments(
 
     target_price = sim_state.get("target_price_usd", Decimal("0.0")) or Decimal("0.0")
 
-    # Safety cap: allow more turns if we're running "until target"
+    # Safety cap: allow more turns if we are running "until target"
     if until_target and target_payments < 1_000_000:
-        # If you pass small target_payments with until_target, we still bump the iterations.
         max_iterations = max(target_payments * 20, 100000)
     else:
         max_iterations = target_payments * 5  # default cap
@@ -897,7 +990,7 @@ def _create_bookings_and_payments(
             if client.esc_balance < amount:
                 continue
 
-            # 1% burn
+            # 1 percent burn
             burn_rate = Decimal("0.01")
             burn_amount = (amount * burn_rate).quantize(Decimal("0.0000"))
             net_to_provider = amount - burn_amount
@@ -910,12 +1003,12 @@ def _create_bookings_and_payments(
             sim_state["volume_esc"] += amount
             sim_state["burned_esc"] += burn_amount
 
-            # Update price from cumulative volume
+            # Update internal reference price from cumulative volume
             _update_price_from_volume(sim_state)
             price_usd = sim_state["price_usd"]
             amount_usd = (net_to_provider * price_usd).quantize(Decimal("0.0000"))
 
-            # Move balances (User)
+            # Move balances (user)
             client.esc_balance -= amount
             provider.esc_balance += net_to_provider
             client.save(update_fields=["esc_balance"])
@@ -926,6 +1019,17 @@ def _create_bookings_and_payments(
             provider_wallet.balance += net_to_provider
             client_wallet.save(update_fields=["balance"])
             provider_wallet.save(update_fields=["balance"])
+
+            # If the client wallet balance fell at or below the threshold from this payment,
+            # record it and simulate AMM-based DEX buys to top them back up.
+            if client_wallet.balance <= WALLET_TOPUP_THRESHOLD_ESC:
+                sim_state["wallet_zero_events"] = sim_state.get("wallet_zero_events", 0) + 1
+                _simulate_dex_topup_for_user(
+                    client,
+                    sim_state,
+                    price_usd,
+                    STARTER_PER_ACCOUNT_ESC,  # target ~50 ESC topup via multiple 5 USD buys
+                )
 
             tx = Transaction.objects.create(
                 sender=client,
@@ -946,7 +1050,7 @@ def _create_bookings_and_payments(
             b.paid_at = timezone.now()
             b.save(update_fields=["transaction", "paid_at"])
 
-            # Low-level ledger entry
+            # Low level ledger entry
             WalletTransaction.objects.create(
                 from_wallet=client_wallet,
                 to_wallet=provider_wallet,
@@ -972,7 +1076,7 @@ def _create_bookings_and_payments(
 
             payments_created += 1
 
-            # 🎯 Track when we first hit or cross the target price
+            # Track when we first hit or cross the neighborhood target price
             if (
                 target_price > 0
                 and not sim_state.get("hit_target")
@@ -987,13 +1091,12 @@ def _create_bookings_and_payments(
                 sim_state["hit_target_onramp_usd"] = sim_state.get("onramp_usd", Decimal("0.0"))
 
                 print(
-                    f"🎯 Target price reached: ${price_usd} ≥ ${target_price} "
+                    f"🎯 Target (neighborhood curve) reached: ${price_usd} ≥ ${target_price} "
                     f"after {sim_state['tx_count']} payments, "
                     f"volume={sim_state['volume_esc']} ESC."
                 )
 
                 if until_target:
-                    # We'll break on the next loop check
                     continue
 
     print(f"✅ Created {bookings_created} bookings total.")
@@ -1002,7 +1105,7 @@ def _create_bookings_and_payments(
         f"📈 Sim volume: {sim_state['volume_esc']} ESC across {sim_state['tx_count']} payments."
     )
     print(f"🔥 Total burned (1% fee): {sim_state['burned_esc']} ESC.")
-    print(f"💵 Final simulated price: ${sim_state['price_usd']} per ESC.")
+    print(f"💵 Final neighborhood reference price: ${sim_state['price_usd']} per ESC.")
 
     if CIRCULATING_SLICE_ESC > 0:
         progress = sim_state["volume_esc"] / CIRCULATING_SLICE_ESC
@@ -1017,11 +1120,23 @@ def _create_bookings_and_payments(
 
     if "onramp_esc" in sim_state:
         print(
-            f"🏦 On-ramped: {sim_state['onramp_esc']} ESC "
+            f"🏦 On ramped (treasury off chain): {sim_state['onramp_esc']} ESC "
             f"(~${sim_state.get('onramp_usd', Decimal('0.0'))} USD simulated in)."
         )
     if "minted_esc" in sim_state:
         print(f"🪙 Protocol-minted during sim: {sim_state['minted_esc']} ESC.")
+
+    if sim_state.get("wallet_zero_events", 0) > 0:
+        print(
+            f"🧮 Wallet threshold events: {sim_state['wallet_zero_events']} "
+            f"wallets hit ≤ {WALLET_TOPUP_THRESHOLD_ESC} ESC and triggered DEX top ups."
+        )
+    if sim_state.get("dex_topups_count", 0) > 0:
+        print(
+            f"🪙 Simulated DEX top ups: {sim_state['dex_topups_count']} buys "
+            f"→ {sim_state['dex_topups_esc']} ESC purchased for "
+            f"≈ ${sim_state['dex_topups_usdc']} USDC."
+        )
 
     target_price = sim_state.get("target_price_usd", Decimal("0.0")) or Decimal("0.0")
     if target_price > 0:
@@ -1033,18 +1148,187 @@ def _create_bookings_and_payments(
             except Exception:
                 multiple = 0.0
             print(
-                f"🎯 Summary: target ${target_price} reached at tx #{tx_at_hit}, "
+                f"🎯 Neighborhood curve summary: target ${target_price} reached at tx #{tx_at_hit}, "
                 f"volume={vol_at_hit} ESC (~{multiple:.2f}× early circulating slice)."
             )
         else:
             print(
-                f"⚠️ Target price ${target_price} NOT reached within this sim "
+                f"⚠️ Neighborhood target price ${target_price} NOT reached within this sim "
                 f"(final ${sim_state['price_usd']}))."
             )
 
 
+# ================================================================
+# 🔥 REAL AMM MATH (CONSTANT PRODUCT LP) FOR ESC/USDC
+# ================================================================
+def _run_amm_price_sim(
+    lp_esc,
+    lp_usdc,
+    trade_size_usd,
+    target_price,
+    max_trades,
+    circulating_esc,
+    injection_specs,
+    stdout,
+    style,
+    sim_state,
+):
+    """
+    Simulate a constant product AMM (x*y=k) for ESC/USDC.
+
+    - lp_esc / lp_usdc: initial reserves
+    - trade_size_usd: USDC per buy
+    - target_price: ESC price target (USDC/ESC)
+    - max_trades: safety cap
+    - circulating_esc: for implied market cap
+    - injection_specs: list of strings "price,usdc,esc"
+    """
+    esc_reserve = Decimal(lp_esc)
+    usdc_reserve = Decimal(lp_usdc)
+    trade_size_usd = Decimal(trade_size_usd)
+    target_price = Decimal(target_price)
+    max_trades = int(max_trades)
+    circulating_esc = Decimal(circulating_esc)
+
+    if trade_size_usd <= 0:
+        stdout.write(style.ERROR("AMM: trade_size_usd must be > 0"))
+        return
+
+    if target_price <= 0:
+        stdout.write(style.ERROR("AMM: target_price must be > 0"))
+        return
+
+    # Parse injections
+    injections = []
+    for raw in injection_specs:
+        try:
+            price_str, usdc_str, esc_str = raw.split(",")
+            inj = {
+                "price_trigger": Decimal(price_str),
+                "usdc": Decimal(usdc_str),
+                "esc": Decimal(esc_str),
+                "applied": False,
+            }
+            if inj["price_trigger"] <= 0:
+                raise ValueError("price_trigger must be > 0")
+            injections.append(inj)
+        except Exception as e:
+            stdout.write(
+                style.ERROR(
+                    f"AMM: Could not parse --amm-inject '{raw}'. "
+                    f"Expected 'price,usdc,esc'. Error: {e}"
+                )
+            )
+
+    injections.sort(key=lambda inj: inj["price_trigger"])
+
+    k = esc_reserve * usdc_reserve
+    initial_price = usdc_reserve / esc_reserve
+
+    total_usdc_in = Decimal("0")
+    total_esc_out = Decimal("0")
+    trades = 0
+
+    stdout.write("")
+    stdout.write(style.WARNING("🔁 AMM ESC/USDC simulation (constant-product) starting..."))
+    stdout.write(
+        f"   → Initial pool: {esc_reserve} ESC vs {usdc_reserve} USDC "
+        f"(price=${initial_price:.6f} / ESC)"
+    )
+    stdout.write(
+        f"   → Target AMM price: ${target_price} / ESC, trade size={trade_size_usd} USDC per buy"
+    )
+    if injections:
+        stdout.write("   → LP injections configured:")
+        for inj in injections:
+            stdout.write(
+                f"      - when AMM price ≥ ${inj['price_trigger']} add "
+                f"{inj['usdc']} USDC and {inj['esc']} ESC"
+            )
+
+    for i in range(1, max_trades + 1):
+        current_price = usdc_reserve / esc_reserve
+
+        # Apply LP injections when price triggers are hit
+        for inj in injections:
+            if not inj["applied"] and current_price >= inj["price_trigger"]:
+                esc_reserve += inj["esc"]
+                usdc_reserve += inj["usdc"]
+                k = esc_reserve * usdc_reserve
+                inj["applied"] = True
+                stdout.write(
+                    style.SUCCESS(
+                        f"💧 LP injection at AMM trade #{i}: price=${current_price:.6f} "
+                        f"→ added {inj['usdc']} USDC and {inj['esc']} ESC. "
+                        f"New pool: {esc_reserve} ESC vs {usdc_reserve} USDC."
+                    )
+                )
+
+        current_price = usdc_reserve / esc_reserve
+        if current_price >= target_price:
+            break
+
+        # Simulate one buy: trader sends trade_size_usd USDC, receives ESC
+        usdc_in = trade_size_usd
+        new_usdc_reserve = usdc_reserve + usdc_in
+        new_esc_reserve = k / new_usdc_reserve
+        esc_out = esc_reserve - new_esc_reserve
+
+        if esc_out <= 0:
+            stdout.write(style.ERROR("AMM: esc_out <= 0, aborting."))
+            break
+
+        usdc_reserve = new_usdc_reserve
+        esc_reserve = new_esc_reserve
+        k = esc_reserve * usdc_reserve
+
+        total_usdc_in += usdc_in
+        total_esc_out += esc_out
+        trades = i
+
+    final_price = usdc_reserve / esc_reserve
+    implied_market_cap = circulating_esc * final_price
+
+    stdout.write("")
+    stdout.write(style.SUCCESS("✅ AMM ESC/USDC simulation complete."))
+    stdout.write(
+        f"📊 AMM final pool: {esc_reserve:.6f} ESC vs {usdc_reserve:.6f} USDC "
+        f"(price=${final_price:.6f} / ESC)"
+    )
+    stdout.write(f"   AMM trades executed: {trades}")
+    stdout.write(f"   Total USDC into pool:   ${total_usdc_in:.2f}")
+    stdout.write(f"   Total ESC out of pool:  {total_esc_out:.6f} ESC")
+    stdout.write(
+        f"   AMM implied market cap (circulating {circulating_esc} ESC): "
+        f"≈ ${implied_market_cap:.2f}"
+    )
+
+    if final_price >= target_price:
+        stdout.write(
+            style.SUCCESS(
+                f"🎯 AMM target price ${target_price} reached or exceeded "
+                f"(final ${final_price:.6f})."
+            )
+        )
+    else:
+        stdout.write(
+            style.WARNING(
+                f"⚠️ AMM target price ${target_price} NOT reached within {max_trades} trades "
+                f"(final ${final_price:.6f})."
+            )
+        )
+
+    # Save into sim_state for introspection / snapshots
+    sim_state["amm_initial_price_usd"] = initial_price
+    sim_state["amm_final_price_usd"] = final_price
+    sim_state["amm_trades"] = trades
+    sim_state["amm_total_usdc_in"] = total_usdc_in
+    sim_state["amm_total_esc_out"] = total_esc_out
+    sim_state["amm_implied_market_cap_usd"] = implied_market_cap
+
+
 class Command(BaseCommand):
-    help = "Seed ESC neighborhood with fake users, avatars, services, bookings, and payments + price sim."
+    help = "Seed ESC neighborhood with fake users, avatars, services, bookings, and payments + neighborhood and AMM price sims."
 
     def add_arguments(self, parser):
         parser.add_argument(
@@ -1065,12 +1349,12 @@ class Command(BaseCommand):
             default=180,
             help="Look-back window in days for simulated activity (default: 180 ≈ 6 months).",
         )
-        # 🔹 Curve + target controls (start price is locked to 0.01)
+        # Neighborhood price curve controls (start price stays 0.01)
         parser.add_argument(
             "--price-slope",
             type=str,
             default=str(PRICE_VOLUME_SLOPE),
-            help="Price curve slope vs volume/circulating (default 6).",
+            help="Neighborhood price curve slope vs volume/circulating (default 6).",
         )
         parser.add_argument(
             "--price-cap",
@@ -1082,12 +1366,85 @@ class Command(BaseCommand):
             "--target-price",
             type=str,
             default="0",
-            help="Target ESC price in USD for analysis (e.g. 1.00). 0 means no target.",
+            help="Target neighborhood reference price in USD (for example 1.00). 0 means no target.",
         )
         parser.add_argument(
             "--until-target",
             action="store_true",
-            help="If set and target-price>0, keep simulating until target price is reached (or safety cap).",
+            help="If set and target-price>0, keep simulating until neighborhood target price is reached (or safety cap).",
+        )
+
+        # Real AMM / LP simulation controls
+        parser.add_argument(
+            "--amm-trade-size-usd",
+            type=str,
+            default="5",
+            help="USDC trade size per AMM buy for ESC (default 5).",
+        )
+        parser.add_argument(
+            "--amm-target-price",
+            type=str,
+            default="1.00",
+            help="AMM ESC price target in USD (default 1.00).",
+        )
+        parser.add_argument(
+            "--amm-max-trades",
+            type=int,
+            default=200000,
+            help="Max number of AMM trades to simulate (default 200000).",
+        )
+        parser.add_argument(
+            "--amm-circulating-esc",
+            type=str,
+            default=str(CIRCULATING_SLICE_ESC),
+            help="Circulating ESC used for AMM implied market cap (default early slice).",
+        )
+        parser.add_argument(
+            "--amm-inject",
+            dest="amm_inject",
+            action="append",
+            type=str,
+            metavar="PRICE,USDC,ESC",
+            default=[],
+            help=(
+                "Optional AMM LP injection in the form 'price,usdc,esc'. "
+                "Example: --amm-inject \"0.20,500,50000\" "
+                "(when AMM price ≥ 0.20, add 500 USDC and 50000 ESC). "
+                "You can pass this flag multiple times."
+            ),
+        )
+
+        # Hypothetical extra mint controls (valuation only)
+        parser.add_argument(
+            "--extra-mint-esc",
+            type=str,
+            default="0",
+            help=(
+                "Hypothetical extra ESC minted AFTER this sim (for example 9000000). "
+                "Used only for valuation; does NOT change seeding or AMM math."
+            ),
+        )
+        parser.add_argument(
+            "--extra-mint-split",
+            type=str,
+            default="treasury",
+            choices=["treasury", "founder", "split"],
+            help=(
+                "How to hypothetically allocate the extra-minted ESC: "
+                "'treasury' (all to treasury), 'founder' (all to founder reserve), "
+                "or 'split' (50/50). Default: treasury."
+            ),
+        )
+
+        # CSV metrics export
+        parser.add_argument(
+            "--metrics-csv",
+            type=str,
+            default="",
+            help=(
+                "Optional path to a CSV file where summary metrics for this run "
+                "will be appended as a single row."
+            ),
         )
 
     def handle(self, *args, **options):
@@ -1097,7 +1454,9 @@ class Command(BaseCommand):
         target_payments = options["target_payments"]
         window_days = options["window_days"]
 
-        # 🔹 Override curve constants from CLI (start price stays hard-coded at 0.01)
+        metrics_csv_path = options.get("metrics_csv") or ""
+
+        # Neighborhood curve overrides
         PRICE_VOLUME_SLOPE = Decimal(options["price_slope"])
         PRICE_VOLUME_CAP = Decimal(options["price_cap"])
 
@@ -1109,16 +1468,21 @@ class Command(BaseCommand):
             f"   → users={count}, target_payments≈{target_payments}, window_days={window_days}"
         )
         self.stdout.write(
-            f"   → curve: start_price={ESC_INITIAL_PRICE_USD}, "
+            f"   → neighborhood curve: start_price={ESC_INITIAL_PRICE_USD}, "
             f"slope={PRICE_VOLUME_SLOPE}, cap={PRICE_VOLUME_CAP}"
         )
         if target_price > 0:
             self.stdout.write(
-                f"   → target price: ${target_price} "
+                f"   → neighborhood target price: ${target_price} "
                 f"(until_target={'on' if until_target else 'off'})"
             )
+        self.stdout.write(
+            f"   → DEX top ups enabled: threshold={WALLET_TOPUP_THRESHOLD_ESC} ESC, "
+            f"top up size={STARTER_PER_ACCOUNT_ESC} ESC per event, "
+            f"AMM buy size from CLI --amm-trade-size-usd."
+        )
 
-        # global sim state
+        # Global sim state
         sim_state = {
             "initial_price_usd": ESC_INITIAL_PRICE_USD,
             "price_usd": ESC_INITIAL_PRICE_USD,
@@ -1136,7 +1500,27 @@ class Command(BaseCommand):
             "hit_target_burned_esc": None,
             "hit_target_onramp_esc": None,
             "hit_target_onramp_usd": None,
+            # DEX + wallet drain analytics
+            "wallet_zero_events": 0,
+            "dex_topups_count": 0,
+            "dex_topups_esc": Decimal("0.0"),
+            "dex_topups_usdc": Decimal("0.0"),
         }
+
+        # Initialize in-sim DEX AMM pool used for wallet topup buys (user behavior)
+        try:
+            dex_trade_size_usd = Decimal(options["amm_trade_size_usd"])
+        except Exception:
+            dex_trade_size_usd = Decimal("5")
+        if dex_trade_size_usd <= 0:
+            dex_trade_size_usd = Decimal("5")
+
+        sim_state.update({
+            "dex_amm_esc_reserve": LP_ESC,
+            "dex_amm_usdc_reserve": LP_USDC,
+            "dex_amm_k": LP_ESC * LP_USDC,
+            "dex_trade_size_usd": dex_trade_size_usd,
+        })
 
         treasury = _create_treasury_user()
         users = _create_fake_users(count=count)
@@ -1178,7 +1562,7 @@ class Command(BaseCommand):
             f"   Value after sim: ${founder_final_value} USD"
         )
 
-        # Circulating / market cap stats (excluding treasury as "off-market" holder)
+        # Circulating / market cap stats (excluding treasury as "off market" holder)
         circ_ex_treasury = (
             User.objects.exclude(id=treasury.id)
             .aggregate(total=Sum("esc_balance"))["total"]
@@ -1193,8 +1577,8 @@ class Command(BaseCommand):
         )
 
         self.stdout.write(
-            f"💫 Circulating (ex-treasury) after sim: {circ_ex_treasury} ESC "
-            f"→ implied market cap ≈ ${market_cap_final}."
+            f"💫 Circulating (ex treasury) after neighborhood sim: {circ_ex_treasury} ESC "
+            f"→ implied neighborhood market cap ≈ ${market_cap_final}."
         )
         self.stdout.write(
             f"   For comparison, early circulating slice {CIRCULATING_SLICE_ESC} ESC "
@@ -1205,7 +1589,24 @@ class Command(BaseCommand):
             self.stdout.write(
                 self.style.WARNING(
                     f"🪙 Protocol minted {sim_state['minted_esc']} ESC during the sim "
-                    "(Sarafu-style flexible supply)."
+                    "(Sarafu style flexible supply)."
+                )
+            )
+
+        if sim_state.get("wallet_zero_events", 0) > 0:
+            self.stdout.write(
+                self.style.WARNING(
+                    f"🧮 Wallet threshold events during neighborhood sim: "
+                    f"{sim_state['wallet_zero_events']} wallets hit "
+                    f"≤ {WALLET_TOPUP_THRESHOLD_ESC} ESC and triggered DEX top ups."
+                )
+            )
+        if sim_state.get("dex_topups_count", 0) > 0:
+            self.stdout.write(
+                self.style.SUCCESS(
+                    f"🪙 Simulated DEX top ups during neighborhood sim: "
+                    f"{sim_state['dex_topups_count']} buys → "
+                    f"{sim_state['dex_topups_esc']} ESC for ≈ ${sim_state['dex_topups_usdc']} USDC."
                 )
             )
 
@@ -1219,31 +1620,116 @@ class Command(BaseCommand):
                     multiple = 0.0
                 self.stdout.write(
                     self.style.SUCCESS(
-                        f"🎯 Target ${target_price} reached at tx #{tx_at_hit}, "
+                        f"🎯 Neighborhood curve target ${target_price} reached at tx #{tx_at_hit}, "
                         f"volume={vol_at_hit} ESC (~{multiple:.2f}× early circulating slice)."
                     )
                 )
             else:
                 self.stdout.write(
                     self.style.WARNING(
-                        f"⚠️ Target price ${target_price} NOT reached in this run "
+                        f"⚠️ Neighborhood target price ${target_price} NOT reached in this run "
                         f"(final ${sim_state['price_usd']} per ESC)."
                     )
                 )
 
-        # ================================
-        # 📊 OPTIONAL: Summary model write
-        # ================================
+        # Real AMM / LP standalone simulation
+        amm_trade_size_usd = options["amm_trade_size_usd"]
+        amm_target_price = options["amm_target_price"]
+        amm_max_trades = options["amm_max_trades"]
+        amm_circ_esc = options["amm_circulating_esc"] or str(CIRCULATING_SLICE_ESC)
+        amm_inject_specs = options.get("amm_inject") or []
+
+        _run_amm_price_sim(
+            lp_esc=LP_ESC,
+            lp_usdc=LP_USDC,
+            trade_size_usd=amm_trade_size_usd,
+            target_price=amm_target_price,
+            max_trades=amm_max_trades,
+            circulating_esc=amm_circ_esc,
+            injection_specs=amm_inject_specs,
+            stdout=self.stdout,
+            style=self.style,
+            sim_state=sim_state,
+        )
+
+        # Hypothetical future mint scenario
+        extra_mint_raw = options.get("extra_mint_esc", "0") or "0"
+        extra_mint_split = options.get("extra_mint_split", "treasury")
+        try:
+            extra_mint_esc = Decimal(extra_mint_raw)
+        except Exception:
+            extra_mint_esc = Decimal("0")
+
+        price_now = sim_state["price_usd"]
+
+        # Defaults if no extra mint
+        hypothetical_treasury_balance = treasury.esc_balance
+        hypothetical_founder_reserve = FOUNDER_RESERVE_ESC
+        hypothetical_total_supply = effective_total_supply
+        hypothetical_treasury_value_usd = (hypothetical_treasury_balance * price_now).quantize(
+            Decimal("0.01")
+        )
+        hypothetical_founder_value_usd = (hypothetical_founder_reserve * price_now).quantize(
+            Decimal("0.01")
+        )
+
+        if extra_mint_esc > 0:
+            base_treasury_balance = treasury.esc_balance
+            base_founder_reserve = FOUNDER_RESERVE_ESC
+
+            extra_to_treasury = Decimal("0")
+            extra_to_founder = Decimal("0")
+
+            if extra_mint_split == "founder":
+                extra_to_founder = extra_mint_esc
+            elif extra_mint_split == "split":
+                half = (extra_mint_esc / Decimal("2")).quantize(Decimal("0.0000"))
+                extra_to_treasury = half
+                extra_to_founder = extra_mint_esc - half
+            else:
+                extra_to_treasury = extra_mint_esc
+
+            hypothetical_treasury_balance = base_treasury_balance + extra_to_treasury
+            hypothetical_founder_reserve = base_founder_reserve + extra_to_founder
+            hypothetical_total_supply = effective_total_supply + extra_mint_esc
+
+            hypothetical_treasury_value_usd = (hypothetical_treasury_balance * price_now).quantize(
+                Decimal("0.01")
+            )
+            hypothetical_founder_value_usd = (hypothetical_founder_reserve * price_now).quantize(
+                Decimal("0.01")
+            )
+
+            self.stdout.write("")
+            self.stdout.write(self.style.WARNING("🧪 Hypothetical extra-mint scenario"))
+            self.stdout.write(
+                f"   Extra mint (not in this DB run): {extra_mint_esc} ESC "
+                f"(split='{extra_mint_split}')"
+            )
+            self.stdout.write(
+                f"   Hypothetical total supply: {hypothetical_total_supply} ESC "
+                f"(effective {effective_total_supply} + extra {extra_mint_esc})"
+            )
+            self.stdout.write(
+                f"   Hypothetical treasury balance: {hypothetical_treasury_balance} ESC "
+                f"→ ≈ ${hypothetical_treasury_value_usd} at price ${price_now} / ESC"
+            )
+            self.stdout.write(
+                f"   Hypothetical founder reserve: {hypothetical_founder_reserve} ESC "
+                f"→ ≈ ${hypothetical_founder_value_usd} at price ${price_now} / ESC"
+            )
+
+        # Optional: summary model write
         try:
             EscEconomySnapshot = apps.get_model("app", "EscEconomySnapshot")
         except LookupError:
             EscEconomySnapshot = None
 
-        if EscEconomySnapshot:
-            now = timezone.now()
-            window_start = now - timedelta(days=window_days)
-            window_end = now
+        now = timezone.now()
+        window_start = now - timedelta(days=window_days)
+        window_end = now
 
+        if EscEconomySnapshot:
             circ = (
                 User.objects.aggregate(total=Sum("esc_balance"))["total"]
                 or Decimal("0.0")
@@ -1267,11 +1753,28 @@ class Command(BaseCommand):
                 "holder_count": User.objects.filter(esc_balance__gt=0).count(),
                 "window_start": window_start,
                 "window_end": window_end,
+                # AMM analytics
+                "amm_initial_price_usd": sim_state.get("amm_initial_price_usd"),
+                "amm_final_price_usd": sim_state.get("amm_final_price_usd"),
+                "amm_trades": sim_state.get("amm_trades"),
+                "amm_total_usdc_in": sim_state.get("amm_total_usdc_in"),
+                "amm_total_esc_out": sim_state.get("amm_total_esc_out"),
+                "amm_implied_market_cap_usd": sim_state.get("amm_implied_market_cap_usd"),
             }
 
-            # Only include minted_esc if the model actually has that field
-            if "minted_esc" in [f.name for f in EscEconomySnapshot._meta.get_fields()]:
+            snapshot_field_names = [f.name for f in EscEconomySnapshot._meta.get_fields()]
+
+            if "minted_esc" in snapshot_field_names:
                 snapshot_kwargs["minted_esc"] = sim_state["minted_esc"]
+
+            if "wallet_zero_events" in snapshot_field_names:
+                snapshot_kwargs["wallet_zero_events"] = sim_state.get("wallet_zero_events", 0)
+            if "dex_topups_count" in snapshot_field_names:
+                snapshot_kwargs["dex_topups_count"] = sim_state.get("dex_topups_count", 0)
+            if "dex_topups_esc" in snapshot_field_names:
+                snapshot_kwargs["dex_topups_esc"] = sim_state.get("dex_topups_esc", Decimal("0.0"))
+            if "dex_topups_usdc" in snapshot_field_names:
+                snapshot_kwargs["dex_topups_usdc"] = sim_state.get("dex_topups_usdc", Decimal("0.0"))
 
             snapshot = EscEconomySnapshot.objects.create(**snapshot_kwargs)
 
@@ -1285,7 +1788,105 @@ class Command(BaseCommand):
         else:
             self.stdout.write(
                 self.style.WARNING(
-                    "ℹ️ EscEconomySnapshot model not found – skipping summary row. "
+                    "ℹ️ EscEconomySnapshot model not found. Skipping summary row. "
                     "Add it in app.models if you want persistent sim stats."
+                )
+            )
+
+        # CSV export of metrics if requested
+        if metrics_csv_path:
+            label = f"demo_{now:%Y%m%d_%H%M}"
+            fieldnames = [
+                "label",
+                "created_at",
+                "users",
+                "target_payments",
+                "window_days",
+                "price_slope",
+                "price_cap",
+                "neighborhood_target_price",
+                "neighborhood_until_target",
+                "initial_price_usd",
+                "final_price_usd",
+                "tx_count",
+                "volume_esc",
+                "burned_esc",
+                "onramp_esc",
+                "onramp_usd",
+                "minted_esc",
+                "effective_total_supply",
+                "circ_ex_treasury_esc",
+                "market_cap_initial_usd",
+                "market_cap_final_usd",
+                "wallet_zero_events",
+                "dex_topups_count",
+                "dex_topups_esc",
+                "dex_topups_usdc",
+                "amm_initial_price_usd",
+                "amm_final_price_usd",
+                "amm_trades",
+                "amm_total_usdc_in",
+                "amm_total_esc_out",
+                "amm_implied_market_cap_usd",
+                "extra_mint_esc",
+                "extra_mint_split",
+                "hypothetical_total_supply",
+                "hypothetical_treasury_balance",
+                "hypothetical_treasury_value_usd",
+                "hypothetical_founder_reserve",
+                "hypothetical_founder_value_usd",
+            ]
+
+            metrics_row = {
+                "label": label,
+                "created_at": now.isoformat(),
+                "users": str(count),
+                "target_payments": str(target_payments),
+                "window_days": str(window_days),
+                "price_slope": str(PRICE_VOLUME_SLOPE),
+                "price_cap": str(PRICE_VOLUME_CAP),
+                "neighborhood_target_price": str(target_price),
+                "neighborhood_until_target": str(until_target),
+                "initial_price_usd": str(sim_state["initial_price_usd"]),
+                "final_price_usd": str(sim_state["price_usd"]),
+                "tx_count": str(sim_state["tx_count"]),
+                "volume_esc": str(sim_state["volume_esc"]),
+                "burned_esc": str(sim_state["burned_esc"]),
+                "onramp_esc": str(sim_state["onramp_esc"]),
+                "onramp_usd": str(sim_state["onramp_usd"]),
+                "minted_esc": str(sim_state.get("minted_esc", Decimal("0.0"))),
+                "effective_total_supply": str(effective_total_supply),
+                "circ_ex_treasury_esc": str(circ_ex_treasury),
+                "market_cap_initial_usd": str(market_cap_initial),
+                "market_cap_final_usd": str(market_cap_final),
+                "wallet_zero_events": str(sim_state.get("wallet_zero_events", 0)),
+                "dex_topups_count": str(sim_state.get("dex_topups_count", 0)),
+                "dex_topups_esc": str(sim_state.get("dex_topups_esc", Decimal("0.0"))),
+                "dex_topups_usdc": str(sim_state.get("dex_topups_usdc", Decimal("0.0"))),
+                "amm_initial_price_usd": str(sim_state.get("amm_initial_price_usd", "")),
+                "amm_final_price_usd": str(sim_state.get("amm_final_price_usd", "")),
+                "amm_trades": str(sim_state.get("amm_trades", "")),
+                "amm_total_usdc_in": str(sim_state.get("amm_total_usdc_in", "")),
+                "amm_total_esc_out": str(sim_state.get("amm_total_esc_out", "")),
+                "amm_implied_market_cap_usd": str(sim_state.get("amm_implied_market_cap_usd", "")),
+                "extra_mint_esc": str(extra_mint_esc),
+                "extra_mint_split": extra_mint_split,
+                "hypothetical_total_supply": str(hypothetical_total_supply),
+                "hypothetical_treasury_balance": str(hypothetical_treasury_balance),
+                "hypothetical_treasury_value_usd": str(hypothetical_treasury_value_usd),
+                "hypothetical_founder_reserve": str(hypothetical_founder_reserve),
+                "hypothetical_founder_value_usd": str(hypothetical_founder_value_usd),
+            }
+
+            file_exists = os.path.exists(metrics_csv_path)
+            with open(metrics_csv_path, "a", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=fieldnames)
+                if not file_exists or os.stat(metrics_csv_path).st_size == 0:
+                    writer.writeheader()
+                writer.writerow(metrics_row)
+
+            self.stdout.write(
+                self.style.SUCCESS(
+                    f"🧾 Metrics CSV row appended to {metrics_csv_path}"
                 )
             )
