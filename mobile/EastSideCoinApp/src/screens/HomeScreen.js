@@ -37,13 +37,6 @@ const OPEN_METEO = `https://api.open-meteo.com/v1/forecast?latitude=${ZIP_60617_
 // Air Quality — Open-Meteo (no key) — US AQI & particulates
 const OPEN_METEO_AIR = `https://air-quality-api.open-meteo.com/v1/air-quality?latitude=${ZIP_60617_LAT}&longitude=${ZIP_60617_LON}&hourly=us_aqi,pm2_5,pm10,ozone,carbon_monoxide&timezone=America%2FChicago`;
 
-const BRIDGES = [
-  { id: "95th", name: "95th St Bridge (Calumet River)" },
-  { id: "100th", name: "100th St Bridge (Calumet River)" },
-  { id: "106th", name: "106th St Bridge (Calumet River)" },
-  { id: "92nd", name: "92nd St Bridge (Ewing Ave)" },
-];
-
 // Civil Rights “Quote of the Day”
 const QUOTES = [
   { a: "Martin Luther King Jr.", q: "The time is always right to do what is right." },
@@ -282,20 +275,68 @@ const HomeScreen = () => {
     }
   }, []);
 
-  // ---------- bridge lifts (beta placeholder) ----------
+  // ---------- bridge lifts (real backend: /bridges/status/) ----------
   const loadBridgeInfo = useCallback(async () => {
     try {
-      const mock = BRIDGES.map((b, idx) => ({
-        id: b.id,
-        name: b.name,
-        status: idx % 3 === 0 ? "Lifting soon" : idx % 3 === 1 ? "Closed" : "Open",
-        eta: idx % 3 === 0 ? "≈ 12 min" : null,
-        lastSeenVessel: idx % 2 === 0 ? "Bulk Carrier (downbound)" : "Tug + Barge (upbound)",
-      }));
-      setBridgeInfo(mock);
+      const payload = await api.get("/bridges/status/");
+
+      let items = [];
+      if (Array.isArray(payload)) {
+        items = payload;
+      } else if (Array.isArray(payload?.results)) {
+        items = payload.results;
+      } else if (Array.isArray(payload?.bridges)) {
+        items = payload.bridges;
+      }
+
+      const mapped = items.map((b) => {
+        const slug = b.slug || b.id || "";
+        const status = (b.status || "unknown").toLowerCase();
+
+        // Be flexible about how the backend names these fields
+        const lastVesselName =
+          b.last_vessel_name ||
+          b.last_vessel ||
+          b.vessel_name ||
+          b.ship_name ||
+          b.last_ship ||
+          "";
+
+        const lastVesselDirection =
+          b.last_vessel_direction ||
+          b.vessel_direction ||
+          b.last_direction ||
+          b.direction ||
+          "";
+
+        return {
+          id: slug || b.id || Math.random().toString(36).slice(2),
+          slug,
+          name:
+            b.name ||
+            (slug
+              ? `${slug.toUpperCase()} St Bridge`
+              : "Bridge"),
+          status, // open / predicted_lift / closed / unknown
+          etaMinutes:
+            typeof b.eta_minutes === "number" ? b.eta_minutes : null,
+          lastVesselName,
+          lastVesselDirection,
+          reason: b.reason || "",
+          updatedAt: b.updated_at || null,
+        };
+      });
+
+      setBridgeInfo(mapped);
+      await AsyncStorage.setItem("home_bridge_cache", JSON.stringify(mapped));
     } catch (e) {
       console.warn("Bridge info error:", e?.message || e);
-      setBridgeInfo([]);
+      const cached = await AsyncStorage.getItem("home_bridge_cache");
+      if (cached) {
+        setBridgeInfo(JSON.parse(cached));
+      } else {
+        setBridgeInfo([]);
+      }
     }
   }, []);
 
@@ -676,7 +717,7 @@ const HomeScreen = () => {
       loadBridgeInfo(),
       loadTraffic(),
       loadEscSpots(),
-      loadEconomy(),
+      loadEconomy(), // fixed: was loadEconomy without ()
     ]);
     setRefreshing(false);
   }, [
@@ -825,6 +866,14 @@ const HomeScreen = () => {
       ? n.toLocaleString(undefined, { maximumFractionDigits: 1 }) + "%"
       : "—";
 
+  const humanBridgeStatus = (status) => {
+    const s = (status || "").toLowerCase();
+    if (s === "open") return "Open";
+    if (s === "predicted_lift") return "Lifting soon";
+    if (s === "closed") return "Closed for lift";
+    return "Status unknown";
+  };
+
   return (
     <SafeAreaView style={styles.safe}>
       {/* background accents */}
@@ -855,7 +904,7 @@ const HomeScreen = () => {
             <TouchableOpacity
               activeOpacity={0.8}
               onLongPress={() => navigation.navigate("FlappyESC")}
-              delayLongPress={800} // hold for 0.8s so it feels intentional
+              delayLongPress={800}
             >
               <Text style={styles.title}>EastSide Coin</Text>
             </TouchableOpacity>
@@ -1298,44 +1347,59 @@ const HomeScreen = () => {
             {bridgeInfo.length === 0 ? (
               <Text style={styles.empty}>No data yet.</Text>
             ) : (
-              bridgeInfo.map((b) => (
-                <View key={b.id} style={styles.bridgeRow}>
-                  <View style={{ flex: 1 }}>
-                    <Text style={styles.bridgeName}>{b.name}</Text>
-                    <Text style={styles.bridgeMeta}>
-                      {b.status}
-                      {b.eta ? ` • ETA ${b.eta}` : ""}
-                    </Text>
-                    {b.lastSeenVessel && (
-                      <Text style={styles.bridgeVessel}>
-                        Last seen vessel: {b.lastSeenVessel}
+              bridgeInfo.map((b) => {
+                const status = (b.status || "").toLowerCase();
+                return (
+                  <View key={b.id} style={styles.bridgeRow}>
+                    <View style={{ flex: 1 }}>
+                      <Text style={styles.bridgeName}>{b.name}</Text>
+                      <Text style={styles.bridgeMeta}>
+                        {humanBridgeStatus(status)}
+                        {b.etaMinutes != null ? ` • ETA ≈ ${b.etaMinutes} min` : ""}
                       </Text>
-                    )}
+                      {(b.lastVesselName || b.lastVesselDirection) && (
+                        <Text style={styles.bridgeVessel}>
+                          {b.lastVesselName
+                            ? `Last vessel: ${b.lastVesselName}${
+                                b.lastVesselDirection
+                                  ? ` (${b.lastVesselDirection.toLowerCase()})`
+                                  : ""
+                              }`
+                            : b.lastVesselDirection
+                            ? `Last vessel direction: ${b.lastVesselDirection.toLowerCase()}`
+                            : ""}
+                        </Text>
+                      )}
+                    </View>
+                    <View
+                      style={[
+                        styles.statusPill,
+                        status === "open"
+                          ? styles.ok
+                          : status === "predicted_lift"
+                          ? styles.warn
+                          : status === "closed"
+                          ? styles.idle
+                          : styles.idle,
+                      ]}
+                    >
+                      <Text style={styles.pillText}>
+                        {status === "open"
+                          ? "OPEN"
+                          : status === "predicted_lift"
+                          ? "SOON"
+                          : status === "closed"
+                          ? "LIFT"
+                          : "—"}
+                      </Text>
+                    </View>
                   </View>
-                  <View
-                    style={[
-                      styles.statusPill,
-                      b.status === "Open"
-                        ? styles.ok
-                        : b.status === "Lifting soon"
-                        ? styles.warn
-                        : styles.idle,
-                    ]}
-                  >
-                    <Text style={styles.pillText}>
-                      {b.status === "Open"
-                        ? "OPEN"
-                        : b.status === "Lifting soon"
-                        ? "SOON"
-                        : "CLOSED"}
-                    </Text>
-                  </View>
-                </View>
-              ))
+                );
+              })
             )}
             <Text style={styles.note}>
-              We’re prototyping AIS-based predictions for East Side bridges (95th, 100th,
-              106th, 92nd/Ewing).
+              Powered by neighborhood bridge status data (95th, 100th, 106th, 92nd/Ewing).
+              We’re prototyping AIS-based predictions so you know when bridges might lift.
             </Text>
           </View>
 

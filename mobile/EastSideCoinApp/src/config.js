@@ -1,7 +1,5 @@
 // config.js
-export const API_URL = "http://192.168.1.131:8000/api"; // Change this manually
-// export const WS_URL = `ws://192.168.1.131:8000/ws`; // WebSocket base URL
-export const WS_URL = "ws://192.168.1.131:8000"; // no trailing /ws
+export const API_ORIGIN = "http://192.168.0.144:8000";   // base for media + API
+export const API_URL = `${API_ORIGIN}/api`;              // JSON API base
 
-// export const API_URL = "http://172.20.10.2:8000/api"; // Change this manually
-// export const WS_URL = `ws://172.20.10.2:8000/ws`; // WebSocket base URL
+export const WS_URL = "ws://192.168.0.144:8000";         // no trailing /ws

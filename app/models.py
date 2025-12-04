@@ -577,3 +577,88 @@ class EscEconomySnapshot(models.Model):
 
     def __str__(self):
         return f"{self.label} (tx={self.tx_count}, price=${self.price_final_usd})"
+
+
+# ✅ Bridge models for live bridge-lift predictions (Calumet / Ewing)
+class Bridge(models.Model):
+    """
+    Physical bridges in the neighborhood (Calumet River + 92nd/Ewing).
+    Used by the AIS worker + HomeScreen 'Bridge Lift Watch'.
+    """
+
+    slug = models.SlugField(
+        max_length=32,
+        unique=True,
+        help_text="Short ID, e.g. '95th', '100th', '106th', '92nd'.",
+    )
+    name = models.CharField(max_length=128)
+
+    # Rough coordinates for distance/ETA calcs from AIS vessel positions
+    latitude = models.FloatField()
+    longitude = models.FloatField()
+
+    notes = models.TextField(blank=True)
+
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["name"]
+        indexes = [
+            models.Index(fields=["slug"]),
+            models.Index(fields=["latitude", "longitude"]),
+        ]
+
+    def __str__(self):
+        return self.name
+
+
+class BridgeStatus(models.Model):
+    """
+    Latest status snapshot per bridge, updated by AIS worker / other jobs.
+    """
+
+    STATUS_CHOICES = [
+        ("open", "Open"),
+        ("predicted_lift", "Predicted lift soon"),
+        ("closed", "Closed for lift"),
+        ("unknown", "Unknown"),
+    ]
+
+    bridge = models.OneToOneField(
+        Bridge,
+        on_delete=models.CASCADE,
+        related_name="status",
+    )
+    status = models.CharField(
+        max_length=32,
+        choices=STATUS_CHOICES,
+        default="unknown",
+    )
+
+    # ETA (in minutes) until the next likely lift, if predicted_lift
+    eta_minutes = models.IntegerField(null=True, blank=True)
+
+    # Human-readable vessel info driving the prediction
+    last_vessel_name = models.CharField(max_length=128, blank=True)
+    last_vessel_mmsi = models.CharField(max_length=32, blank=True)
+    last_vessel_direction = models.CharField(
+        max_length=16,
+        blank=True,
+        help_text="upbound / downbound / unknown",
+    )
+
+    # Why we think it will lift: e.g. 'ais_vessel_approach', 'scheduled_window'
+    reason = models.CharField(max_length=64, blank=True)
+
+    updated_at = models.DateTimeField(default=timezone.now)
+
+    class Meta:
+        ordering = ["bridge__name"]
+        indexes = [
+            models.Index(fields=["status"]),
+            models.Index(fields=["updated_at"]),
+        ]
+
+    def __str__(self):
+        return f"{self.bridge.slug}: {self.status} (eta={self.eta_minutes} min)"

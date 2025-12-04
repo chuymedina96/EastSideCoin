@@ -59,6 +59,7 @@ pydantic_core==2.27.2
 PyJWT==2.10.1
 pyOpenSSL==25.0.0
 PySocks==1.7.1
+python-dotenv==1.2.1
 pyunormalize==16.0.0
 redis==5.2.1
 regex==2024.11.6

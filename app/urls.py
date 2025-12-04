@@ -48,7 +48,8 @@ from .views import (
     me_detail_update,
     profile_avatar,
     boot_status,
-    esc_stats
+    esc_stats,
+    bridge_status_list
 )
 
 urlpatterns = [
@@ -127,4 +128,5 @@ urlpatterns = [
     path("users/me/boot_status/", boot_status, name="boot_status"),
     
     path("esc/stats/", esc_stats, name="esc_stats"),
+    path("bridges/status/", bridge_status_list, name="bridge-status-list"),
 ]

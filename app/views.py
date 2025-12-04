@@ -29,7 +29,8 @@ from .models import (
     Booking,
     Transaction,
     WalletActivity,
-    EscEconomySnapshot,  # 🔥 new: sim snapshot model
+    EscEconomySnapshot, # 🔥 new: sim snapshot model
+    Bridge,
 )  # noqa: F401
 
 User = get_user_model()
@@ -1938,3 +1939,48 @@ def esc_stats(request):
         print("❌ esc_stats error:", e)
         # Frontend will fall back to client-side sim if this fails
         return Response({"error": str(e)}, status=500)
+    
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])  # or AllowAny if you want it public
+def bridge_status_list(request):
+    """
+    GET /bridges/status/
+
+    Returns a simple JSON list that HomeScreen expects:
+    [
+      {
+        "id": "95th",
+        "slug": "95th",
+        "name": "95th St Bridge",
+        "status": "open" | "predicted_lift" | "closed" | "unknown",
+        "eta_minutes": 12,
+        "last_vessel_name": "...",
+        "last_vessel_direction": "upbound" | "downbound" | "...",
+        "reason": "vessel traffic",
+        "updated_at": "2025-01-01T12:34:56Z"
+      },
+      ...
+    ]
+    """
+    rows = []
+    for b in Bridge.objects.select_related("status").all():
+        s = getattr(b, "status", None)
+        slug = b.slug or str(b.id)
+        updated_at = getattr(s, "updated_at", None)
+
+        rows.append(
+            {
+                "id": slug,
+                "slug": slug,
+                "name": b.name or f"{slug.upper()} St Bridge",
+                "status": getattr(s, "status", None) or "unknown",
+                "eta_minutes": getattr(s, "eta_minutes", None),
+                "last_vessel_name": getattr(s, "last_vessel_name", None),
+                "last_vessel_direction": getattr(s, "last_vessel_direction", None),
+                "reason": getattr(s, "reason", None),
+                "updated_at": updated_at.isoformat() if updated_at else None,
+            }
+        )
+
+    return Response(rows, status=200)

@@ -25,7 +25,7 @@ import AsyncStorage from "@react-native-async-storage/async-storage";
 import { AuthContext } from "../context/AuthProvider";
 import { walletBalance, fetchUserPublicKey, fetchMe } from "../utils/api";
 import { API_URL } from "../config";
-import avatarPlaceholder from "../../assets/avatar-placeholder.png"; // ✅ root-level assets (../../ from src/screens)
+import avatarPlaceholder from "../../assets/avatar-placeholder.png"; // root-level assets
 
 const THEME = {
   bg: "#101012",
@@ -40,11 +40,11 @@ const THEME = {
   ok: "#2f8f46",
 };
 
-// ⚙️ Match WalletScreen's demo flags
+// Demo mode flags (mirrors WalletScreen)
 const DEMO_MODE = true;
 const DEMO_LEDGER_KEY = "esc_demo_ledger_v1";
 
-// ---- demo ledger helpers (same behavior as WalletScreen) ----
+// ---- Demo ledger helpers ----
 async function getDemoLedger() {
   try {
     const raw = await AsyncStorage.getItem(DEMO_LEDGER_KEY);
@@ -80,7 +80,6 @@ function resolveAvatarUri(me, fallback) {
 
   const base = isAbsolute ? raw : `${API_URL.replace(/\/+$/, "")}/${raw.replace(/^\/+/, "")}`;
 
-  // Use server timestamp if present; fallback to now
   const ts = me?.avatar_updated_at || me?.updated_at || me?.profile_updated_at || Date.now();
   const sep = base.includes("?") ? "&" : "?";
   return `${base}${sep}t=${encodeURIComponent(String(ts))}`;
@@ -102,16 +101,18 @@ const ProfileScreen = () => {
   const [address, setAddress] = useState(authUser?.wallet_address || "");
   const [refreshing, setRefreshing] = useState(false);
   const [loadingBalance, setLoadingBalance] = useState(true);
+
+  // FIXED: missing earlier
   const [showFullAddr, setShowFullAddr] = useState(false);
 
-  // 🔑 live key status (server-refreshed)
+  // key status
   const [keysReady, setKeysReady] = useState(Boolean(authUser?.public_key));
 
   const [qrOpen, setQrOpen] = useState(false);
 
-  // avatar states
+  // avatar handling
   const [avatarError, setAvatarError] = useState(false);
-  const [avatarBust, setAvatarBust] = useState(0); // bump to force reload
+  const [avatarBust, setAvatarBust] = useState(0);
 
   // subtle float accents
   const float = useRef(new Animated.Value(0)).current;
@@ -128,22 +129,22 @@ const ProfileScreen = () => {
   // --------- data loaders ----------
   const loadMe = useCallback(async () => {
     try {
-      const data = await fetchMe(); // { id, email, first_name, last_name, avatar_url, avatar_updated_at, bio, ... }
+      const data = await fetchMe();
+      
       setMe(data);
-      // keep address in sync if server returns wallet
+
       if (data?.wallet_address && data.wallet_address !== address) {
         setAddress(data.wallet_address);
       }
-      // update keys badge if server exposes public_key in /me/
+
       if (typeof data?.public_key !== "undefined") {
         setKeysReady(Boolean(data.public_key));
       }
-      // on fresh fetch, reset avatar error and bump cache if server timestamp changed
+
       setAvatarError(false);
       setAvatarBust((b) => b + 1);
     } catch (e) {
       console.warn("fetchMe error:", e?.data || e?.message || e);
-      // keep previous me if fails
     }
   }, [address]);
 
@@ -152,25 +153,20 @@ const ProfileScreen = () => {
       setLoadingBalance(true);
       const data = await walletBalance();
 
-      // Mirror WalletScreen's address fallback
       let addr = data?.address || data?.wallet_address || "";
-      if (!addr && DEMO_MODE) {
-        addr = "esc_demo_wallet_local";
-      }
+      if (!addr && DEMO_MODE) addr = "esc_demo_wallet_local";
       if (!addr) {
         setAddress("");
         setBalance(0);
         return;
       }
 
-      // Base numeric balance from backend
       let balNum = Number(data?.balance);
       if (!Number.isFinite(balNum) || balNum < 0) balNum = 0;
 
       if (DEMO_MODE) {
         const ledger = await getDemoLedger();
         if (ledger[addr] == null) {
-          // Seed to backend value if >0, else 100 — same as WalletScreen
           const seed = balNum > 0 ? balNum : 100;
           ledger[addr] = seed;
           await saveDemoLedger(ledger);
@@ -184,13 +180,13 @@ const ProfileScreen = () => {
       setAddress(addr);
       setBalance(balNum);
     } catch (e) {
-      console.warn("Balance fetch error (Profile):", e?.data || e?.message || e);
+      console.warn("Balance fetch error:", e);
       if (DEMO_MODE) {
         const addr = address || "esc_demo_wallet_local";
         try {
           const ledger = await getDemoLedger();
           let b = Number(ledger[addr]);
-          if (!Number.isFinite(b) || b < 0) b = 100; // sane fallback
+          if (!Number.isFinite(b) || b < 0) b = 100;
           setAddress(addr);
           setBalance(b);
         } catch {
@@ -204,32 +200,27 @@ const ProfileScreen = () => {
     }
   }, [address]);
 
-  // 🔑 fetch latest key status from server (dedicated)
   const refreshKeyStatus = useCallback(async () => {
     const id = me?.id || authUser?.id;
     if (!id) return;
     try {
-      const data = await fetchUserPublicKey(id); // { public_key } or { public_key: null }
+      const data = await fetchUserPublicKey(id);
       setKeysReady(Boolean(data?.public_key));
     } catch {
-      // If endpoint not available for self/non-self, fall back to what we know
       setKeysReady((prev) => prev || Boolean(me?.public_key || authUser?.public_key));
     }
   }, [me?.id, me?.public_key, authUser?.id, authUser?.public_key]);
 
-  // boot
   useEffect(() => {
     loadMe();
     loadBalance();
     refreshKeyStatus();
   }, [loadMe, loadBalance, refreshKeyStatus]);
 
-  // refresh on screen focus (fixes post-registration stale UI)
   useFocusEffect(
     useCallback(() => {
       loadMe();
       refreshKeyStatus();
-      // optionally: loadBalance();
     }, [loadMe, refreshKeyStatus])
   );
 
@@ -239,12 +230,13 @@ const ProfileScreen = () => {
     setRefreshing(false);
   }, [loadMe, loadBalance, refreshKeyStatus]);
 
-  // --------- computed display ----------
+  // -------- computed values --------
   const profile = me || authUser || {};
+
   const displayName = useMemo(() => {
     const name = [profile.first_name, profile.last_name].filter(Boolean).join(" ").trim();
     return name || profile.email || "";
-  }, [profile.first_name, profile.last_name, profile.email]);
+  }, [profile]);
 
   const initials = useMemo(() => {
     const parts = displayName.split(" ").filter(Boolean);
@@ -252,36 +244,30 @@ const ProfileScreen = () => {
     return (parts[0]?.[0] || "").toUpperCase() + (parts[1]?.[0] || "").toUpperCase();
   }, [displayName, profile?.email]);
 
-  // Final avatar uri with cache-bust + manual bump
   const avatarUriBase = resolveAvatarUri(me, authUser?.avatar_url);
   const avatarUri = avatarUriBase
     ? `${avatarUriBase}${avatarUriBase.includes("?") ? "&" : "?"}b=${avatarBust}`
     : null;
 
-  // Optional auth header for protected media endpoints
   const imageHeaders = useMemo(() => {
     if (!accessToken) return undefined;
     return { Authorization: `Bearer ${accessToken}` };
   }, [accessToken]);
 
-  // --------- actions ----------
+  // -------- actions --------
   const handleCopy = async () => {
     if (!address) return;
     try {
       await Clipboard.setStringAsync(address);
       Alert.alert("Copied", "Wallet address copied to clipboard.");
-    } catch {
-      /* noop */
-    }
+    } catch {}
   };
 
   const handleShare = async () => {
     if (!address) return;
     try {
       await Share.share({ message: `My ESC address: ${address}` });
-    } catch {
-      /* noop */
-    }
+    } catch {}
   };
 
   const handleLogout = async () => {
@@ -323,18 +309,16 @@ const ProfileScreen = () => {
 
   const anyBusy = isLoggingOut || isDeleting;
 
-  const onAvatarError = () => {
-    setAvatarError(true);
-  };
-
   const reloadAvatar = () => {
     setAvatarError(false);
     setAvatarBust((b) => b + 1);
   };
 
+  const onAvatarError = () => setAvatarError(true);
+
   return (
     <SafeAreaView style={styles.safe}>
-      {/* accents */}
+      {/* animated accents */}
       <Animated.View style={[styles.accent, styles.accentTop, { transform: [{ translateY: floatY }] }]} />
       <Animated.View style={[styles.accent, styles.accentBottom, { transform: [{ translateY: floatY }] }]} />
 
@@ -343,18 +327,16 @@ const ProfileScreen = () => {
         refreshControl={<RefreshControl refreshing={refreshing} onRefresh={onRefresh} tintColor={THEME.accentGold} />}
         keyboardShouldPersistTaps="handled"
       >
-        {/* Big centered avatar */}
+        {/* Avatar */}
         <View style={styles.avatarSection}>
           <View style={styles.bigAvatarWrap}>
             {avatarUri && !avatarError ? (
               <Image
-                // key ensures React re-renders when cache-busting value changes
                 key={avatarUri}
                 source={{ uri: avatarUri, headers: imageHeaders }}
                 style={styles.bigAvatarImg}
                 resizeMode="cover"
                 onError={onAvatarError}
-                // iOS only default placeholder
                 defaultSource={Platform.OS === "ios" ? avatarPlaceholder : undefined}
               />
             ) : (
@@ -363,39 +345,42 @@ const ProfileScreen = () => {
               </View>
             )}
           </View>
+
           <Text style={styles.nameCenter} numberOfLines={1}>
             {displayName || "Your Profile"}
           </Text>
+
           {!!profile?.email && (
             <Text style={styles.emailCenter} numberOfLines={1}>
               {profile.email}
             </Text>
           )}
 
-          {/* Badges under the name */}
+          {/* badges */}
           <View style={[styles.badgesRow, { justifyContent: "center", marginTop: 10 }]}>
             <View style={[styles.badge, profile?.is_vip ? styles.badgeVip : styles.badgeDim]}>
               <Text style={[styles.badgeText, profile?.is_vip ? styles.badgeTextVip : null]}>
                 {profile?.is_vip ? "VIP" : "Member"}
               </Text>
             </View>
+
             <View style={[styles.badge, keysReady ? styles.badgeOk : styles.badgeWarn]}>
               <Text style={styles.badgeText}>{keysReady ? "Keys: Set" : "Keys: Not Set"}</Text>
             </View>
-            {profile?.onboarding_completed ? (
+
+            {profile?.onboarding_completed && (
               <View style={[styles.badge, styles.badgeOk]}>
                 <Text style={styles.badgeText}>Onboarding: Done</Text>
               </View>
-            ) : null}
+            )}
           </View>
 
-          {/* Quick avatar reload */}
           <TouchableOpacity onPress={reloadAvatar} style={[styles.ghostBtn, { marginTop: 12 }]}>
             <Text style={styles.ghostBtnText}>Reload Photo</Text>
           </TouchableOpacity>
         </View>
 
-        {/* Profile details */}
+        {/* Profile */}
         <View style={styles.card}>
           <Text style={styles.cardHeader}>Profile</Text>
 
@@ -436,7 +421,11 @@ const ProfileScreen = () => {
             )}
           </View>
 
-          {!profile?.bio && !profile?.neighborhood && !profile?.languages && !profile?.skills && !profile?.age ? (
+          {!profile?.bio &&
+          !profile?.neighborhood &&
+          !profile?.languages &&
+          !profile?.skills &&
+          !profile?.age ? (
             <Text style={styles.subtle}>No profile details yet. Add your info in onboarding or profile edit.</Text>
           ) : null}
         </View>
@@ -477,10 +466,11 @@ const ProfileScreen = () => {
               <Text style={styles.ghostBtnText}>QR</Text>
             </TouchableOpacity>
           </View>
+
           <Text style={styles.subtle}>Tip: Long-press the address to toggle full/short view.</Text>
         </View>
 
-        {/* Account actions */}
+        {/* Account */}
         <View style={styles.card}>
           <Text style={styles.cardHeader}>Account</Text>
 
@@ -488,7 +478,6 @@ const ProfileScreen = () => {
             style={[styles.primaryBtn, anyBusy && styles.btnDisabled]}
             onPress={handleLogout}
             disabled={anyBusy}
-            accessibilityLabel="Log out"
           >
             {isLoggingOut ? <ActivityIndicator color="#FFF" /> : <Text style={styles.primaryBtnText}>Logout</Text>}
           </TouchableOpacity>
@@ -497,7 +486,6 @@ const ProfileScreen = () => {
             style={[styles.dangerBtn, anyBusy && styles.btnDisabled]}
             onPress={handleDelete}
             disabled={anyBusy}
-            accessibilityLabel="Delete account"
           >
             {isDeleting ? (
               <ActivityIndicator color="#FFF" />
@@ -525,6 +513,7 @@ const ProfileScreen = () => {
             <Text style={[styles.modalText, { marginTop: 10 }]} selectable>
               {address}
             </Text>
+
             <View style={[styles.row, { marginTop: 14 }]}>
               <TouchableOpacity onPress={handleCopy} style={[styles.ghostBtn, { marginRight: 8 }]}>
                 <Text style={styles.ghostBtnText}>Copy</Text>
@@ -542,19 +531,17 @@ const ProfileScreen = () => {
 
 export default ProfileScreen;
 
-/* ======= styles ======= */
+/* ================== STYLES ================== */
 const BIG_AVATAR = 160;
 
 const styles = StyleSheet.create({
   safe: { flex: 1, backgroundColor: THEME.bg },
   scrollContent: { padding: 16, paddingBottom: 40 },
 
-  // accents
   accent: { position: "absolute", width: 340, height: 340, borderRadius: 999, opacity: 0.1, zIndex: -1 },
   accentTop: { top: -100, right: -70, backgroundColor: THEME.accentGold },
   accentBottom: { bottom: -120, left: -80, backgroundColor: THEME.accentOrange },
 
-  // avatar (centered hero)
   avatarSection: {
     alignItems: "center",
     justifyContent: "center",
@@ -583,6 +570,7 @@ const styles = StyleSheet.create({
     justifyContent: "center",
   },
   bigAvatarText: { color: THEME.accentGold, fontWeight: "900", fontSize: 42, letterSpacing: 1 },
+
   nameCenter: { color: THEME.text, fontSize: 22, fontWeight: "900", marginTop: 12, textAlign: "center" },
   emailCenter: { color: THEME.subtext, textAlign: "center", marginTop: 4 },
 
@@ -628,7 +616,6 @@ const styles = StyleSheet.create({
   },
   smallBtnText: { color: THEME.accentGold, fontWeight: "700" },
 
-  // wallet
   balanceRow: { flexDirection: "row", alignItems: "flex-end", marginTop: 10 },
   balanceNumber: { color: "#fff", fontSize: 34, fontWeight: "900" },
   balanceTicker: { color: THEME.accentGold, fontWeight: "800", marginLeft: 6, marginBottom: 3 },
@@ -638,7 +625,6 @@ const styles = StyleSheet.create({
 
   row: { flexDirection: "row", alignItems: "center", marginTop: 12 },
 
-  // buttons
   ghostBtn: {
     backgroundColor: "#2d2d2f",
     borderColor: "#3a3a3f",
