@@ -1,29 +1,36 @@
-# EastSide Coin (ESC) – Neighborhood Currency Platform
-A hyperlocal digital economy built for real communities.
+# EastSide Coin (ESC) – Neighborhood Currency & Local Economy Platform
+A full-stack, hyperlocal digital currency ecosystem designed for real Chicago neighborhoods — combining payments, services, messaging, and live local infrastructure data into one unified platform.
 
 --------------------------------------------------------------------------------
+🚨 **OPEN-SOURCE NOTICE**  
+This project is **NOT fully open-source yet**.  
+The repository is viewable, but several economic models, security primitives, and networking components are still under restricted license.
 
-🚨 PROJECT STATUS & OPEN-SOURCE NOTICE  
-This project is NOT fully open-source yet.  
-The codebase is under active development. Core components such as encryption logic, wallet mechanics, simulation engines, and networking services are NOT licensed for public reuse at this time.  
-You may clone or run locally for learning purposes only.
+You MAY:
+- Clone and run locally  
+- Study the architecture  
+- Modify for learning or experimentation  
 
-If you want to set up your own instance, you must configure:  
-- Your own Django backend  
-- Your own React Native (Expo) mobile app  
-- Your own `.env` secrets  
-- Your own RSA keypair generation and key wrapping  
-- Your own database seeds and ESC economy simulation
+You may NOT:
+- Redistribute a fork  
+- Use production code in commercial systems  
+- Publish derivatives of the economic models or simulation engines  
 
 --------------------------------------------------------------------------------
-
 # 📂 PROJECT STRUCTURE
 
 ```
 /
-├── app/                  # Django app: users, wallet, bookings, services, chat, AIS, snapshots
-├── backend/              # Django project: settings, ASGI config, URL routing
-├── mobile/               # React Native (Expo) application
+├── app/                        # Core Django app: users, wallet, chat, services, bookings, ESC economy, AIS
+│   ├── management/
+│   │   └── commands/
+│   │       ├── seed_esc_demo.py      # FULL ESC seeding + 1,800-line economy simulation
+│   │       ├── seed_bridges.py       # Seeds Calumet River bridge metadata
+│   │       └── run_ais_watch.py      # Live AIS → Bridge lift prediction worker
+│   │
+├── backend/                    # Django project (settings, URLs, ASGI, Channels)
+├── mobile/                     # React Native (Expo) mobile app
+│   └── ...
 │
 ├── manage.py
 ├── Procfile
@@ -34,255 +41,299 @@ If you want to set up your own instance, you must configure:
 ```
 
 --------------------------------------------------------------------------------
-
 # 🌎 WHAT IS EASTSIDE COIN?
 
-EastSide Coin is a **neighborhood digital currency and service marketplace**, designed to strengthen local communities by enabling:
+EastSide Coin (ESC) is a **neighborhood-scale digital currency and services marketplace** built for the East Side / South Deering community.
 
-- Peer-to-peer payments  
-- A local service economy  
-- Secure end-to-end encrypted chat  
-- Real-time bridge lift predictions via AIS  
-- Wallet balances, transaction history, and pricing  
-- Hyperlocal liquidity and tokenomics simulations  
+The platform combines:
 
-The platform blends **Django**, **React Native**, **WebSockets**, **AES + RSA encryption**, and a full economic simulation/AMM model.
+### 🪙 Local Digital Currency
+- Wallets  
+- LEDGER-BASED transactions  
+- Airdrops  
+- Treasury controls  
+- AMM price curve simulation  
 
---------------------------------------------------------------------------------
+### 🧱 Real Neighborhood Services
+- Local business listings  
+- Resident skill listings  
+- Booking system (pending → confirmed → completed)  
 
-# ⚙️ CORE SYSTEMS
+### 🔐 Fully Encrypted Messaging
+- RSA-OAEP public key registry  
+- AES-256-GCM message bodies  
+- WebSocket real-time E2EE chat  
 
-## 1. Django Backend (API + WebSockets)
-Included inside `backend/` and `app/`.
+### 🌉 Live Infrastructure Monitoring
+Real-time AIS (ship tracking) data used to predict:
+- 92nd Street Bridge lifts  
+- 95th  
+- 100th  
+- 106th  
 
-### Features:
-- Custom User model (email login, avatars, onboarding profile)
-- Device RSA public key registry
-- AES/RSA hybrid encrypted messaging
-- WalletAccount + ledger modeling
-- ESC transactions (payment, airdrop, treasury, etc.)
-- Service listings + categories
-- Bookings system (pending/confirmed/rejected/cancelled/completed)
-- Conversations + message history endpoints
-- AIS worker for real-time bridge predictions (Calumet River)
-- Economy simulation engine
-- ESC price modeling + AMM constant-product pool
-- Snapshot storage in `EscEconomySnapshot`
-- JWT authentication
-- Local or S3 media storage
+### 📊 Economic Simulation Engine
+A **1,800+ line management command** models:
+- ESC supply  
+- Trading flows  
+- AMM liquidity  
+- Slippage  
+- Treasury injections  
+- Zero-wallet refill patterns  
+- Holder distribution  
+- Price curves  
+- Snapshot analytics  
 
---------------------------------------------------------------------------------
-
-## 2. React Native Mobile App (Expo)
-Located at `mobile/`.
-
-### Features:
-- JWT login, registration, logout
-- RSA keypair generation on-device
-- AES-encrypted chat messages over WebSocket
-- Per-user key storage with AsyncStorage (namespaced)
-- Message hydration + caching
-- Wallet balance + transactions
-- Real-time Bridge Lift Watch
-- Marketplace + service details
-- Booking creation, updates, and status changes
-- Auto-logout + refresh flow
-- Smooth navigation with secure key bootstrapping
+This powers a living neighborhood economy.
 
 --------------------------------------------------------------------------------
-
-## 3. ESC ECONOMY SIMULATION
-
-Simulation includes:
-- Randomized user trades
-- On-chain/off-chain pricing through AMM curve
-- Treasury injections
-- Airdrops
-- Zero-wallet refill analytics
-- Price shifts over time
-- Volume, tx count, slippage
-- Circulating supply + holder diversity metrics
-
-The result is written as an `EscEconomySnapshot`, used by the app for analytics and dashboards.
-
---------------------------------------------------------------------------------
-
-# 🧱 TECH STACK
+# ⚙️ TECH STACK
 
 ### Backend
 - Python 3  
 - Django 5  
+- Django Channels (WebSockets)  
 - Django REST Framework  
-- Django Channels  
 - SimpleJWT  
-- WebSockets  
-- SQLite/PostgreSQL  
-- AISStream WebSocket integration  
+- AISStream  
+- SQLite / PostgreSQL  
 
 ### Mobile
-- React Native (Expo)  
-- RSA-OAEP  
-- AES-256-GCM  
-- Secure key storage  
-- Realtime WebSockets  
+- React Native (Expo)
+- AES-256-GCM encryption
+- RSA-OAEP keypair handling
+- Persistent secure storage
+- WebSocket encrypted chat
+- React Navigation
 
 --------------------------------------------------------------------------------
-
 # 🚀 LOCAL DEVELOPMENT SETUP
 
-## 1. Clone the repo
+## 1. Clone the repository
 ```
 git clone https://github.com/yourusername/eastside-coin.git
 cd eastside-coin
 ```
 
 --------------------------------------------------------------------------------
+# 2. BACKEND SETUP (Django)
 
-## 2. BACKEND SETUP
-
-### Create a virtual environment:
+## Create virtual environment
 ```
 python3 -m venv venv
 source venv/bin/activate
 ```
 
-### Install backend dependencies:
+## Install dependencies
 ```
 pip install -r requirements.txt
 ```
 
-### Create your `.env`:
+## Create `.env`
 ```
 cp .env.example .env
 ```
 
-Fill out:
-- SECRET_KEY  
-- DEBUG=True  
-- AISSTREAM_API_KEY  
-- Optional S3 storage credentials  
+Fill with values such as:
+```
+SECRET_KEY=your_secret_key
+DEBUG=True
+AISSTREAM_API_KEY=your_key
+USE_S3_MEDIA=0   # local file storage
+```
 
-### Run migrations:
+## Run migrations
 ```
 python manage.py migrate
 ```
 
-### Create superuser (optional):
+## Create a superuser (optional)
 ```
 python manage.py createsuperuser
 ```
 
-### Start backend server:
+## Start backend server
 ```
 python manage.py runserver 0.0.0.0:8000
 ```
 
-Backend available at:  
-**http://YOUR_LOCAL_IP:8000**
+Backend API is now available at:
+```
+http://YOUR_LOCAL_IP:8000
+```
 
 --------------------------------------------------------------------------------
+# ⭐ DATABASE SEEDING & SIMULATION (IMPORTANT)
 
-## 3. RUN THE ESC ECONOMY SIMULATION
+ESC provides **built-in full seeding logic** and does NOT require the user to write their own seeds.
 
+You MUST run the following commands in order:
+
+---
+
+# 1️⃣ Seed the bridge metadata
 ```
-python manage.py run_sim
+python manage.py seed_bridges
+```
+This populates:
+- 92nd bridge  
+- 95th bridge  
+- 100th bridge  
+- 106th bridge  
+
+Used by the AIS system.
+
+---
+
+# 2️⃣ Run the complete ESC economy seeding + simulation
+```
+python manage.py seed_esc_demo
 ```
 
-Simulation seeds:
-- Users  
+This **1,800+ line script** handles:
+
+### ✔ Creation of:
+- Demo users  
 - WalletAccounts  
-- Services  
+- Initial ESC distribution  
+- Service listings  
 - Bookings  
-- Economy activity  
-- AMM liquidity pool  
-- Final snapshot  
+- Chat threads  
+- Transaction skeletons  
+
+### ✔ Full AMM simulation with parameters:
+- LP_USDC_INITIAL  
+- LP_ESC_INITIAL  
+- NUM_SIM_TRADES  
+- NUM_ZERO_WALLET_REFILLS  
+- TREASURY_INJECTION_AMOUNT  
+- TRADE_VOLUME_VARIANCE  
+- HOLDER_DISTRIBUTION_MODE  
+
+### ✔ Neighborhood economic behavior:
+- Buy pressure  
+- Sell pressure  
+- Slippage  
+- Price curve progression  
+- Airdrop events  
+- Randomized service booking flows  
+
+### ✔ Writes a final `EscEconomySnapshot`
+Used for charts, analytics, and dashboards in-app.
+
+---
+
+# 3️⃣ (Optional) Configure Simulation Parameters
+Inside:
+```
+app/management/commands/seed_esc_demo.py
+```
+
+You may tune variables such as:
+```
+LP_ESC_INITIAL
+LP_USDC_INITIAL
+TRADES_PER_USER
+AMM_FEE_PERCENT
+TREASURY_REFILL_THRESHOLDS
+ZERO_WALLET_REFILL_ESC
+```
+
+All parameters are documented in the top of the file.
 
 --------------------------------------------------------------------------------
+# 🌉 LIVE AIS → BRIDGE LIFT WATCHER
 
-## 4. MOBILE SETUP (React Native / Expo)
+To stream real-time positions of ships entering the Calumet River:
 
-### Install dependencies:
+```
+python manage.py run_ais_watch
+```
+
+This connects to AISStream and updates `BridgeStatus` in real-time.
+
+It detects:
+- Vessel heading  
+- Distance to bridges  
+- ETA predictions  
+- Upbound/downbound movement  
+- Whether a bridge is likely to lift  
+
+The mobile app reads these updates on the Home screen.
+
+--------------------------------------------------------------------------------
+# 3. MOBILE APP SETUP (React Native / Expo)
+
+Navigate to mobile project:
 ```
 cd mobile
+```
+
+Install dependencies:
+```
 npm install
 ```
 
-### Update API + WS URL:
-Edit `mobile/utils/api.js` or `mobile/config.js`:
+Update API and WebSocket URLs in:
+```
+mobile/utils/api.js
+mobile/config.js
+```
 
+Example:
 ```
 export const API_URL = "http://YOUR_LOCAL_IP:8000";
 export const WS_URL  = "ws://YOUR_LOCAL_IP:8000/ws";
 ```
 
-### Start Expo:
+Start Expo:
 ```
 npx expo start
 ```
 
-Open on:
-- iOS simulator  
-- Android emulator  
-- Physical device (same WiFi)
+Open on device or simulator.
 
 --------------------------------------------------------------------------------
-
-# 🛠 DEPLOYMENT NOTES
-
-This repo contains:
-- `Procfile` for Heroku / Railway  
-- `runtime.txt`  
-- `requirements.txt`  
-
-Production requires:
-- PostgreSQL  
-- Redis (Channels backend)  
-- S3/Spaces for media  
-- A worker dyno for AIS tasks  
-
---------------------------------------------------------------------------------
-
 # 🔐 SECURITY ARCHITECTURE
 
-### Messaging Security
-- AES-256-GCM for message bodies  
-- Per-message random IV  
-- Server stores ONLY ciphertext + wrapped AES key  
-- RSA-OAEP public-key wrapping  
-- Private keys NEVER leave client devices  
+## Encryption
+- Client generates RSA-2048 keypair
+- Public key uploaded to Django
+- Django NEVER handles private keys
+- Messages encrypted using AES-256-GCM
+- AES key is wrapped using RSA-OAEP
+- Ciphertext + wrapped key stored in DB
 
-### Wallet Security
-- Ledger-based accounting  
-- Immutable transaction history  
-- Booking-to-transaction linking  
-
-### API Auth
-- JWT access + refresh  
-- Token rotation support  
-- Auto-logout protections  
-- CSRF/CORS configured for mobile + local dev  
+## WebSockets
+- Authenticated via JWT query param
+- One socket per conversation
+- Messages decrypted only on-device
 
 --------------------------------------------------------------------------------
+# 📡 BACKEND SERVICES
 
-# 📡 AIS WORKER – BRIDGE LIFT PREDICTION
+### AIS Worker
+Real-time ship tracking + bridge predictions.
 
-Uses AISStream WebSocket feed.
+### Booking Engine
+Lifecycle:
+pending → confirmed → completed / cancelled
 
-Continuously:
-- Reads vessel lat/lon  
-- Determines speed + heading  
-- Calculates distance to neighborhood bridges  
-- Predicts upcoming lifts  
-- Updates `BridgeStatus` model  
+### Service Marketplace
+Listings, categories, pricing.
 
-Bridges covered:
-- 92nd  
-- 95th  
-- 100th  
-- 106th  
+### Wallet System
+- Ledger-based  
+- Audit trail  
+- Transaction linking  
+- Treasury behavior  
+
+### AMM Price Engine
+Simulates ESC ↔ USDC pricing using:
+```
+x * y = k
+```
 
 --------------------------------------------------------------------------------
-
 # 🧪 TESTING
 
 Run all tests:
@@ -296,39 +347,51 @@ python manage.py test_ais
 ```
 
 --------------------------------------------------------------------------------
+# 🛠 DEPLOYMENT (Heroku / Railway Ready)
 
+Included:
+- `Procfile`
+- `runtime.txt`
+- `requirements.txt`
+
+Production requires:
+- Postgres  
+- Redis (for WebSockets)  
+- S3 media storage  
+- Worker dyno for AIS  
+
+--------------------------------------------------------------------------------
 # 🤝 CONTRIBUTING
 
-The repo is not fully open-source yet.  
+Pull requests are not yet open.
+
 However:
-- Issues  
-- Feature suggestions  
-- Architecture discussions  
+- Discussions  
+- Architecture feedback  
+- Issue reports  
 
 …are welcome.
 
 --------------------------------------------------------------------------------
-
 # 📜 LICENSE
 
-License will be added when full open-source rollout begins.  
-Until then: **All rights reserved.**
+License will be added upon open-source release.  
+Until then: **ALL RIGHTS RESERVED.**
 
 --------------------------------------------------------------------------------
+# 🗺 FUTURE ROADMAP
 
-# 🗺 ROADMAP
-
-- Group encrypted chats  
-- Secure file attachments  
-- DAO governance  
-- On/off-ramps (ACH)  
-- Multi-neighborhood support  
-- Public dashboards  
-- Analytics + ML forecasting  
+- Group chats (encrypted)  
+- Neighborhood DAO governance  
+- Full public dashboards  
+- On/off ramps (bank transfers)  
+- More bridge + infrastructure integrations  
+- Machine-learning economic forecasting  
+- Multiple neighborhood support  
 
 --------------------------------------------------------------------------------
+# ✨ THANK YOU
 
-# ✨ ACKNOWLEDGMENTS
+EastSide Coin is built for real communities — for neighbors, by neighbors.  
+This platform blends code, economics, encryption, and Chicago’s working-class character into something powerful.
 
-This project is dedicated to the East Side / South Deering community and the broader movement for neighborhood self-determination.  
-Building a digital economy from the ground up requires vision, engineering, and community — ESC is built with all three.
